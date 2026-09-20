@@ -14,6 +14,10 @@ struct FirmwareMetadata: Codable, Hashable {
     let fileSizeBytes: Int64
     /// The file name the user imported, kept for display only.
     let originalFileName: String
+    /// Path of the kernelcache inside the IPSW, e.g.
+    /// "kernelcache.release.n81" — `nil` if the manifest didn't declare
+    /// one. Needed to locate the kernel for Milestone 4 boot attempts.
+    let kernelCachePath: String?
 
     /// The primary device this firmware targets, for display purposes.
     /// IPSWs for this era of device are effectively single-device, so the

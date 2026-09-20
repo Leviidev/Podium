@@ -48,6 +48,19 @@ final class ARMv7CPU: CPU {
         isRunning = false
     }
 
+    /// Sets all 16 registers at once — how a kernel image's
+    /// `LC_UNIXTHREAD` initial state (see `MachOLoader`) gets installed
+    /// before execution starts. A dedicated method rather than exposing
+    /// `registers` for direct external mutation, since "load a specific
+    /// architectural state" is the actual operation callers need, not
+    /// general read-write access to the register file.
+    func loadInitialRegisters(_ values: [UInt32]) {
+        precondition(values.count == 16, "expected exactly 16 register values")
+        for index in 0..<16 {
+            registers[index] = values[index]
+        }
+    }
+
     func step() {
         guard lastError == nil else { return }
 
@@ -74,17 +87,39 @@ final class ARMv7CPU: CPU {
     func run() {
         isRunning = true
         while isRunning && lastError == nil {
-            if let jit, let block = jit.block(at: registers.pc, memory: memory) {
-                registers.withUnsafeMutableStorage { block.run(registers: $0) }
-                registers.pc = registers.pc &+ UInt32(4 * block.instructionCount)
-            } else {
-                step()
-            }
+            runOneUnit()
         }
+    }
+
+    /// Runs until `lastError` is set, `stop()` is called, or `maxUnits`
+    /// fetch-decode-execute units (one interpreted instruction, or one
+    /// JIT-compiled block) have run — whichever comes first. Returns how
+    /// many units actually ran. Exists so a first boot attempt can be
+    /// bounded rather than either blocking indefinitely on code this CPU
+    /// doesn't support yet, or never exercising the JIT path the way
+    /// plain `step()`-in-a-loop would.
+    @discardableResult
+    func run(maxUnits: Int) -> Int {
+        isRunning = true
+        var unitsRun = 0
+        while isRunning && lastError == nil && unitsRun < maxUnits {
+            runOneUnit()
+            unitsRun += 1
+        }
+        return unitsRun
     }
 
     func stop() {
         isRunning = false
+    }
+
+    private func runOneUnit() {
+        if let jit, let block = jit.block(at: registers.pc, memory: memory) {
+            registers.withUnsafeMutableStorage { block.run(registers: $0) }
+            registers.pc = registers.pc &+ UInt32(4 * block.instructionCount)
+        } else {
+            step()
+        }
     }
 
     // MARK: - Execute

@@ -205,17 +205,6 @@ final class ZipArchiveReader {
 }
 
 private extension Data {
-    func readUInt16LE(at offset: Int) -> UInt16 {
-        UInt16(self[self.startIndex + offset]) | (UInt16(self[self.startIndex + offset + 1]) << 8)
-    }
-
-    func readUInt32LE(at offset: Int) -> UInt32 {
-        UInt32(self[self.startIndex + offset])
-            | (UInt32(self[self.startIndex + offset + 1]) << 8)
-            | (UInt32(self[self.startIndex + offset + 2]) << 16)
-            | (UInt32(self[self.startIndex + offset + 3]) << 24)
-    }
-
     /// Finds the last occurrence of a 4-byte little-endian signature,
     /// searching from the end (EOCD is always the *last* such record).
     func lastRange(ofFourByteLESignature signature: UInt32) -> Range<Int>? {

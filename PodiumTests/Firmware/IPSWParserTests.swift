@@ -17,13 +17,19 @@ final class IPSWParserTests: XCTestCase {
     private func makeBuildManifestData(
         productVersion: String,
         buildVersion: String,
-        deviceIdentifiers: [String]
+        deviceIdentifiers: [String],
+        kernelCachePath: String? = nil
     ) throws -> Data {
-        let plist: [String: Any] = [
+        var plist: [String: Any] = [
             "ProductVersion": productVersion,
             "ProductBuildVersion": buildVersion,
             "SupportedProductTypes": deviceIdentifiers,
         ]
+        if let kernelCachePath {
+            plist["BuildIdentities"] = [
+                ["Manifest": ["KernelCache": ["Info": ["Path": kernelCachePath]]]],
+            ]
+        }
         return try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
     }
 
@@ -32,6 +38,7 @@ final class IPSWParserTests: XCTestCase {
         productVersion: String = ReferenceFirmware.productVersion,
         buildVersion: String = ReferenceFirmware.buildVersion,
         deviceIdentifiers: [String] = [ReferenceFirmware.device.identifier],
+        kernelCachePath: String? = nil,
         includeManifest: Bool = true
     ) throws -> URL {
         var builder = TestZipBuilder()
@@ -39,7 +46,8 @@ final class IPSWParserTests: XCTestCase {
             let manifest = try makeBuildManifestData(
                 productVersion: productVersion,
                 buildVersion: buildVersion,
-                deviceIdentifiers: deviceIdentifiers
+                deviceIdentifiers: deviceIdentifiers,
+                kernelCachePath: kernelCachePath
             )
             builder.addEntry(name: IPSWParser.buildManifestEntryName, data: manifest, compress: false)
         }
@@ -58,6 +66,18 @@ final class IPSWParserTests: XCTestCase {
         XCTAssertEqual(parsed.metadata.buildVersion, ReferenceFirmware.buildVersion)
         XCTAssertEqual(parsed.metadata.supportedDeviceIdentifiers, [ReferenceFirmware.device.identifier])
         XCTAssertEqual(parsed.compatibility, .compatible)
+    }
+
+    func testKernelCachePathIsNilWhenManifestDoesNotDeclareBuildIdentities() throws {
+        let url = try makeIPSW() // default: no kernelCachePath / BuildIdentities
+        let parsed = try IPSWParser.parse(fileURL: url)
+        XCTAssertNil(parsed.metadata.kernelCachePath)
+    }
+
+    func testKernelCachePathIsReadFromBuildIdentitiesWhenPresent() throws {
+        let url = try makeIPSW(kernelCachePath: "kernelcache.release.n81")
+        let parsed = try IPSWParser.parse(fileURL: url)
+        XCTAssertEqual(parsed.metadata.kernelCachePath, "kernelcache.release.n81")
     }
 
     func testReportsFileSize() throws {

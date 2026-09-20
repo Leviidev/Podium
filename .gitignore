@@ -11,3 +11,8 @@ xcuserdata/
 
 # Imported firmware never belongs in git (large binaries, user data)
 *.ipsw
+
+# Real Apple firmware downloaded locally for development/verification —
+# copyrighted, and in places encrypted; never committed regardless of
+# what it's extracted/decrypted/decompressed into.
+.reference-firmware/

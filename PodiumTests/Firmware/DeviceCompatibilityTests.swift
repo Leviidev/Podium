@@ -12,7 +12,8 @@ final class DeviceCompatibilityTests: XCTestCase {
             productVersion: productVersion,
             buildVersion: buildVersion,
             fileSizeBytes: 123,
-            originalFileName: "test.ipsw"
+            originalFileName: "test.ipsw",
+            kernelCachePath: "kernelcache.release.n81"
         )
     }
 

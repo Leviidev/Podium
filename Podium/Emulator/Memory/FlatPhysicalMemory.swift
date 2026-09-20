@@ -56,6 +56,14 @@ final class FlatPhysicalMemory: MemoryBus {
         storage[index + 3] = UInt8((value >> 24) & 0xFF)
     }
 
+    func writeBytes(_ bytes: Data, at address: UInt32) throws {
+        guard !bytes.isEmpty else { return }
+        let index = try offset(for: address, width: bytes.count)
+        storage.withUnsafeMutableBufferPointer { buffer in
+            _ = bytes.copyBytes(to: UnsafeMutableBufferPointer(rebasing: buffer[index..<(index + bytes.count)]))
+        }
+    }
+
     /// Translates a guest address to a storage index, or throws. Uses
     /// 64-bit arithmetic throughout so an address/width near `UInt32.max`
     /// can't wrap around and defeat the bounds check.

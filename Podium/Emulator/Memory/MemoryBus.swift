@@ -17,4 +17,18 @@ protocol MemoryBus: AnyObject {
     func writeByte(_ value: UInt8, at address: UInt32) throws
     func writeWord16(_ value: UInt16, at address: UInt32) throws
     func writeWord32(_ value: UInt32, at address: UInt32) throws
+
+    /// Writes a contiguous run of bytes starting at `address`. Conformers
+    /// may override this for a bulk copy; the default just calls
+    /// `writeByte` in a loop, correct but not what you want for
+    /// megabyte-sized transfers like loading a kernel image.
+    func writeBytes(_ bytes: Data, at address: UInt32) throws
+}
+
+extension MemoryBus {
+    func writeBytes(_ bytes: Data, at address: UInt32) throws {
+        for (offset, byte) in bytes.enumerated() {
+            try writeByte(byte, at: address &+ UInt32(offset))
+        }
+    }
 }

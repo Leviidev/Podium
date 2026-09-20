@@ -37,6 +37,19 @@ struct EmulatorScreen: View {
                     .foregroundStyle(.secondary)
             }
 
+            if emulatorCore.status == .ready, let firmware, firmware.compatibility.isCompatible {
+                Button("Attempt Boot") {
+                    Task {
+                        await emulatorCore.attemptBoot(
+                            firmware: firmware,
+                            storedAt: firmwareLibrary.fileURL(for: firmware)
+                        )
+                    }
+                }
+                .buttonStyle(.podiumPrimary)
+                .padding(.horizontal, 40)
+            }
+
             Spacer()
 
             EmulatorControlBar { event in

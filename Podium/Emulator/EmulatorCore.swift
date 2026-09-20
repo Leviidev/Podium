@@ -31,6 +31,20 @@ final class EmulatorCore {
     /// The iPod touch 4's actual RAM size (Section 9 of the project spec).
     static let physicalMemorySize = 256 * 1024 * 1024
 
+    /// Physical RAM base address for this SoC (S5L8930X / n81ap).
+    /// Not a guess: the real iPod4,1 6.1.6 kernel's `__TEXT` segment is
+    /// linked at 0x80001000, which only makes sense if physical RAM
+    /// starts at (or just below) 0x80000000 — observed directly via
+    /// `otool -l` on the actual decrypted kernelcache, not assumed from
+    /// documentation (Apple doesn't publish this).
+    static let physicalMemoryBaseAddress: UInt32 = 0x8000_0000
+
+    /// Caps a single boot attempt so unsupported guest code halts the
+    /// attempt instead of either running forever or never giving the JIT
+    /// path (which only engages inside `run`, not single `step`s) a
+    /// chance to actually compile anything.
+    private static let maxBootUnits = 200_000
+
     private static let logCapacity = 200
 
     init(
@@ -49,15 +63,90 @@ final class EmulatorCore {
     func activateCoreIfNeeded() {
         guard cpu == nil else { return }
 
-        let ram = FlatPhysicalMemory(length: Self.physicalMemorySize)
+        let ram = FlatPhysicalMemory(length: Self.physicalMemorySize, baseAddress: Self.physicalMemoryBaseAddress)
         let armCPU = ARMv7CPU(memory: ram, jit: JITEngine())
         armCPU.reset()
 
         memory = ram
         cpu = armCPU
         status = .ready
-        appendLog("ARMv7 interpreter core online (with JIT compilation for eligible instruction sequences). \(Int64(Self.physicalMemorySize).formattedByteCount) physical memory mapped at 0x00000000.")
-        appendLog("No guest firmware is loaded — there is no kernelcache extraction or boot pipeline yet, so the CPU has nothing to execute.")
+        let baseHex = "0x" + Self.physicalMemoryBaseAddress.hexString8
+        appendLog("ARMv7 interpreter core online (with JIT compilation for eligible instruction sequences). \(Int64(Self.physicalMemorySize).formattedByteCount) physical memory mapped at \(baseHex).")
+        appendLog("No guest firmware is loaded yet.")
+    }
+
+    /// Extracts the kernel from `firmware`'s stored IPSW, loads it into
+    /// guest memory, points the CPU at its real entry point, and runs a
+    /// bounded number of instructions. This is Milestone 4's own stated
+    /// goal — "get the guest kernel executing" — not a claim that it
+    /// boots to anything further: real XNU boot code uses instruction
+    /// families (multiply, coprocessor/MMU control, block transfer) this
+    /// CPU doesn't implement yet, so halting on `.unsupportedInstruction`
+    /// within the first stretch of real execution is the expected,
+    /// honest outcome right now, not a bug in the loader.
+    func attemptBoot(firmware: ImportedFirmware, storedAt fileURL: URL) async {
+        activateCoreIfNeeded()
+        guard let armCPU = cpu as? ARMv7CPU, let memory else { return }
+
+        status = .booting
+        appendLog("Extracting kernel from \(firmware.metadata.originalFileName)…")
+
+        let machO: Data
+        do {
+            machO = try await Task.detached(priority: .userInitiated) {
+                try KernelcacheExtractor.extractKernelMachO(from: firmware, storedAt: fileURL)
+            }.value
+        } catch let error as FriendlyError {
+            status = .error(error.userMessage)
+            appendLog("Kernel extraction failed: \(error.developerDetail)")
+            return
+        } catch {
+            status = .error("Podium couldn't extract the kernel from this firmware.")
+            appendLog("Kernel extraction failed: \(error.localizedDescription)")
+            return
+        }
+        appendLog("Kernel extracted and decompressed: \(Int64(machO.count).formattedByteCount).")
+
+        let image: LoadedKernelImage
+        do {
+            image = try MachOLoader.load(machO, into: memory)
+        } catch let error as FriendlyError {
+            status = .error(error.userMessage)
+            appendLog("Kernel load failed: \(error.developerDetail)")
+            return
+        } catch {
+            status = .error("Podium couldn't load this kernel binary.")
+            appendLog("Kernel load failed: \(error.localizedDescription)")
+            return
+        }
+
+        armCPU.reset()
+        armCPU.loadInitialRegisters(image.initialRegisters)
+        appendLog("Kernel loaded. Entry point: 0x\(image.entryPointPC.hexString8). Starting execution…")
+
+        let stepBudget = Self.maxBootUnits
+        let unitsRun = await Task.detached(priority: .userInitiated) {
+            armCPU.run(maxUnits: stepBudget)
+        }.value
+
+        if let error = armCPU.lastError {
+            status = .error("Halted after \(unitsRun) instruction group\(unitsRun == 1 ? "" : "s"): \(Self.describe(error)).")
+            appendLog("Execution halted: \(error)")
+        } else {
+            status = .running
+            appendLog("Ran \(unitsRun) instruction groups without hitting an unimplemented instruction (step budget reached). PC now 0x\(armCPU.registers.pc.hexString8).")
+        }
+    }
+
+    private static func describe(_ error: CPUError) -> String {
+        switch error {
+        case .unsupportedInstruction(let word, let address):
+            return "unsupported instruction 0x\(word.hexString8) at 0x\(address.hexString8)"
+        case .undefinedInstruction(let word, let address):
+            return "undefined instruction 0x\(word.hexString8) at 0x\(address.hexString8)"
+        case .memoryFault(let fault, let address):
+            return "memory fault at 0x\(address.hexString8) (\(fault))"
+        }
     }
 
     func sendInput(_ event: InputEvent) {
