@@ -427,4 +427,18 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers.pc, 14) // (0 + 4) + 5*2
     }
+
+    func testUmullRealKernelWordComputes64BitProduct() {
+        let cpu = makeThumbCPU(program: [
+            0xfba0, 0x5203, // umull r5, r2, r0, r3, real word from the actual kernel
+        ])
+        cpu.registers[0] = 0xFFFF_FFFF
+        cpu.registers[3] = 2
+        cpu.step()
+
+        // 0xFFFFFFFF * 2 = 0x1_FFFFFFFE
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[5], 0xFFFF_FFFE) // RdLo
+        XCTAssertEqual(cpu.registers[2], 1) // RdHi
+    }
 }

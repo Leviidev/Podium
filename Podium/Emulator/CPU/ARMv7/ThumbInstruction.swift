@@ -331,6 +331,21 @@ struct ThumbBlockDataTransferInstruction: Equatable {
 /// for `TBH`), doubles it, and adds it to the address just after this
 /// instruction — a compiler-emitted jump table, always staying in
 /// Thumb state (unlike `BX`/`BLX`, this never switches ISA).
+/// `UMULL RdLo, RdHi, Rn, Rm`: 32×32→64-bit unsigned multiply, never
+/// flag-setting (this Thumb-2 T1 encoding has no `S` bit at all, unlike
+/// ARM state's classical `UMULL`). Lives in the "long multiply, long
+/// multiply accumulate, and divide" space (fixed hw0 bits[15:8] ==
+/// `0xFB`), disambiguated from its siblings (`SMULL`/`UMLAL`/`SMLAL`/
+/// `SDIV`/`UDIV`, none decoded yet) by hw0 bits[7:4] == `1010`.
+/// Verified against a real `umull r5, r2, r0, r3` word from the actual
+/// kernel.
+struct ThumbUmullInstruction: Equatable {
+    let rdLo: Int
+    let rdHi: Int
+    let rn: Int
+    let rm: Int
+}
+
 struct ThumbTableBranchInstruction: Equatable {
     let rn: Int
     let rm: Int
@@ -373,6 +388,7 @@ enum ThumbInstruction: Equatable {
     case loadStoreRegister(ThumbLoadStoreRegisterInstruction)
     case blockDataTransfer(ThumbBlockDataTransferInstruction)
     case tableBranch(ThumbTableBranchInstruction)
+    case umull(ThumbUmullInstruction)
     /// A recognized-but-not-yet-implemented Thumb instruction family —
     /// see `ThumbDecoder`'s doc comment for what's covered so far.
     case unsupported(rawHalfword: UInt16, secondHalfword: UInt16?)

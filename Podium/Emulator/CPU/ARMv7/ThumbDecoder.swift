@@ -26,12 +26,12 @@ import Foundation
 /// own condition field the same way 16-bit `Bcond` does), `LDR`/`STR`/
 /// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDRSB`
 /// (immediate, T3 and T4), `LDM`/
-/// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), and
-/// `MCR`/`MRC` (reusing ARM state's exact field layout — see
+/// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), `UMULL`,
+/// and `MCR`/`MRC` (reusing ARM state's exact field layout — see
 /// `decode32Coprocessor`'s doc comment). Everything else — PC-relative
-/// `LDR` (format 6), `REV`/`REV16`/`REVSH`, multiply/multiply-
-/// accumulate beyond 16-bit `MUL`, `LDREX`/`STREX`/`LDRD`/`STRD`, the
-/// rest of the coprocessor space (`CDP`/`LDC`/`STC`), SIMD/VFP —
+/// `LDR` (format 6), `REV`/`REV16`/`REVSH`, `SMULL`/`UMLAL`/`SMLAL`/
+/// `SDIV`/`UDIV` (`UMULL`'s siblings), `LDREX`/`STREX`/`LDRD`/`STRD`,
+/// the rest of the coprocessor space (`CDP`/`LDC`/`STC`), SIMD/VFP —
 /// decodes to `.unsupported`.
 enum ThumbDecoder {
     /// Whether `firstHalfword` opens a 32-bit Thumb-2 instruction (in
@@ -253,14 +253,23 @@ enum ThumbDecoder {
         case 0b11110:
             return decode32DataProcessingOrBranch(hw0, hw1)
         case 0b11111:
-            // bit[8] splits plain byte/word/register load-store
-            // (`0`, `0xF8` prefix) from the signed-load family (`1`,
-            // `0xF9`/`0xFB` prefix) — verified against real words from
-            // each branch.
-            if hw0.bit16(8) {
+            // bits[9:8] split this class further — verified against
+            // real words from each confirmed branch: `00` plain byte/
+            // word/register load-store (`0xF8` prefix), `01` the
+            // signed-load family (`0xF9` prefix), `11` long multiply/
+            // multiply-accumulate/divide (`0xFB` prefix, of which only
+            // `UMULL`'s exact bits[7:4] pattern is decoded). `10`
+            // (`0xFA`, SIMD/media-adjacent) isn't decoded.
+            switch hw0.bitField16(9, 8) {
+            case 0b00:
+                return decode32LoadStoreSingle(hw0, hw1)
+            case 0b01:
                 return decode32LoadStoreSignedByte(hw0, hw1)
+            case 0b11:
+                return decode32LongMultiply(hw0, hw1)
+            default:
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             }
-            return decode32LoadStoreSingle(hw0, hw1)
         default:
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
@@ -438,6 +447,19 @@ enum ThumbDecoder {
             isLoad: true, isByte: true, isSigned: true, rn: rn, rt: rt,
             preIndexed: hw1.bit16(10), addOffset: hw1.bit16(9), writeback: hw1.bit16(8),
             offset: UInt32(hw1.bitField16(7, 0))
+        ))
+    }
+
+    /// `UMULL` — see `ThumbUmullInstruction`'s doc comment for the
+    /// exact bit split and its sibling instructions that aren't
+    /// decoded.
+    private static func decode32LongMultiply(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
+        guard hw0.bitField16(15, 8) == 0b1111_1011, hw0.bitField16(7, 4) == 0b1010, hw1.bitField16(7, 4) == 0 else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        return .umull(ThumbUmullInstruction(
+            rdLo: Int(hw1.bitField16(15, 12)), rdHi: Int(hw1.bitField16(11, 8)),
+            rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
         ))
     }
 

@@ -156,6 +156,8 @@ extension ARMv7CPU {
             executeThumbBlockDataTransfer(instr)
         case .tableBranch(let instr):
             executeThumbTableBranch(instr, instructionAddress: instructionAddress)
+        case .umull(let instr):
+            executeThumbUmull(instr)
         case .branch(let instr):
             executeThumbBranch(instr, instructionAddress: instructionAddress)
         case .extend(let instr):
@@ -487,6 +489,14 @@ extension ARMv7CPU {
         }
 
         registers.pc = (instructionAddress &+ 4) &+ (tableValue &* 2)
+    }
+
+    // MARK: - UMULL
+
+    private func executeThumbUmull(_ instr: ThumbUmullInstruction) {
+        let product = UInt64(registers[instr.rn]) &* UInt64(registers[instr.rm])
+        registers[instr.rdLo] = UInt32(truncatingIfNeeded: product)
+        registers[instr.rdHi] = UInt32(truncatingIfNeeded: product >> 32)
     }
 
     // MARK: - Branches

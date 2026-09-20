@@ -410,4 +410,15 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rm, 1)
         XCTAssertTrue(instr.isHalfword)
     }
+
+    func testDecodesUmullFromRealKernel() {
+        // umull r5, r2, r0, r3 — from the real kernel at 0x8008b8f8.
+        guard case .umull(let instr) = ThumbDecoder.decode(0xfba0, 0x5203) else {
+            return XCTFail("Expected umull")
+        }
+        XCTAssertEqual(instr.rdLo, 5)
+        XCTAssertEqual(instr.rdHi, 2)
+        XCTAssertEqual(instr.rn, 0)
+        XCTAssertEqual(instr.rm, 3)
+    }
 }
