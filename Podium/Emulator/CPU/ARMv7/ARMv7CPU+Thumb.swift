@@ -144,6 +144,8 @@ extension ARMv7CPU {
             executeThumbBranchLink(instr, instructionAddress: instructionAddress)
         case .loadStoreWide(let instr):
             executeThumbLoadStoreWide(instr)
+        case .loadStoreRegister(let instr):
+            executeThumbLoadStoreRegister(instr)
         case .blockDataTransfer(let instr):
             executeThumbBlockDataTransfer(instr)
         case .branch(let instr):
@@ -533,6 +535,42 @@ extension ARMv7CPU {
             if instr.writeback { registers[instr.rn] = offsetAddress }
         } else {
             registers[instr.rn] = offsetAddress
+        }
+    }
+
+    // MARK: - Thumb-2: LDR/STR (register)
+
+    /// Always pre-indexed, always adds, never writes back — see
+    /// `ThumbLoadStoreRegisterInstruction`'s doc comment. The offset is
+    /// `Rm LSL imm2`; `applyShift`'s carry-out is discarded since this
+    /// is a data value, not a flag-setting shifter operand.
+    private func executeThumbLoadStoreRegister(_ instr: ThumbLoadStoreRegisterInstruction) {
+        let offset = ShifterOperand.applyShift(
+            .lsl, to: registers[instr.rm], amount: UInt8(instr.shiftAmount), currentCarry: cpsr.carry
+        ).value
+        let address = registers[instr.rn] &+ offset
+
+        do {
+            let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
+            if instr.isLoad {
+                let value = instr.isByte
+                    ? UInt32(try memory.readByte(at: physicalAddress))
+                    : try memory.readWord32(at: physicalAddress)
+                if instr.rt == Registers.pcIndex {
+                    cpsr.thumbState = value.bit(0)
+                    registers.pc = value & ~UInt32(0b1)
+                } else {
+                    registers[instr.rt] = value
+                }
+            } else if instr.isByte {
+                try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+            } else {
+                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+            }
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: address)
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(address), address: address)
         }
     }
 }

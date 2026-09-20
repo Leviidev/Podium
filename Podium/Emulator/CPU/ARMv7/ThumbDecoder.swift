@@ -19,12 +19,13 @@ import Foundation
 /// immediate family, `BL`, `BLX` (immediate), `B.W` (both the
 /// unconditional T4 form and the conditional T3 form, which carries its
 /// own condition field the same way 16-bit `Bcond` does), `LDR`/`STR`/
-/// `LDRB`/`STRB` (immediate, T3 and T4), `LDM`/`STM` (T2, both IA and
-/// DB), and `MCR`/`MRC` (reusing ARM state's exact field layout — see
-/// `decode32Coprocessor`'s doc comment). Everything else — `ADD`/`SUB`
-/// (format 2, register or 3-bit immediate), signed-byte/halfword loads
-/// (format 8), PC-relative `LDR` (format 6), register-offset load/store
-/// (format 7), `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate
+/// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDM`/
+/// `STM` (T2, both IA and DB), and `MCR`/`MRC` (reusing ARM state's
+/// exact field layout — see `decode32Coprocessor`'s doc comment).
+/// Everything else — `ADD`/`SUB` (format 2, register or 3-bit
+/// immediate), signed-byte/halfword loads (format 8), PC-relative `LDR`
+/// (format 6), 16-bit register-offset load/store (format 7),
+/// `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate
 /// beyond 16-bit `MUL`, table branches, the rest of the coprocessor
 /// space (`CDP`/`LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
@@ -261,12 +262,17 @@ enum ThumbDecoder {
     }
 
     /// `LDR`/`STR`/`LDRB`/`STRB` (immediate) — T3 (12-bit unsigned
-    /// offset, always pre-indexed, no writeback) and T4 (8-bit signed
-    /// offset, pre/post-indexed, optional writeback). bits[6:5] select
-    /// size: `10` word, `00` byte (verified against real `str.w`/
-    /// `ldr.w`/`str ...!`/`ldr ...,#4`/`strb` words from the actual
-    /// kernel); `01` (halfword) isn't decoded yet, since no real word
-    /// has confirmed it.
+    /// offset, always pre-indexed, no writeback), T4 (8-bit signed
+    /// offset, pre/post-indexed, optional writeback), and the
+    /// register-offset form (`Rm LSL imm2`, always pre-indexed, never
+    /// writeback — verified against a real `ldr.w r3, [r5, r0, lsl #3]`
+    /// word). bits[6:5] select size: `10` word, `00` byte (verified
+    /// against real `str.w`/`ldr.w`/`str ...!`/`ldr ...,#4`/`strb`
+    /// words from the actual kernel); `01` (halfword) isn't decoded
+    /// yet, since no real word has confirmed it. Within the bit[7]==0
+    /// half, the fixed `1` at hw1 bit[11] distinguishes T4's immediate
+    /// form from the register-offset form's fixed `000000` at
+    /// hw1 bits[11:6].
     private static func decode32LoadStoreSingle(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
         guard hw0.bitField16(15, 8) == 0b1111_1000 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
@@ -287,14 +293,22 @@ enum ThumbDecoder {
                 offset: UInt32(hw1.bitField16(11, 0))
             ))
         }
-        // T4: 8-bit signed immediate with explicit P/U/W bits.
-        guard hw1.bit16(11) else {
+        // T4 (8-bit signed immediate, explicit P/U/W bits, fixed marker
+        // bit[11]==1) vs register-offset form (bits[11:6]==000000,
+        // verified against a real `ldr.w r3, [r5, r0, lsl #3]` word).
+        if hw1.bit16(11) {
+            return .loadStoreWide(ThumbLoadStoreWideInstruction(
+                isLoad: isLoad, isByte: isByte, rn: rn, rt: rt,
+                preIndexed: hw1.bit16(10), addOffset: hw1.bit16(9), writeback: hw1.bit16(8),
+                offset: UInt32(hw1.bitField16(7, 0))
+            ))
+        }
+        guard hw1.bitField16(11, 6) == 0 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
-        return .loadStoreWide(ThumbLoadStoreWideInstruction(
+        return .loadStoreRegister(ThumbLoadStoreRegisterInstruction(
             isLoad: isLoad, isByte: isByte, rn: rn, rt: rt,
-            preIndexed: hw1.bit16(10), addOffset: hw1.bit16(9), writeback: hw1.bit16(8),
-            offset: UInt32(hw1.bitField16(7, 0))
+            rm: Int(hw1.bitField16(3, 0)), shiftAmount: Int(hw1.bitField16(5, 4))
         ))
     }
 

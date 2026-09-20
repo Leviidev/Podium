@@ -236,6 +236,22 @@ struct ThumbLoadStoreWideInstruction: Equatable {
     let offset: UInt32
 }
 
+/// Thumb-2 `LDR`/`STR`/`LDRB`/`STRB` (register) — the register-offset
+/// sibling of `ThumbLoadStoreWideInstruction`'s immediate forms, verified
+/// against a real `ldr.w r3, [r5, r0, lsl #3]` word from the actual
+/// kernel. Always pre-indexed, always adds, never writes back (per ARM
+/// DDI 0406C A8.8.66/A8.8.204: `index=TRUE, add=TRUE, wback=FALSE`), and
+/// the offset is always `Rm LSL imm2` — no other shift type is encodable
+/// here.
+struct ThumbLoadStoreRegisterInstruction: Equatable {
+    let isLoad: Bool
+    let isByte: Bool
+    let rn: Int
+    let rt: Int
+    let rm: Int
+    let shiftAmount: Int
+}
+
 /// Thumb-2 `LDM`/`STM`/`PUSH.W`/`POP.W` (32-bit block data transfer):
 /// same semantics as `BlockDataTransferInstruction`, just IA/DB only
 /// (Thumb-2 doesn't encode IB/DA) — see
@@ -278,6 +294,7 @@ enum ThumbInstruction: Equatable {
     case branchLink(ThumbBranchLinkInstruction)
     case branchWide(ThumbBranchWideInstruction)
     case loadStoreWide(ThumbLoadStoreWideInstruction)
+    case loadStoreRegister(ThumbLoadStoreRegisterInstruction)
     case blockDataTransfer(ThumbBlockDataTransferInstruction)
     /// A recognized-but-not-yet-implemented Thumb instruction family —
     /// see `ThumbDecoder`'s doc comment for what's covered so far.
