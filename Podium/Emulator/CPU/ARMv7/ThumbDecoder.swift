@@ -16,7 +16,8 @@ import Foundation
 /// `PUSH`/`POP` (format 14), `SXTH`/`SXTB`/`UXTH`/`UXTB`, conditional
 /// and unconditional branch (formats 16/18), `CBZ`/`CBNZ`, and `IT`.
 /// Covers (32-bit): `MOVW`/`MOVT`, the data-processing modified-
-/// immediate family, `BL`, `BLX` (immediate), `B.W` (both the
+/// immediate family, the data-processing shifted-register family
+/// (sharing the same op table), `BL`, `BLX` (immediate), `B.W` (both the
 /// unconditional T4 form and the conditional T3 form, which carries its
 /// own condition field the same way 16-bit `Bcond` does), `LDR`/`STR`/
 /// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDM`/
@@ -199,15 +200,27 @@ enum ThumbDecoder {
     private static func decode32(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
         switch hw0.bitField16(15, 11) {
         case 0b11101:
-            // This class covers both load/store multiple/dual/exclusive
-            // (bits[11:8] fixed at 0b0100 for the LDM/STM shape this
-            // codebase already decodes) and coprocessor instructions
-            // (bits[11:8] fixed at 0b1110 for MCR/MRC) — try coprocessor
-            // first since its marker is unambiguous.
-            if hw0.bitField16(11, 8) == 0b1110, hw1.bit16(4) {
-                return decode32Coprocessor(hw0, hw1)
+            // bits[10:9] split this class four ways — verified against
+            // one real kernel word from each confirmed branch: `00`
+            // load/store multiple, `01` data-processing (shifted
+            // register), `11` coprocessor (bits[11:8] fixed at 0b1110
+            // with hw1 bit[4] set for MCR/MRC specifically; other
+            // coprocessor instructions like CDP/LDC/STC aren't
+            // decoded). `10` (load/store dual/exclusive, table branch)
+            // isn't decoded — no real word has confirmed it.
+            switch hw0.bitField16(10, 9) {
+            case 0b00:
+                return decode32LoadStoreMultiple(hw0, hw1)
+            case 0b01:
+                return decode32DataProcessingShiftedRegister(hw0, hw1)
+            case 0b11:
+                if hw0.bitField16(11, 8) == 0b1110, hw1.bit16(4) {
+                    return decode32Coprocessor(hw0, hw1)
+                }
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+            default:
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             }
-            return decode32LoadStoreMultiple(hw0, hw1)
         case 0b11110:
             return decode32DataProcessingOrBranch(hw0, hw1)
         case 0b11111:
@@ -234,6 +247,29 @@ enum ThumbDecoder {
             crn: Int(hw0.bitField16(3, 0)),
             crm: Int(hw1.bitField16(3, 0)),
             opc2: Int(hw1.bitField16(7, 5))
+        ))
+    }
+
+    /// Data-processing (shifted register) — verified against a real
+    /// `sub.w r1, r3, sb` word from the actual kernel. Shares
+    /// `ThumbModifiedImmediateOp`'s table with the modified-immediate
+    /// family (see `ThumbDataProcessingShiftedRegisterInstruction`'s
+    /// doc comment); the shift amount is `imm3:imm2` (bits[14:12] of
+    /// hw1, bits[7:6] of hw1), same split as ARM state's immediate
+    /// shifts.
+    private static func decode32DataProcessingShiftedRegister(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
+        guard let op = ThumbModifiedImmediateOp(rawValue: UInt8(hw0.bitField16(8, 5))) else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        let imm3 = hw1.bitField16(14, 12)
+        let imm2 = hw1.bitField16(7, 6)
+        let shiftAmount = UInt8((imm3 << 2) | imm2)
+        guard let shiftType = ShiftType(rawValue: UInt8(hw1.bitField16(5, 4))) else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        return .dataProcessingShiftedRegister(ThumbDataProcessingShiftedRegisterInstruction(
+            op: op, setFlags: hw0.bit16(4), rn: Int(hw0.bitField16(3, 0)), rd: Int(hw1.bitField16(11, 8)),
+            rm: Int(hw1.bitField16(3, 0)), shiftType: shiftType, shiftAmount: shiftAmount
         ))
     }
 

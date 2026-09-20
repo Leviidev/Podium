@@ -348,4 +348,18 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rm, 0)
         XCTAssertEqual(instr.shiftAmount, 3)
     }
+
+    func testDecodesSubWShiftedRegisterFromRealKernel() {
+        // sub.w r1, r3, sb (r9) — from the real kernel at 0x80018042.
+        guard case .dataProcessingShiftedRegister(let instr) = ThumbDecoder.decode(0xeba3, 0x0109) else {
+            return XCTFail("Expected dataProcessingShiftedRegister")
+        }
+        XCTAssertEqual(instr.op, .sub)
+        XCTAssertFalse(instr.setFlags)
+        XCTAssertEqual(instr.rn, 3)
+        XCTAssertEqual(instr.rd, 1)
+        XCTAssertEqual(instr.rm, 9)
+        XCTAssertEqual(instr.shiftType, .lsl)
+        XCTAssertEqual(instr.shiftAmount, 0)
+    }
 }

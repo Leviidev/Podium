@@ -337,4 +337,16 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[3], 0xC0FF_EE00)
     }
+
+    func testSubWShiftedRegisterRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xeba3, 0x0109, // sub.w r1, r3, sb (r9), real word from the actual kernel
+        ])
+        cpu.registers[3] = 100
+        cpu.registers[9] = 30
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 70)
+    }
 }

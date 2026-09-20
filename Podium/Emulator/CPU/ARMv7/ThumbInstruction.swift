@@ -201,6 +201,26 @@ struct ThumbDataProcessingImmediateInstruction: Equatable {
     let imm32: UInt32
 }
 
+/// Thumb-2 "data-processing (shifted register)" — the 32-bit sibling of
+/// `ThumbDataProcessingImmediateInstruction`, sharing the exact same
+/// `ThumbModifiedImmediateOp` table (ARM DDI 0406C table A5-11 uses the
+/// same op-field encoding as the modified-immediate family's table
+/// A5-6), except operand2 is `Rm` shifted by an immediate amount
+/// instead of a 12-bit modified immediate. Verified against a real
+/// `sub.w r1, r3, sb` word from the actual kernel. `Rd == 1111, S == 1`
+/// is `TST`/`TEQ`/`CMN`/`CMP` (register) the same way as the immediate
+/// family; `ORR` with `Rn == 1111` is the `MOV`/`ASR`/`LSL`/`LSR`/`ROR`
+/// (register-shifted) alias.
+struct ThumbDataProcessingShiftedRegisterInstruction: Equatable {
+    let op: ThumbModifiedImmediateOp
+    let setFlags: Bool
+    let rn: Int
+    let rd: Int
+    let rm: Int
+    let shiftType: ShiftType
+    let shiftAmount: UInt8
+}
+
 /// `BL`/`BLX` (immediate, 32-bit): always unconditional (see
 /// `ARMv7CPU.executeThumbBranchLinkImmediate` for why — matches
 /// `BranchLinkExchangeImmediateInstruction`'s ARM-state reasoning in
@@ -291,6 +311,7 @@ enum ThumbInstruction: Equatable {
     case it(ThumbItInstruction)
     case movWide(ThumbMovWideInstruction)
     case dataProcessingImmediate(ThumbDataProcessingImmediateInstruction)
+    case dataProcessingShiftedRegister(ThumbDataProcessingShiftedRegisterInstruction)
     case branchLink(ThumbBranchLinkInstruction)
     case branchWide(ThumbBranchWideInstruction)
     case loadStoreWide(ThumbLoadStoreWideInstruction)

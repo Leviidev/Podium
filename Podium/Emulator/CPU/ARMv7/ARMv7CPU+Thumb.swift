@@ -140,6 +140,8 @@ extension ARMv7CPU {
             executeThumbMovWide(instr)
         case .dataProcessingImmediate(let instr):
             executeThumbDataProcessingImmediate(instr)
+        case .dataProcessingShiftedRegister(let instr):
+            executeThumbDataProcessingShiftedRegister(instr)
         case .branchLink(let instr):
             executeThumbBranchLink(instr, instructionAddress: instructionAddress)
         case .loadStoreWide(let instr):
@@ -496,6 +498,51 @@ extension ARMv7CPU {
             setNZCV(arithmeticResult)
         } else {
             setNZ(result) // Logical ops: C/V unaffected (no shifter carry for a modified immediate).
+        }
+    }
+
+    // MARK: - Thumb-2: data-processing (shifted register)
+
+    private func executeThumbDataProcessingShiftedRegister(_ instr: ThumbDataProcessingShiftedRegisterInstruction) {
+        let rn = registers[instr.rn]
+        let shifted = ShifterOperand.applyShift(instr.shiftType, to: registers[instr.rm], amount: instr.shiftAmount, currentCarry: cpsr.carry)
+        let operand2 = shifted.value
+        let result: UInt32
+        var arithmeticResult: ALU.AddResult?
+
+        // Same comparison/move aliasing as the modified-immediate
+        // family (see `executeThumbDataProcessingImmediate`).
+        let isComparison = instr.setFlags && instr.rd == Registers.pcIndex
+            && (instr.op == .and || instr.op == .eor || instr.op == .add || instr.op == .sub)
+        let isMove = instr.op == .orr && instr.rn == Registers.pcIndex
+
+        switch instr.op {
+        case .and: result = rn & operand2
+        case .bic: result = rn & ~operand2
+        case .orr: result = isMove ? operand2 : (rn | operand2)
+        case .eor: result = rn ^ operand2
+        case .add:
+            let r = ALU.add(rn, operand2); arithmeticResult = r; result = r.value
+        case .adc:
+            let r = ALU.addWithCarry(rn, operand2, carryIn: cpsr.carry); arithmeticResult = r; result = r.value
+        case .sbc:
+            let r = ALU.subtractWithCarry(rn, operand2, carryIn: cpsr.carry); arithmeticResult = r; result = r.value
+        case .rsb:
+            let r = ALU.subtract(operand2, rn); arithmeticResult = r; result = r.value
+        case .sub:
+            let r = ALU.subtract(rn, operand2); arithmeticResult = r; result = r.value
+        }
+        if !isComparison {
+            writeThumbResult(result, to: instr.rd)
+        }
+
+        guard instr.setFlags else { return }
+        if let arithmeticResult {
+            setNZCV(arithmeticResult)
+        } else {
+            cpsr.negative = result.bit(31)
+            cpsr.zero = result == 0
+            cpsr.carry = shifted.carryOut // Logical ops: C comes from the shifter, unlike the modified-immediate form.
         }
     }
 
