@@ -55,7 +55,7 @@ final class ARMDecoderTests: XCTestCase {
     func testCompareWithFlagsClearIsUnsupportedNotMisdecoded() {
         // CMP's encoding space with S==0 is actually MRS/MSR — must not
         // be decoded as a flag-less CMP.
-        let word: UInt32 = 0xE150_0000 // cond=AL, opcode=CMP(1010), S=0
+        let word: UInt32 = 0xE140_0000 // cond=AL, opcode=CMP(1010), S=0
         if case .dataProcessing = ARMDecoder.decode(word) {
             XCTFail("S==0 CMP-space encoding should not decode as dataProcessing")
         }

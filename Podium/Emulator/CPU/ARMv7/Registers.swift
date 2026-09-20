@@ -57,4 +57,15 @@ struct Registers {
     mutating func reset() {
         storage = Array(repeating: 0, count: 16)
     }
+
+    /// Exposes the register file as a raw pointer for exactly the
+    /// duration of `body` — used to hand a JIT-compiled block direct
+    /// access to guest registers via the AArch64 calling convention
+    /// (see `JITTranslator`), without copying 16 words in and back out
+    /// for every native call.
+    mutating func withUnsafeMutableStorage<T>(_ body: (UnsafeMutablePointer<UInt32>) -> T) -> T {
+        storage.withUnsafeMutableBufferPointer { buffer in
+            body(buffer.baseAddress!)
+        }
+    }
 }

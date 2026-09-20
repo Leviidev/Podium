@@ -15,7 +15,6 @@ enum FileHasher {
             if chunk.isEmpty { break }
             hasher.update(data: chunk)
         }
-        let digest = hasher.finalize()
-        return digest.map { String(format: "%02x", $0) }.joined()
+        return hasher.finalize().hexEncodedString
     }
 }

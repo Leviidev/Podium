@@ -69,7 +69,12 @@ final class ShifterOperandTests: XCTestCase {
     }
 
     func testPCReadAsShiftedRegisterOperandIsInstructionAddressPlusEight() {
-        registers.pc = 100
+        // `registers.pc` holds the address of the *next* instruction to
+        // fetch (see `Registers.pcForOperandRead`'s doc comment) — by the
+        // time an instruction at address 100 is executing, `step()` has
+        // already advanced `pc` to 104. An operand read of r15 should
+        // then see 100 + 8 = 108.
+        registers.pc = 104
         let op = ShifterOperand.shiftedRegister(rm: Registers.pcIndex, shiftType: .lsl, shiftAmount: 0)
         let resolved = op.resolve(registers: registers, currentCarry: false)
         XCTAssertEqual(resolved.value, 108)

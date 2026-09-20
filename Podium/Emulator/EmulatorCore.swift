@@ -5,41 +5,59 @@ import Observation
 ///
 /// `EmulatorCore` depends on every subsystem through a protocol (`CPU?`,
 /// `MemoryBus?`, `AudioOutput`, `NetworkInterface`), never a concrete
-/// type, so the frontend is never coupled to a specific implementation —
-/// today's `nil` CPU and stub audio/network can be swapped for real
-/// implementations as they're built without touching UI code.
+/// type, so the frontend is never coupled to a specific implementation.
 ///
-/// Right now there is no CPU and no memory-mapped hardware, so `status`
-/// stays `.notImplemented`. It does not advance to `.booting` just
-/// because a firmware was selected — that would misrepresent what's
-/// actually happening.
+/// `cpu`/`memory` start `nil` and are brought up lazily by
+/// `activateCoreIfNeeded()` — there's no reason to hold 256 MB of guest
+/// RAM before the user has actually opened the emulator screen. Once
+/// activated, `status` becomes `.ready`: a real ARMv7 interpreter exists
+/// and is reset and waiting, which is honestly what "ready" means here.
+/// It does not advance to `.booting`/`.running` just because a firmware
+/// was selected — there is still no kernelcache extraction or boot
+/// pipeline to actually load and run guest code, so nothing is executing
+/// and status must not claim otherwise.
 @MainActor
 @Observable
 final class EmulatorCore {
     private(set) var status: EmulatorStatus = .notImplemented
     private(set) var log: [EmulatorLogEntry] = []
+    private(set) var cpu: CPU?
+    private(set) var memory: MemoryBus?
 
-    let cpu: CPU?
-    let memory: MemoryBus?
     let audioOutput: AudioOutput
     let networkInterface: NetworkInterface
     let inputController: InputController
 
+    /// The iPod touch 4's actual RAM size (Section 9 of the project spec).
+    static let physicalMemorySize = 256 * 1024 * 1024
+
     private static let logCapacity = 200
 
     init(
-        cpu: CPU? = nil,
-        memory: MemoryBus? = nil,
         audioOutput: AudioOutput = NullAudioOutput(),
         networkInterface: NetworkInterface = NullNetworkInterface(),
         inputController: InputController = PassthroughInputController()
     ) {
-        self.cpu = cpu
-        self.memory = memory
         self.audioOutput = audioOutput
         self.networkInterface = networkInterface
         self.inputController = inputController
-        appendLog("Emulator core not implemented. Firmware parsing and the module architecture are in place; CPU and hardware emulation haven't started yet.")
+        appendLog("Emulator core not implemented. Firmware parsing and the module architecture are in place; no CPU is active yet.")
+    }
+
+    /// Brings up the CPU/memory subsystems if they aren't already. Safe
+    /// to call repeatedly (e.g. every time the emulator screen appears).
+    func activateCoreIfNeeded() {
+        guard cpu == nil else { return }
+
+        let ram = FlatPhysicalMemory(length: Self.physicalMemorySize)
+        let armCPU = ARMv7CPU(memory: ram, jit: JITEngine())
+        armCPU.reset()
+
+        memory = ram
+        cpu = armCPU
+        status = .ready
+        appendLog("ARMv7 interpreter core online (with JIT compilation for eligible instruction sequences). \(Int64(Self.physicalMemorySize).formattedByteCount) physical memory mapped at 0x00000000.")
+        appendLog("No guest firmware is loaded — there is no kernelcache extraction or boot pipeline yet, so the CPU has nothing to execute.")
     }
 
     func sendInput(_ event: InputEvent) {

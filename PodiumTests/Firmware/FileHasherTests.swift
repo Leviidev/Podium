@@ -21,7 +21,7 @@ final class FileHasherTests: XCTestCase {
         try Data("hello world".utf8).write(to: url)
 
         let digest = try FileHasher.sha256(of: url)
-        XCTAssertEqual(digest, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde")
+        XCTAssertEqual(digest, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
     }
 
     func testEmptyFileHashesToKnownEmptyDigest() throws {
@@ -50,7 +50,6 @@ final class FileHasherTests: XCTestCase {
 /// implementation against CryptoKit on the same input.
 private enum SHA256Reference {
     static func hex(of data: Data) -> String {
-        let digest = SHA256.hash(data: data)
-        return digest.map { String(format: "%02x", $0) }.joined()
+        SHA256.hash(data: data).hexEncodedString
     }
 }

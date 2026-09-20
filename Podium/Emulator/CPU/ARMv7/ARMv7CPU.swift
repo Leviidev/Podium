@@ -19,16 +19,26 @@ enum CPUError: Error, Equatable {
 /// rather than skipping the instruction or guessing at its effect —
 /// silently pressing on past something this CPU doesn't actually
 /// understand would make broken execution look like progress.
+///
+/// `jit`, if provided, lets `run()` (not `step()` — single-stepping
+/// always interprets, which is what you want while debugging) execute
+/// eligible straight-line runs as compiled native code instead of one
+/// interpreted instruction at a time. See `JITEngine`/`JITTranslator`
+/// for exactly what's eligible and why a missing/unavailable JIT is a
+/// normal, handled outcome rather than a failure.
 final class ARMv7CPU: CPU {
     private(set) var registers = Registers()
     private(set) var cpsr = CPSR()
     private(set) var lastError: CPUError?
 
+    let jit: JITEngine?
+
     private let memory: MemoryBus
     private var isRunning = false
 
-    init(memory: MemoryBus) {
+    init(memory: MemoryBus, jit: JITEngine? = nil) {
         self.memory = memory
+        self.jit = jit
     }
 
     func reset() {
@@ -64,7 +74,12 @@ final class ARMv7CPU: CPU {
     func run() {
         isRunning = true
         while isRunning && lastError == nil {
-            step()
+            if let jit, let block = jit.block(at: registers.pc, memory: memory) {
+                registers.withUnsafeMutableStorage { block.run(registers: $0) }
+                registers.pc = registers.pc &+ UInt32(4 * block.instructionCount)
+            } else {
+                step()
+            }
         }
     }
 

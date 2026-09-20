@@ -56,6 +56,9 @@ struct EmulatorScreen: View {
                 }
             }
         }
+        .task {
+            emulatorCore.activateCoreIfNeeded()
+        }
     }
 
     /// Maps a tap location within the displayed framebuffer view to the
