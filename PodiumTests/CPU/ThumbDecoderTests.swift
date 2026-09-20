@@ -252,6 +252,18 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.offset, 42)
     }
 
+    func testDecodesStmWFromRealKernel() {
+        // stm.w r1, {r0, r3} — from the real kernel at 0x8027a462.
+        guard case .blockDataTransfer(let instr) = ThumbDecoder.decode(0xe881, 0x0009) else {
+            return XCTFail("Expected blockDataTransfer")
+        }
+        XCTAssertFalse(instr.isLoad)
+        XCTAssertTrue(instr.isIncrement)
+        XCTAssertFalse(instr.writeback)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.registerList, 0x0009) // r0, r3
+    }
+
     func testDecodesStrbFromRealKernel() {
         // strb r0, [r6, #0x64] — from the real kernel at 0x8027b9f2.
         guard case .loadStoreWide(let instr) = ThumbDecoder.decode(0xF886, 0x0064) else {

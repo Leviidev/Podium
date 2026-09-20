@@ -18,7 +18,7 @@ import Foundation
 /// Covers (32-bit): `MOVW`/`MOVT`, the data-processing modified-
 /// immediate family, `BL`, `BLX` (immediate), unconditional `B.W`,
 /// `LDR`/`STR`/`LDRB`/`STRB` (immediate, T3 and T4), and `LDM`/`STM`
-/// (T2, load-only so far). Everything else — `ADD`/`SUB` (format 2,
+/// (T2, IA direction only). Everything else — `ADD`/`SUB` (format 2,
 /// register or 3-bit immediate), signed-byte/halfword loads (format 8),
 /// PC-relative `LDR` (format 6), register-offset load/store (format 7),
 /// `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate beyond
@@ -205,16 +205,18 @@ enum ThumbDecoder {
         }
     }
 
-    /// `LDM`/`STM` (T2) — verified against a real `pop.w` (`LDM`, IA,
-    /// load) word from the actual kernel; the `STM` (DB-only in Thumb-2)
-    /// counterpart isn't decoded yet, since no real word has confirmed
-    /// its exact bit layout.
+    /// `LDM`/`STM` (T2, IA form): verified against a real `pop.w` (load)
+    /// and a real `stm.w` (store) word from the actual kernel — both
+    /// share the exact same bits[15:7]/[6] fixed pattern, differing only
+    /// in bit4 (L). The DB-direction encoding (used by `push.w`/
+    /// `stmdb.w`, when it doesn't fit the 16-bit `PUSH` format) isn't
+    /// decoded yet, since no real word has confirmed its bit layout.
     private static func decode32LoadStoreMultiple(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard hw0.bitField16(15, 7) == 0b111010001, !hw0.bit16(6), hw0.bit16(4) else {
+        guard hw0.bitField16(15, 7) == 0b111010001, !hw0.bit16(6) else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         return .blockDataTransfer(ThumbBlockDataTransferInstruction(
-            isLoad: true, isIncrement: true, writeback: hw0.bit16(5),
+            isLoad: hw0.bit16(4), isIncrement: true, writeback: hw0.bit16(5),
             rn: Int(hw0.bitField16(3, 0)), registerList: hw1
         ))
     }

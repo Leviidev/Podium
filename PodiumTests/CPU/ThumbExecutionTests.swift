@@ -194,6 +194,23 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[1], 0xDD)
     }
 
+    func testStmWStoresRegistersRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xe881, 0x0009, // stm.w r1, {r0, r3}, real word from the actual kernel
+            0xF8D1, 0x2000, // ldr.w r2, [r1]       -- readback of the first stored word
+            0xF8D1, 0x4004, // ldr.w r4, [r1, #4]   -- readback of the second stored word
+        ], memorySize: 256)
+        cpu.registers[0] = 0x1111_1111
+        cpu.registers[3] = 0x3333_3333
+        cpu.registers[1] = 64
+        for _ in 0..<3 { cpu.step() }
+
+        XCTAssertNil(cpu.lastError, "Expected all 3 instructions to run; halted with \(String(describing: cpu.lastError))")
+        XCTAssertEqual(cpu.registers[2], 0x1111_1111) // r0, the lowest-numbered register, at the lowest address
+        XCTAssertEqual(cpu.registers[4], 0x3333_3333) // r3 immediately after
+        XCTAssertEqual(cpu.registers[1], 64, "stm.w without '!' must not write back the base")
+    }
+
     func testUxtbZeroExtendsLowByte() {
         let cpu = makeThumbCPU(program: [
             0xb2c0, // uxtb r0, r0, real word from the actual kernel
