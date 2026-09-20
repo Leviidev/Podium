@@ -454,4 +454,20 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[4], 142) // 6*7 + 100
     }
+
+    func testStrdRealKernelWordStoresConsecutiveWords() {
+        let cpu = makeThumbCPU(program: [
+            0xe9c8, 0x0100, // strd r0, r1, [r8], real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[8] = 16
+        cpu.registers[0] = 0x1111_1111
+        cpu.registers[1] = 0x2222_2222
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        let memory = cpu.memory as! FlatPhysicalMemory
+        XCTAssertEqual(try! memory.readWord32(at: 16), 0x1111_1111)
+        XCTAssertEqual(try! memory.readWord32(at: 20), 0x2222_2222)
+        XCTAssertEqual(cpu.registers[8], 16) // No writeback.
+    }
 }

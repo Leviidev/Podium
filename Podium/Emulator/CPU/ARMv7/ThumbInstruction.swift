@@ -362,6 +362,22 @@ struct ThumbMlaInstruction: Equatable {
     let ra: Int
 }
 
+/// `LDRD`/`STRD` (immediate): transfers `Rt`/`Rt2` to/from consecutive
+/// words at `[Rn, #offset]` and `[Rn, #offset+4]`. Shares
+/// `ThumbTableBranchInstruction`'s decode space (see
+/// `ThumbDecoder.decode32TableBranch`'s doc comment); verified against
+/// a real `strd r0, r1, [r8]` word from the actual kernel.
+struct ThumbLoadStoreDualInstruction: Equatable {
+    let isLoad: Bool
+    let rn: Int
+    let rt: Int
+    let rt2: Int
+    let preIndexed: Bool
+    let addOffset: Bool
+    let writeback: Bool
+    let offset: UInt32
+}
+
 struct ThumbTableBranchInstruction: Equatable {
     let rn: Int
     let rm: Int
@@ -404,6 +420,7 @@ enum ThumbInstruction: Equatable {
     case loadStoreRegister(ThumbLoadStoreRegisterInstruction)
     case blockDataTransfer(ThumbBlockDataTransferInstruction)
     case tableBranch(ThumbTableBranchInstruction)
+    case loadStoreDual(ThumbLoadStoreDualInstruction)
     case umull(ThumbUmullInstruction)
     case mla(ThumbMlaInstruction)
     /// A recognized-but-not-yet-implemented Thumb instruction family —

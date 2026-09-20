@@ -432,4 +432,19 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rm, 3)
         XCTAssertEqual(instr.ra, 2)
     }
+
+    func testDecodesStrdFromRealKernel() {
+        // strd r0, r1, [r8] — from the real kernel at 0x8008b92c.
+        guard case .loadStoreDual(let instr) = ThumbDecoder.decode(0xe9c8, 0x0100) else {
+            return XCTFail("Expected loadStoreDual")
+        }
+        XCTAssertFalse(instr.isLoad)
+        XCTAssertEqual(instr.rn, 8)
+        XCTAssertEqual(instr.rt, 0)
+        XCTAssertEqual(instr.rt2, 1)
+        XCTAssertTrue(instr.preIndexed)
+        XCTAssertTrue(instr.addOffset)
+        XCTAssertFalse(instr.writeback)
+        XCTAssertEqual(instr.offset, 0)
+    }
 }

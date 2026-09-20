@@ -156,6 +156,8 @@ extension ARMv7CPU {
             executeThumbBlockDataTransfer(instr)
         case .tableBranch(let instr):
             executeThumbTableBranch(instr, instructionAddress: instructionAddress)
+        case .loadStoreDual(let instr):
+            executeThumbLoadStoreDual(instr)
         case .umull(let instr):
             executeThumbUmull(instr)
         case .mla(let instr):
@@ -491,6 +493,39 @@ extension ARMv7CPU {
         }
 
         registers.pc = (instructionAddress &+ 4) &+ (tableValue &* 2)
+    }
+
+    // MARK: - LDRD/STRD (immediate)
+
+    private func executeThumbLoadStoreDual(_ instr: ThumbLoadStoreDualInstruction) {
+        let base = registers[instr.rn]
+        let offsetAddress = instr.addOffset ? base &+ instr.offset : base &- instr.offset
+        let transferAddress = instr.preIndexed ? offsetAddress : base
+
+        do {
+            let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
+            let secondAddress = transferAddress &+ 4
+            let secondPhysicalAddress = try translatedAddress(secondAddress, access: instr.isLoad ? .read : .write)
+            if instr.isLoad {
+                registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+                registers[instr.rt2] = try memory.readWord32(at: secondPhysicalAddress)
+            } else {
+                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+                try memory.writeWord32(registers[instr.rt2], at: secondPhysicalAddress)
+            }
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: transferAddress)
+            return
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress)
+            return
+        }
+
+        if instr.preIndexed {
+            if instr.writeback { registers[instr.rn] = offsetAddress }
+        } else {
+            registers[instr.rn] = offsetAddress
+        }
     }
 
     // MARK: - UMULL

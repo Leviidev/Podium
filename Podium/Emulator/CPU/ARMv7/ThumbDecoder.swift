@@ -26,14 +26,15 @@ import Foundation
 /// own condition field the same way 16-bit `Bcond` does), `LDR`/`STR`/
 /// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDRSB`
 /// (immediate, T3 and T4), `LDM`/
-/// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), `UMULL`,
-/// `MLA`, and `MCR`/`MRC` (reusing ARM state's exact field layout —
-/// see `decode32Coprocessor`'s doc comment). Everything else —
-/// PC-relative `LDR` (format 6), `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2
-/// wide form and `MLS` (`MLA`'s siblings), `SMULL`/`UMLAL`/`SMLAL`/
-/// `SDIV`/`UDIV` (`UMULL`'s siblings), `LDREX`/`STREX`/`LDRD`/`STRD`,
-/// the rest of the coprocessor space (`CDP`/`LDC`/`STC`), SIMD/VFP —
-/// decodes to `.unsupported`.
+/// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), `LDRD`/
+/// `STRD` (immediate), `UMULL`, `MLA`, and `MCR`/`MRC` (reusing ARM
+/// state's exact field layout — see `decode32Coprocessor`'s doc
+/// comment). Everything else — PC-relative `LDR` (format 6),
+/// `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2 wide form and `MLS` (`MLA`'s
+/// siblings), `SMULL`/`UMLAL`/`SMLAL`/`SDIV`/`UDIV` (`UMULL`'s
+/// siblings), `LDREX`/`STREX` (Thumb-2 forms — `LDRD`/`STRD`'s
+/// siblings in that same space), the rest of the coprocessor space
+/// (`CDP`/`LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
     /// Whether `firstHalfword` opens a 32-bit Thumb-2 instruction (in
     /// which case the caller must fetch a second halfword before
@@ -350,19 +351,37 @@ enum ThumbDecoder {
         ))
     }
 
-    /// `TBB`/`TBH` (table branch) — verified against a real
-    /// `tbh [pc, r1, lsl #1]` word from the actual kernel. The wider
-    /// "load/store dual/exclusive" sub-family sharing this same
-    /// bit[6]==1 branch (`LDREX`/`STREX`/`LDRD`/`STRD`) isn't decoded,
-    /// since no real word has confirmed any of it — only `TBB`/`TBH`'s
-    /// exact 12-bit hw0 prefix (`111010001101`) and 11-bit hw1 prefix
-    /// (`11110000000`) are matched.
+    /// `TBB`/`TBH` (table branch, verified against a real
+    /// `tbh [pc, r1, lsl #1]` word) and `LDRD`/`STRD` (immediate,
+    /// verified against a real `strd r0, r1, [r8]` word) — both live in
+    /// this bit[6]==1 sub-family (bits[15:9] == `1110100`, guaranteed
+    /// by the caller). `LDREX`/`STREX` (the third member of this space)
+    /// aren't decoded, since no real word has confirmed either.
     private static func decode32TableBranch(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard hw0.bitField16(15, 4) == 0b1110_1000_1101, hw1.bitField16(15, 5) == 0b111_1000_0000 else {
+        if hw0.bitField16(15, 4) == 0b1110_1000_1101, hw1.bitField16(15, 5) == 0b111_1000_0000 {
+            return .tableBranch(ThumbTableBranchInstruction(
+                rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0)), isHalfword: hw1.bit16(4)
+            ))
+        }
+        // LDRD/STRD (immediate): P (bit8), U (bit7), fixed 1 (bit6,
+        // already known true here), W (bit5), L (bit4, 1 = LDRD).
+        // P==0 && W==0 is reserved for the exclusive-access/TBB/TBH
+        // shape within this same space (TBB/TBH already handled above;
+        // LDREX/STREX aren't decoded, since no real word has confirmed
+        // either) — refused here rather than misread as a bogus,
+        // never-pre-indexed-and-never-written-back LDRD/STRD.
+        guard hw0.bit16(8) || hw0.bit16(5) else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
-        return .tableBranch(ThumbTableBranchInstruction(
-            rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0)), isHalfword: hw1.bit16(4)
+        return .loadStoreDual(ThumbLoadStoreDualInstruction(
+            isLoad: hw0.bit16(4),
+            rn: Int(hw0.bitField16(3, 0)),
+            rt: Int(hw1.bitField16(15, 12)),
+            rt2: Int(hw1.bitField16(11, 8)),
+            preIndexed: hw0.bit16(8),
+            addOffset: hw0.bit16(7),
+            writeback: hw0.bit16(5),
+            offset: UInt32(hw1.bitField16(7, 0)) * 4
         ))
     }
 
