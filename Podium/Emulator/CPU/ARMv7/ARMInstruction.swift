@@ -70,9 +70,11 @@ struct BranchInstruction {
 /// `BLX <label>` (immediate form — always lives in the unconditional-
 /// instruction-extension space, so there's no real condition to carry,
 /// unlike `BranchInstruction`): branches with link, *always* switching
-/// to Thumb state. Unlike `BX`, there's no bit to check and no ARM-mode
-/// continuation to fall back to — every one of these halts (see
-/// `ARMv7CPU.executeBranchLinkExchangeImmediate`).
+/// to Thumb state — the mirror image of Thumb state's own `BLX`
+/// (immediate), which always switches to ARM (see
+/// `ThumbBranchLinkInstruction`). Fully executable now that
+/// `ARMv7CPU+Thumb.swift` provides a real Thumb decoder to switch into
+/// (see `ARMv7CPU.executeBranchLinkExchangeImmediate`).
 struct BranchLinkExchangeImmediateInstruction: Equatable {
     /// Signed byte offset from the instruction address + 8, same
     /// convention as `BranchInstruction.signedOffset`.
@@ -81,9 +83,9 @@ struct BranchLinkExchangeImmediateInstruction: Equatable {
 
 /// `BX Rm`: branches to the address in `Rm`, and — on real hardware —
 /// switches to Thumb state if `Rm`'s bit 0 is set (that's the whole
-/// point of the name: Branch and *Exchange* instruction sets). Podium
-/// doesn't decode Thumb, so that bit is checked, not silently masked
-/// off: see `ARMv7CPU.executeBranchExchange`.
+/// point of the name: Branch and *Exchange* instruction sets). Fully
+/// executable — see `ARMv7CPU.executeBranchExchange` — now that a real
+/// Thumb decoder exists to switch into.
 struct BranchExchangeInstruction: Equatable {
     let condition: ARMCondition
     let rm: Int
@@ -249,11 +251,12 @@ enum ARMInstruction: Equatable {
     case moveToStatusRegister(MSRInstruction)
     case coprocessorRegisterTransfer(CoprocessorRegisterTransferInstruction)
     case changeProcessorState(ChangeProcessorStateInstruction)
-    /// `DSB`/`DMB`/`ISB`: memory/instruction ordering barriers. Podium's
-    /// interpreter executes everything strictly in program order with no
-    /// caching, reordering, or pipelining to synchronize — so for this
-    /// CPU, correctly implementing a barrier *is* treating it as a no-op,
-    /// not a missing feature.
+    /// `DSB`/`DMB`/`ISB` (memory/instruction ordering barriers) and
+    /// `PLD` (immediate, a cache-prefetch hint). Podium's interpreter
+    /// executes everything strictly in program order with no caching,
+    /// reordering, or pipelining to synchronize or prefetch for — so for
+    /// this CPU, correctly implementing any of these *is* treating them
+    /// as a no-op, not a missing feature.
     case memoryBarrier
     /// A recognized-but-not-yet-implemented instruction family: multiply
     /// and the "extra load/store" SWP/reserved encodings (SH==00), the

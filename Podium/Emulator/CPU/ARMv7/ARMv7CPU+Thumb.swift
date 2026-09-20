@@ -1,0 +1,541 @@
+import Foundation
+
+/// The Thumb-state half of `ARMv7CPU`: `stepThumb()` fetches and
+/// executes one Thumb instruction (16 or 32-bit), reached only via a
+/// genuine interworking `BX`/`BLX`/`LDM`-into-PC from `cpsr.thumbState`
+/// becoming `true` — never a separate, parallel emulation path. See
+/// `ThumbDecoder`'s doc comment for exactly which instructions are
+/// covered; hitting anything else sets `lastError` and halts, the same
+/// discipline the ARM-state half already follows.
+extension ARMv7CPU {
+    /// The value an instruction sees when it reads r15 as an operand in
+    /// Thumb state: the address of the current instruction + 4 (ARM
+    /// state's equivalent, `Registers.pcForOperandRead`, uses +8) — ARM
+    /// DDI 0406C A2.3, verified against the real "add r4, pc" /
+    /// "add r7, sp, #imm" pattern the actual kernel's Thumb code uses
+    /// for position-independent addressing.
+    private func thumbOperandValue(for register: Int, instructionAddress: UInt32) -> UInt32 {
+        register == Registers.pcIndex ? (instructionAddress &+ 4) : registers[register]
+    }
+
+    /// `ITAdvance()` (ARM DDI 0406C A2.5.2): runs after *every* Thumb
+    /// instruction, whether or not an `IT` block is active. When bits
+    /// [2:0] are all zero, this was the last instruction in the block
+    /// (or no block was active), so the state clears; otherwise the
+    /// low 5 bits shift left by one, folding the next mask bit into the
+    /// position that — combined with the fixed top 3 bits of the
+    /// original condition — forms the *next* instruction's condition
+    /// (this is why condition codes are paired the way they are: only
+    /// the LSB needs to flip to invert one).
+    func advanceThumbITState() {
+        guard itState & 0b111 != 0 else {
+            itState = 0
+            return
+        }
+        let low5 = itState & 0x1F
+        itState = (itState & 0xE0) | ((low5 << 1) & 0x1F)
+    }
+
+    /// The condition the *next* Thumb instruction executes under: the
+    /// current `ITSTATE[7:4]` if a block is active, `.always` otherwise.
+    func currentThumbCondition() -> ARMCondition {
+        guard itState & 0xF != 0 else { return .always }
+        return ARMCondition(rawBits: UInt32(itState >> 4))
+    }
+
+    func stepThumb() {
+        let instructionAddress = registers.pc
+        let hw0: UInt16
+        do {
+            let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
+            hw0 = try memory.readWord16(at: physicalAddress)
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: instructionAddress)
+            return
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(instructionAddress), address: instructionAddress)
+            return
+        }
+
+        let isWide = ThumbDecoder.isThirtyTwoBitFirstHalfword(hw0)
+        var hw1: UInt16 = 0
+        if isWide {
+            do {
+                let physicalAddress2 = try translatedAddress(instructionAddress &+ 2, access: .execute)
+                hw1 = try memory.readWord16(at: physicalAddress2)
+            } catch let memoryError as MemoryAccessError {
+                lastError = .memoryFault(memoryError, address: instructionAddress &+ 2)
+                return
+            } catch {
+                lastError = .memoryFault(.unmappedAddress(instructionAddress &+ 2), address: instructionAddress &+ 2)
+                return
+            }
+        }
+
+        registers.pc = instructionAddress &+ (isWide ? 4 : 2)
+
+        let instruction = ThumbDecoder.decode(hw0, hw1)
+
+        switch instruction {
+        case .conditionalBranch(let instr):
+            // Bcond carries its own condition — never gated by ITSTATE.
+            advanceThumbITState()
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeThumbConditionalBranch(instr, instructionAddress: instructionAddress)
+
+        case .it(let instr):
+            // IT can't itself be inside a block, and sets fresh state
+            // rather than being gated/advanced by prior state.
+            itState = (instr.firstCondition << 4) | instr.mask
+
+        case .compareBranch(let instr):
+            // CBZ/CBNZ can't appear inside an IT block either.
+            advanceThumbITState()
+            executeThumbCompareBranch(instr, instructionAddress: instructionAddress)
+
+        default:
+            let condition = currentThumbCondition()
+            advanceThumbITState()
+            guard cpsr.isSatisfied(condition) else { return }
+            executeThumb(instruction, hw0: hw0, instructionAddress: instructionAddress)
+        }
+    }
+
+    private func executeThumb(_ instruction: ThumbInstruction, hw0: UInt16, instructionAddress: UInt32) {
+        switch instruction {
+        case .shiftImmediate(let instr):
+            executeThumbShiftImmediate(instr)
+        case .immediate(let instr):
+            executeThumbImmediate(instr)
+        case .alu(let instr):
+            executeThumbAlu(instr)
+        case .hiRegister(let instr):
+            executeThumbHiRegister(instr, instructionAddress: instructionAddress)
+        case .branchExchange(let instr):
+            executeThumbBranchExchange(instr, instructionAddress: instructionAddress)
+        case .loadStoreImmediate(let instr):
+            executeThumbLoadStoreImmediate(instr)
+        case .address(let instr):
+            executeThumbAddress(instr, instructionAddress: instructionAddress)
+        case .adjustStack(let instr):
+            executeThumbAdjustStack(instr)
+        case .pushPop(let instr):
+            executeThumbPushPop(instr)
+        case .movWide(let instr):
+            executeThumbMovWide(instr)
+        case .dataProcessingImmediate(let instr):
+            executeThumbDataProcessingImmediate(instr)
+        case .branchLink(let instr):
+            executeThumbBranchLink(instr, instructionAddress: instructionAddress)
+        case .branchWide(let instr):
+            executeThumbBranchWide(instr, instructionAddress: instructionAddress)
+        case .loadStoreWide(let instr):
+            executeThumbLoadStoreWide(instr)
+        case .blockDataTransfer(let instr):
+            executeThumbBlockDataTransfer(instr)
+        case .branch(let instr):
+            executeThumbBranch(instr, instructionAddress: instructionAddress)
+        case .extend(let instr):
+            executeThumbExtend(instr)
+        case .conditionalBranch, .it, .compareBranch:
+            preconditionFailure("handled in stepThumb before reaching executeThumb")
+        case .unsupported:
+            lastError = .unsupportedInstruction(rawWord: UInt32(hw0), address: instructionAddress)
+        case .undefined:
+            lastError = .undefinedInstruction(rawWord: UInt32(hw0), address: instructionAddress)
+        }
+    }
+
+    // MARK: - Flags
+
+    private func setNZ(_ result: UInt32) {
+        cpsr.negative = result.bit(31)
+        cpsr.zero = result == 0
+    }
+
+    private func setNZCV(_ result: ALU.AddResult) {
+        cpsr.negative = result.value.bit(31)
+        cpsr.zero = result.value == 0
+        cpsr.carry = result.carryOut
+        cpsr.overflow = result.overflow
+    }
+
+    /// `Shift_C()` for a *register*-specified amount (ARM DDI 0406C
+    /// A2.2.1) — format 4's `LSL`/`LSR`/`ASR`/`ROR Rdn, Rm`. Distinct
+    /// from `ShifterOperand`'s immediate-shift logic: an encoded 0
+    /// there means "LSR/ASR #32" or ROR's RRX, reserved-value
+    /// conventions that only make sense for a shift amount fixed at
+    /// decode time. Here, where the amount is a runtime register value,
+    /// 0 always means "no shift, value and carry unchanged" for every
+    /// shift type, per the ARM ARM.
+    private static func registerSpecifiedShift(_ type: ShiftType, value: UInt32, by amount: UInt32, currentCarry: Bool) -> (UInt32, Bool) {
+        guard amount != 0 else { return (value, currentCarry) }
+        switch type {
+        case .lsl:
+            if amount >= 32 {
+                return (0, amount == 32 && (value & 1 != 0))
+            }
+            return (value << amount, (value >> (32 - amount)) & 1 != 0)
+        case .lsr:
+            if amount >= 32 {
+                return (0, amount == 32 && (value & 0x8000_0000 != 0))
+            }
+            return (value >> amount, (value >> (amount - 1)) & 1 != 0)
+        case .asr:
+            let signed = Int32(bitPattern: value)
+            if amount >= 32 {
+                let allOnes = signed < 0
+                return (allOnes ? 0xFFFF_FFFF : 0, allOnes)
+            }
+            return (UInt32(bitPattern: signed >> amount), (value >> (amount - 1)) & 1 != 0)
+        case .ror:
+            let rotated = ShifterOperand.rotateRight(value, by: amount)
+            return (rotated, rotated & 0x8000_0000 != 0)
+        }
+    }
+
+    // MARK: - Format 1: LSL/LSR/ASR by immediate
+
+    private func executeThumbShiftImmediate(_ instr: ThumbShiftImmediateInstruction) {
+        let resolved = ShifterOperand.applyShift(instr.shiftType, to: registers[instr.rm], amount: instr.imm5, currentCarry: cpsr.carry)
+        registers[instr.rd] = resolved.value
+        cpsr.negative = resolved.value.bit(31)
+        cpsr.zero = resolved.value == 0
+        cpsr.carry = resolved.carryOut
+    }
+
+    // MARK: - Format 3: immediate MOV/CMP/ADD/SUB
+
+    private func executeThumbImmediate(_ instr: ThumbImmediateInstruction) {
+        switch instr.op {
+        case .mov:
+            registers[instr.rdn] = instr.imm8
+            setNZ(instr.imm8) // Carry/overflow unaffected — no shifter involved.
+        case .cmp:
+            setNZCV(ALU.subtract(registers[instr.rdn], instr.imm8))
+        case .add:
+            let r = ALU.add(registers[instr.rdn], instr.imm8)
+            registers[instr.rdn] = r.value
+            setNZCV(r)
+        case .sub:
+            let r = ALU.subtract(registers[instr.rdn], instr.imm8)
+            registers[instr.rdn] = r.value
+            setNZCV(r)
+        }
+    }
+
+    // MARK: - Format 4: two-register ALU
+
+    private func executeThumbAlu(_ instr: ThumbAluInstruction) {
+        let rdn = registers[instr.rdn]
+        let rm = registers[instr.rm]
+        switch instr.op {
+        case .and:
+            registers[instr.rdn] = rdn & rm
+            setNZ(registers[instr.rdn]) // C/V unaffected: no shift.
+        case .eor:
+            registers[instr.rdn] = rdn ^ rm
+            setNZ(registers[instr.rdn])
+        case .orr:
+            registers[instr.rdn] = rdn | rm
+            setNZ(registers[instr.rdn])
+        case .bic:
+            registers[instr.rdn] = rdn & ~rm
+            setNZ(registers[instr.rdn])
+        case .mvn:
+            registers[instr.rdn] = ~rm
+            setNZ(registers[instr.rdn])
+        case .tst:
+            setNZ(rdn & rm)
+        case .lsl, .lsr, .asr, .ror:
+            let shiftType: ShiftType = instr.op == .lsl ? .lsl : (instr.op == .lsr ? .lsr : (instr.op == .asr ? .asr : .ror))
+            let (value, carry) = Self.registerSpecifiedShift(shiftType, value: rdn, by: rm & 0xFF, currentCarry: cpsr.carry)
+            registers[instr.rdn] = value
+            cpsr.negative = value.bit(31); cpsr.zero = value == 0; cpsr.carry = carry
+        case .adc:
+            let r = ALU.addWithCarry(rdn, rm, carryIn: cpsr.carry)
+            registers[instr.rdn] = r.value
+            setNZCV(r)
+        case .sbc:
+            let r = ALU.subtractWithCarry(rdn, rm, carryIn: cpsr.carry)
+            registers[instr.rdn] = r.value
+            setNZCV(r)
+        case .rsb: // NEG Rdn, Rm == RSB Rdn, Rm, #0
+            let r = ALU.subtract(0, rm)
+            registers[instr.rdn] = r.value
+            setNZCV(r)
+        case .cmp:
+            setNZCV(ALU.subtract(rdn, rm))
+        case .cmn:
+            setNZCV(ALU.add(rdn, rm))
+        case .mul:
+            registers[instr.rdn] = rdn &* rm
+            setNZ(registers[instr.rdn]) // C/V unaffected on ARMv7 (deprecated setting flags at all).
+        }
+    }
+
+    // MARK: - SXTH/SXTB/UXTH/UXTB
+
+    private func executeThumbExtend(_ instr: ThumbExtendInstruction) {
+        let value = registers[instr.rm]
+        switch instr.kind {
+        case .signedHalfword:
+            registers[instr.rd] = UInt32(bitPattern: Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: value))))
+        case .signedByte:
+            registers[instr.rd] = UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: value))))
+        case .unsignedHalfword:
+            registers[instr.rd] = value & 0xFFFF
+        case .unsignedByte:
+            registers[instr.rd] = value & 0xFF
+        }
+    }
+
+    // MARK: - Format 5: hi-register ADD/CMP/MOV
+
+    private func executeThumbHiRegister(_ instr: ThumbHiRegisterInstruction, instructionAddress: UInt32) {
+        let rdnValue = thumbOperandValue(for: instr.rdn, instructionAddress: instructionAddress)
+        let rmValue = thumbOperandValue(for: instr.rm, instructionAddress: instructionAddress)
+        switch instr.op {
+        case .cmp:
+            setNZCV(ALU.subtract(rdnValue, rmValue)) // Only hi-register form that sets flags.
+        case .add:
+            writeThumbResult(rdnValue &+ rmValue, to: instr.rdn)
+        case .mov:
+            writeThumbResult(rmValue, to: instr.rdn)
+        }
+    }
+
+    /// Writing r15 from a hi-register `ADD`/`MOV` performs an
+    /// interworking branch on real ARMv7 (checking bit 0 the same way
+    /// `BX` does), rather than just relocating execution in the current
+    /// state — this is what lets position-independent code compute a
+    /// target with `add r0, pc, r1` and then `mov pc, r0`.
+    private func writeThumbResult(_ value: UInt32, to register: Int) {
+        if register == Registers.pcIndex {
+            cpsr.thumbState = value.bit(0)
+            registers.pc = value & ~UInt32(0b1)
+        } else {
+            registers[register] = value
+        }
+    }
+
+    // MARK: - BX/BLX (register)
+
+    private func executeThumbBranchExchange(_ instr: ThumbBranchExchangeInstruction, instructionAddress: UInt32) {
+        let target = registers[instr.rm]
+        if instr.link {
+            registers.lr = registers.pc | 1
+        }
+        cpsr.thumbState = target.bit(0)
+        registers.pc = target & ~UInt32(0b1)
+    }
+
+    // MARK: - Format 9/11: LDR/STR with immediate offset
+
+    private func executeThumbLoadStoreImmediate(_ instr: ThumbLoadStoreImmediateInstruction) {
+        let address = registers[instr.rn] &+ instr.offset
+        do {
+            let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
+            if instr.isLoad {
+                registers[instr.rt] = instr.isByte
+                    ? UInt32(try memory.readByte(at: physicalAddress))
+                    : try memory.readWord32(at: physicalAddress)
+            } else if instr.isByte {
+                try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+            } else {
+                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+            }
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: address)
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(address), address: address)
+        }
+    }
+
+    // MARK: - Format 12: ADD Rd, PC/SP, #imm8*4
+
+    private func executeThumbAddress(_ instr: ThumbAddressInstruction, instructionAddress: UInt32) {
+        let base = instr.usesSP ? registers.sp : ((instructionAddress &+ 4) & ~UInt32(0b11))
+        registers[instr.rd] = base &+ (instr.imm8 &* 4)
+    }
+
+    // MARK: - Format 13: ADD/SUB SP, #imm7*4
+
+    private func executeThumbAdjustStack(_ instr: ThumbAdjustStackInstruction) {
+        let delta = instr.imm7 &* 4
+        registers.sp = instr.subtract ? registers.sp &- delta : registers.sp &+ delta
+    }
+
+    // MARK: - Format 14 / Thumb-2 T2: PUSH/POP and LDM/STM
+
+    private func executeThumbPushPop(_ instr: ThumbPushPopInstruction) {
+        executeThumbBlockDataTransfer(ThumbBlockDataTransferInstruction(
+            isLoad: instr.isLoad, isIncrement: instr.isLoad, writeback: true,
+            rn: Registers.spIndex, registerList: instr.registerList
+        ))
+    }
+
+    /// Same ascending-register/ascending-address technique as
+    /// `ARMv7CPU.executeBlockDataTransfer` — Thumb-2 only ever encodes
+    /// IA (used by `POP`/`LDM`) or DB (used by `PUSH`/`STMDB`), never
+    /// IB/DA, so there's no `preIndexed` axis to plumb through here.
+    private func executeThumbBlockDataTransfer(_ instr: ThumbBlockDataTransferInstruction) {
+        let baseValue = registers[instr.rn]
+        let count = instr.registerList.nonzeroBitCount
+        guard count > 0 else { return }
+        let transferSize = UInt32(count) * 4
+        var address = instr.isIncrement ? baseValue : (baseValue &- transferSize)
+
+        do {
+            for index in 0..<16 {
+                guard (instr.registerList >> index) & 1 == 1 else { continue }
+                let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
+                if instr.isLoad {
+                    let value = try memory.readWord32(at: physicalAddress)
+                    if index == Registers.pcIndex {
+                        cpsr.thumbState = value.bit(0)
+                        registers.pc = value & ~UInt32(0b1)
+                    } else {
+                        registers[index] = value
+                    }
+                } else {
+                    try memory.writeWord32(registers[index], at: physicalAddress)
+                }
+                address = address &+ 4
+            }
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: address)
+            return
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(address), address: address)
+            return
+        }
+
+        if instr.writeback {
+            registers[instr.rn] = instr.isIncrement ? baseValue &+ transferSize : baseValue &- transferSize
+        }
+    }
+
+    // MARK: - Branches
+
+    private func executeThumbConditionalBranch(_ instr: ThumbConditionalBranchInstruction, instructionAddress: UInt32) {
+        registers.pc = UInt32(bitPattern: Int32(bitPattern: instructionAddress &+ 4) &+ instr.signedOffset)
+    }
+
+    private func executeThumbBranch(_ instr: ThumbBranchInstruction, instructionAddress: UInt32) {
+        registers.pc = UInt32(bitPattern: Int32(bitPattern: instructionAddress &+ 4) &+ instr.signedOffset)
+    }
+
+    private func executeThumbCompareBranch(_ instr: ThumbCompareBranchInstruction, instructionAddress: UInt32) {
+        let takeBranch = instr.branchIfNonZero ? (registers[instr.rn] != 0) : (registers[instr.rn] == 0)
+        guard takeBranch else { return }
+        registers.pc = instructionAddress &+ 4 &+ instr.offset
+    }
+
+    private func executeThumbBranchLink(_ instr: ThumbBranchLinkInstruction, instructionAddress: UInt32) {
+        let base = instr.switchesToARM ? ((instructionAddress &+ 4) & ~UInt32(0b11)) : (instructionAddress &+ 4)
+        let target = UInt32(bitPattern: Int32(bitPattern: base) &+ instr.signedOffset)
+        registers.lr = registers.pc | 1
+        if instr.switchesToARM {
+            cpsr.thumbState = false
+            registers.pc = target & ~UInt32(0b11)
+        } else {
+            registers.pc = target
+        }
+    }
+
+    private func executeThumbBranchWide(_ instr: ThumbBranchWideInstruction, instructionAddress: UInt32) {
+        registers.pc = UInt32(bitPattern: Int32(bitPattern: instructionAddress &+ 4) &+ instr.signedOffset)
+    }
+
+    // MARK: - Thumb-2: MOVW/MOVT
+
+    private func executeThumbMovWide(_ instr: ThumbMovWideInstruction) {
+        if instr.isTop {
+            registers[instr.rd] = (registers[instr.rd] & 0x0000_FFFF) | (UInt32(instr.imm16) << 16)
+        } else {
+            registers[instr.rd] = UInt32(instr.imm16)
+        }
+    }
+
+    // MARK: - Thumb-2: data-processing (modified immediate)
+
+    private func executeThumbDataProcessingImmediate(_ instr: ThumbDataProcessingImmediateInstruction) {
+        let rn = registers[instr.rn]
+        let result: UInt32
+        var arithmeticResult: ALU.AddResult?
+
+        // AND/EOR/ADD/SUB with Rd==PC,S==1 are the TST/TEQ/CMN/CMP
+        // aliases (comparisons: no result written). ORR with Rn==PC is
+        // the MOV alias (result is the immediate itself, unmasked by Rn).
+        let isComparison = instr.setFlags && instr.rd == Registers.pcIndex
+            && (instr.op == .and || instr.op == .eor || instr.op == .add || instr.op == .sub)
+        let isMove = instr.op == .orr && instr.rn == Registers.pcIndex
+
+        switch instr.op {
+        case .and: result = rn & instr.imm32
+        case .bic: result = rn & ~instr.imm32
+        case .orr: result = isMove ? instr.imm32 : (rn | instr.imm32)
+        case .eor: result = rn ^ instr.imm32
+        case .add:
+            let r = ALU.add(rn, instr.imm32); arithmeticResult = r; result = r.value
+        case .adc:
+            let r = ALU.addWithCarry(rn, instr.imm32, carryIn: cpsr.carry); arithmeticResult = r; result = r.value
+        case .sbc:
+            let r = ALU.subtractWithCarry(rn, instr.imm32, carryIn: cpsr.carry); arithmeticResult = r; result = r.value
+        case .rsb:
+            let r = ALU.subtract(instr.imm32, rn); arithmeticResult = r; result = r.value
+        case .sub:
+            let r = ALU.subtract(rn, instr.imm32); arithmeticResult = r; result = r.value
+        }
+        if !isComparison {
+            if instr.rd == Registers.pcIndex {
+                writeThumbResult(result, to: instr.rd)
+            } else {
+                registers[instr.rd] = result
+            }
+        }
+
+        guard instr.setFlags else { return }
+        if let arithmeticResult {
+            setNZCV(arithmeticResult)
+        } else {
+            setNZ(result) // Logical ops: C/V unaffected (no shifter carry for a modified immediate).
+        }
+    }
+
+    // MARK: - Thumb-2: LDR/STR (immediate, T3/T4)
+
+    private func executeThumbLoadStoreWide(_ instr: ThumbLoadStoreWideInstruction) {
+        let base = registers[instr.rn]
+        let offsetAddress = instr.addOffset ? base &+ instr.offset : base &- instr.offset
+        let transferAddress = instr.preIndexed ? offsetAddress : base
+
+        do {
+            let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
+            if instr.isLoad {
+                let value = try memory.readWord32(at: physicalAddress)
+                if instr.rt == Registers.pcIndex {
+                    cpsr.thumbState = value.bit(0)
+                    registers.pc = value & ~UInt32(0b1)
+                } else {
+                    registers[instr.rt] = value
+                }
+            } else {
+                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+            }
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: transferAddress)
+            return
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress)
+            return
+        }
+
+        if instr.preIndexed {
+            if instr.writeback { registers[instr.rn] = offsetAddress }
+        } else {
+            registers[instr.rn] = offsetAddress
+        }
+    }
+}

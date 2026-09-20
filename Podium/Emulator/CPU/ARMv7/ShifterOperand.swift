@@ -45,7 +45,12 @@ enum ShifterOperand {
         return (value >> amount) | (value << (32 - amount))
     }
 
-    private static func applyShift(_ type: ShiftType, to value: UInt32, amount: UInt8, currentCarry: Bool) -> Resolved {
+    /// Not `private`: `ARMv7CPU+Thumb.swift`'s format-1 shift-by-
+    /// immediate (`LSL`/`LSR`/`ASR Rd, Rm, #imm5`) uses the exact same
+    /// immediate-shift conventions as ARM state (an encoded `LSR`/`ASR`
+    /// `#0` means `#32`), so it reuses this directly rather than
+    /// duplicating it.
+    static func applyShift(_ type: ShiftType, to value: UInt32, amount: UInt8, currentCarry: Bool) -> Resolved {
         switch type {
         case .lsl:
             guard amount != 0 else {

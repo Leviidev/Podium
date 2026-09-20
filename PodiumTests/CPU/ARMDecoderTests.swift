@@ -208,6 +208,14 @@ final class ARMDecoderTests: XCTestCase {
         }
     }
 
+    func testDecodesPldFromRealKernel() {
+        // pld [r1, #32] — from the real kernel at 0x80089798, reached
+        // via a genuine Thumb-to-ARM `blx` this CPU can now follow.
+        guard case .memoryBarrier = ARMDecoder.decode(0xF5D1_F020) else {
+            return XCTFail("Expected memoryBarrier")
+        }
+    }
+
     func testDecodesMcrFromRealKernel() {
         // mcr p15, #0, r11, c7, c5, #0 (instruction-cache invalidate),
         // from the real kernel at 0x80086098.

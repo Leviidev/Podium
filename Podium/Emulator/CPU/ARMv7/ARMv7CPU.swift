@@ -6,40 +6,41 @@ enum CPUError: Error, Equatable {
     case memoryFault(MemoryAccessError, address: UInt32)
     /// The guest executed and decoded fine, but asked for real hardware
     /// behavior this CPU doesn't implement and can't safely pretend to —
-    /// right now: SCTLR.AFE (the access-flag AP model; see `ARMv7MMU`'s
-    /// doc comment for why that one specifically isn't implemented,
-    /// unlike MMU translation itself, which is), and a `BX`/`BLX`
-    /// interworking branch requesting Thumb state — `BLX` (immediate)
-    /// always does, `BX` only when its register's bit 0 is set — since
-    /// no Thumb decode exists to switch to. Halting here is the honest
-    /// choice; a normal
-    /// "unsupported instruction" halt wouldn't be accurate, since the
-    /// instruction *is* understood.
+    /// right now, just SCTLR.AFE (the access-flag AP model; see
+    /// `ARMv7MMU`'s doc comment for why that one specifically isn't
+    /// implemented, unlike MMU translation itself, which is). `BX`/`BLX`
+    /// interworking to Thumb state no longer halts here — see
+    /// `ARMv7CPU+Thumb.swift` — now that a real Thumb decoder exists.
+    /// Halting here is the honest choice; a normal "unsupported
+    /// instruction" halt wouldn't be accurate, since the instruction
+    /// *is* understood.
     case unimplementedHardwareFeature(description: String, address: UInt32)
 }
 
-/// The ARM-state ARMv7 interpreter: `ARMDecoder` turns each fetched word
+/// The ARMv7 interpreter: `ARMDecoder` turns each fetched ARM-state word
 /// into an `ARMInstruction`, this executes it against `Registers`/`CPSR`,
-/// with all memory access going through the injected `MemoryBus`.
+/// with all memory access going through the injected `MemoryBus`. Thumb
+/// state (`cpsr.thumbState`) is real too — see `ARMv7CPU+Thumb.swift`
+/// for `stepThumb()`/`ThumbDecoder`/`ThumbInstruction` — reached via a
+/// genuine interworking `BX`/`BLX`, not a separate, disconnected mode.
 ///
-/// What this does *not* do yet, honestly: Thumb decode, exceptions and
-/// interrupts (the `I`/`F` CPSR mask bits `CPS` sets are tracked, but
-/// nothing actually raises an interrupt for them to gate). Address
-/// translation, once the guest sets SCTLR.M, *is* real — see `ARMv7MMU`
-/// — walking the guest's own translation tables for every instruction
-/// fetch and data access rather than leaving memory untranslated; CP15
-/// registers other than the ones that walk directly reads (like SCTLR,
-/// TTBR0/1, TTBCR, DACR) are still just a stored value — see
-/// `CP15State` — not acted on (cache maintenance, TLB invalidation,
-/// etc). Several ARM-state instruction families are also unimplemented:
-/// multiply, block transfer (LDM/STM), register-shifted-by-register
-/// operands, SPSR access, most of the coprocessor and unconditional-
-/// instruction spaces, SWI (see
-/// `ARMDecoder`'s doc comment for the exact list). Hitting any of those
-/// sets `lastError` and halts rather than skipping the instruction or
-/// guessing at its effect — silently pressing on past something this
-/// CPU doesn't actually understand would make broken execution look
-/// like progress.
+/// What this does *not* do yet, honestly: exceptions and interrupts (the
+/// `I`/`F` CPSR mask bits `CPS` sets are tracked, but nothing actually
+/// raises an interrupt for them to gate). Address translation, once the
+/// guest sets SCTLR.M, *is* real — see `ARMv7MMU` — walking the guest's
+/// own translation tables for every instruction fetch and data access
+/// rather than leaving memory untranslated; CP15 registers other than
+/// the ones that walk directly reads (like SCTLR, TTBR0/1, TTBCR, DACR)
+/// are still just a stored value — see `CP15State` — not acted on (cache
+/// maintenance, TLB invalidation, etc). Several ARM-state instruction
+/// families are also unimplemented: multiply, register-shifted-by-
+/// register operands, SPSR access, most of the coprocessor and
+/// unconditional-instruction spaces, SWI (see `ARMDecoder`'s doc comment
+/// for the exact list); Thumb has its own, separate coverage gaps (see
+/// `ThumbDecoder`'s doc comment). Hitting any of those sets `lastError`
+/// and halts rather than skipping the instruction or guessing at its
+/// effect — silently pressing on past something this CPU doesn't
+/// actually understand would make broken execution look like progress.
 ///
 /// `jit`, if provided, lets `run()` (not `step()` — single-stepping
 /// always interprets, which is what you want while debugging) execute
@@ -48,15 +49,27 @@ enum CPUError: Error, Equatable {
 /// for exactly what's eligible and why a missing/unavailable JIT is a
 /// normal, handled outcome rather than a failure.
 final class ARMv7CPU: CPU {
-    private(set) var registers = Registers()
-    private(set) var cpsr = CPSR()
-    private(set) var lastError: CPUError?
-    private(set) var cp15 = CP15State()
+    // Not `private(set)`: `ARMv7CPU+Thumb.swift` (in the same module)
+    // needs to mutate these directly, the same way every ARM-state
+    // execute method in this file already does. External modules still
+    // can't write to them, only read.
+    var registers = Registers()
+    var cpsr = CPSR()
+    var lastError: CPUError?
+    var cp15 = CP15State()
 
     let jit: JITEngine?
 
-    private let memory: MemoryBus
+    let memory: MemoryBus
     private var isRunning = false
+
+    /// Thumb's `ITSTATE`: bits[7:4] hold the condition for the
+    /// instruction about to execute, bits[3:0] the remaining mask —
+    /// `0` means no `IT` block is active. See `ARMv7CPU+Thumb.swift`'s
+    /// `currentThumbCondition()`/`advanceThumbITState()` for the state
+    /// machine, verified against real `it`/`itt`/`ittt` words from the
+    /// actual kernel (ARM DDI 0406C A2.5.2).
+    var itState: UInt8 = 0
 
     init(memory: MemoryBus, jit: JITEngine? = nil) {
         self.memory = memory
@@ -68,6 +81,7 @@ final class ARMv7CPU: CPU {
         cpsr.reset()
         lastError = nil
         isRunning = false
+        itState = 0
     }
 
     /// Sets all 16 registers at once — how a kernel image's
@@ -85,6 +99,11 @@ final class ARMv7CPU: CPU {
 
     func step() {
         guard lastError == nil else { return }
+
+        if cpsr.thumbState {
+            stepThumb()
+            return
+        }
 
         let instructionAddress = registers.pc
         let word: UInt32
@@ -255,12 +274,12 @@ final class ARMv7CPU: CPU {
     /// SCTLR.M is the one real source of truth for this, and deriving it
     /// keeps a plain CP15 write (`cp15.write` below) sufficient to turn
     /// the MMU on or off, exactly like real hardware.
-    private var mmuEnabled: Bool {
+    var mmuEnabled: Bool {
         cp15.read(coprocessor: Self.sctlrCoprocessor, opc1: Self.sctlrOpc1, crn: Self.sctlrCRn, crm: Self.sctlrCRm, opc2: Self.sctlrOpc2)
             & Self.sctlrMMUEnableBit != 0
     }
 
-    private func translatedAddress(_ virtualAddress: UInt32, access: ARMv7MMU.Access) throws -> UInt32 {
+    func translatedAddress(_ virtualAddress: UInt32, access: ARMv7MMU.Access) throws -> UInt32 {
         guard mmuEnabled else { return virtualAddress }
         return try ARMv7MMU.translate(virtualAddress: virtualAddress, access: access, cp15: cp15, memory: memory)
     }
@@ -308,7 +327,7 @@ final class ARMv7CPU: CPU {
         // for it to gate.
     }
 
-    private func operandValue(for register: Int) -> UInt32 {
+    func operandValue(for register: Int) -> UInt32 {
         register == Registers.pcIndex ? registers.pcForOperandRead : registers[register]
     }
 
@@ -374,10 +393,11 @@ final class ARMv7CPU: CPU {
         }
 
         if instr.rd == Registers.pcIndex && !instr.op.isComparison {
-            // Simplification: real ARMv7 can interwork to Thumb via bit 0
-            // here (BX-style). Only ARM-state word-aligned targets are
-            // handled — that's the whole CPU state right now.
-            registers.pc = result & ~UInt32(0b11)
+            // ALUWritePC: on ARMv7, a data-processing instruction that
+            // writes r15 interworks exactly like BX (checking bit 0),
+            // not just a plain same-state jump.
+            cpsr.thumbState = result.bit(0)
+            registers.pc = result & ~UInt32(0b1)
         }
     }
 
@@ -393,30 +413,29 @@ final class ARMv7CPU: CPU {
 
     private func executeBranchExchange(_ instr: BranchExchangeInstruction, instructionAddress: UInt32) {
         let target = operandValue(for: instr.rm)
-        guard !target.bit(0) else {
-            // The guest is requesting a switch to Thumb state — real,
-            // meaningfully different behavior this CPU can't provide
-            // (see `ARMDecoder`'s doc comment: no Thumb decode). Masking
-            // the bit off and continuing in ARM state would silently
-            // execute the wrong instruction stream at that address
-            // instead of honestly stopping.
-            lastError = .unimplementedHardwareFeature(
-                description: "guest requested a BX interworking branch to Thumb state at 0x\(target.hexString8) — no Thumb decode is implemented",
-                address: instructionAddress
-            )
-            return
-        }
-        registers.pc = target
+        // Real interworking: bit 0 of the target selects the resulting
+        // state (1 = Thumb, 0 = ARM) — both are genuinely executable now
+        // that `ARMv7CPU+Thumb.swift` exists, so this never halts.
+        cpsr.thumbState = target.bit(0)
+        registers.pc = target & ~UInt32(0b1)
     }
 
     private func executeBranchLinkExchangeImmediate(_ instr: BranchLinkExchangeImmediateInstruction, instructionAddress: UInt32) {
         let target = UInt32(bitPattern: Int32(bitPattern: registers.pcForOperandRead) &+ instr.signedOffset)
-        // Unlike BX, there's no bit to check and no ARM-mode fallback:
-        // BLX (immediate) always switches to Thumb, so this always halts.
-        lastError = .unimplementedHardwareFeature(
-            description: "guest executed BLX (immediate) to 0x\(target.hexString8), an unconditional switch to Thumb state — no Thumb decode is implemented",
-            address: instructionAddress
-        )
+        // `registers.pc` already holds the address of the instruction
+        // after this one (see `step()`) — exactly what LR should hold;
+        // it's already word-aligned (ARM instructions always are), so no
+        // interworking bit needs to be forced into it here. `BLX`
+        // (immediate), executed from ARM state, always switches *to*
+        // Thumb — the mirror image of Thumb state's own `BLX`
+        // (immediate), which always switches to ARM (see
+        // `ARMv7CPU+Thumb.swift`'s `executeThumbBranchLink`). The target
+        // only needs halfword alignment, already folded into
+        // `signedOffset` via the H bit at decode time — unlike the
+        // Thumb-side form, this one must not force 4-byte alignment.
+        registers.lr = registers.pc
+        cpsr.thumbState = true
+        registers.pc = target
     }
 
     /// ARM ARM's block-transfer addressing modes (IA/IB/DA/DB) only
@@ -449,14 +468,11 @@ final class ARMv7CPU: CPU {
                 if instr.isLoad {
                     let value = try memory.readWord32(at: physicalAddress)
                     if index == Registers.pcIndex {
-                        guard !value.bit(0) else {
-                            lastError = .unimplementedHardwareFeature(
-                                description: "guest requested an LDM interworking branch to Thumb state at 0x\(value.hexString8) — no Thumb decode is implemented",
-                                address: instructionAddress
-                            )
-                            return
-                        }
-                        registers.pc = value & ~UInt32(0b11)
+                        // Real interworking, same as BX — see
+                        // `ARMv7CPU+Thumb.swift`'s `executeThumbBlockDataTransfer`
+                        // for the Thumb-side `LDM`-into-PC equivalent.
+                        cpsr.thumbState = value.bit(0)
+                        registers.pc = value & ~UInt32(0b1)
                     } else {
                         registers[index] = value
                     }
@@ -498,7 +514,9 @@ final class ARMv7CPU: CPU {
                     ? UInt32(try memory.readByte(at: physicalAddress))
                     : try memory.readWord32(at: physicalAddress)
                 if instr.rd == Registers.pcIndex {
-                    registers.pc = value & ~UInt32(0b11)
+                    // LDRWritePC: real interworking, same as BX.
+                    cpsr.thumbState = value.bit(0)
+                    registers.pc = value & ~UInt32(0b1)
                 } else {
                     registers[instr.rd] = value
                 }

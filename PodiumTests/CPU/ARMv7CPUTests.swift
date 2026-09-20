@@ -345,19 +345,17 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers.pc, 16)
     }
 
-    func testBxToThumbInterworkingAddressHaltsHonestly() {
+    func testBxWithBit0SetSwitchesToThumbState() {
         let cpu = makeCPU(program: [
-            0xE3A0_E011, // MOV lr, #17     (bit0 set: real hardware would switch to Thumb)
+            0xE3A0_E011, // MOV lr, #17     (bit0 set: requests Thumb)
             0xE12F_FF1E, // bx lr
         ])
         cpu.step() // MOV
-        cpu.step() // bx lr -- should halt here
+        cpu.step() // bx lr -- real interworking now that Thumb decode exists
 
-        guard case .unimplementedHardwareFeature(let description, let address) = cpu.lastError else {
-            return XCTFail("Expected .unimplementedHardwareFeature, got \(String(describing: cpu.lastError))")
-        }
-        XCTAssertTrue(description.contains("Thumb"))
-        XCTAssertEqual(address, 4) // the bx instruction's own address
+        XCTAssertNil(cpu.lastError)
+        XCTAssertTrue(cpu.cpsr.thumbState)
+        XCTAssertEqual(cpu.registers.pc, 16) // bit 0 cleared from the target
     }
 
     func testPushThenPopRoundTripsRegistersThroughTheStack() {
@@ -427,20 +425,18 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers.sp, 108) // writeback: 100 + 2*4
     }
 
-    func testPopIntoPCWithThumbBitSetHaltsHonestly() {
+    func testPopIntoPCWithThumbBitSetSwitchesToThumbState() {
         let cpu = makeCPU(program: [
             0xE3A0_D064, // MOV sp, #100
             0xE3A0_102D, // MOV r1, #45   -- bit0 set: requests Thumb interworking
             0xE58D_1004, // STR r1, [sp, #4]
-            0xE8BD_8010, // pop {r4, pc}  -- should halt on the Thumb-bit check
+            0xE8BD_8010, // pop {r4, pc}  -- real interworking now that Thumb decode exists
         ], memorySize: 256)
         for _ in 0..<4 { cpu.step() }
 
-        guard case .unimplementedHardwareFeature(let description, let address) = cpu.lastError else {
-            return XCTFail("Expected .unimplementedHardwareFeature, got \(String(describing: cpu.lastError))")
-        }
-        XCTAssertTrue(description.contains("Thumb"))
-        XCTAssertEqual(address, 12) // the pop instruction's own address
+        XCTAssertNil(cpu.lastError)
+        XCTAssertTrue(cpu.cpsr.thumbState)
+        XCTAssertEqual(cpu.registers.pc, 44) // bit 0 cleared from the loaded value
     }
 
     func testStrhThenLdrhRoundTripsUnsignedAndZeroExtends() {
@@ -494,18 +490,15 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 68)
     }
 
-    func testBlxImmediateHaltsHonestlyRequestingThumb() {
+    func testBlxImmediateSwitchesToThumbState() {
         let cpu = makeCPU(program: [
             0xFAFF_FA81, // blx 0x802b8268, real word from the actual kernel (offset relative to address 0 here)
         ])
-        cpu.step()
+        cpu.step() // real interworking now that Thumb decode exists
 
-        guard case .unimplementedHardwareFeature(let description, let address) = cpu.lastError else {
-            return XCTFail("Expected .unimplementedHardwareFeature, got \(String(describing: cpu.lastError))")
-        }
-        XCTAssertTrue(description.contains("Thumb"))
-        XCTAssertTrue(description.contains("BLX"))
-        XCTAssertEqual(address, 0) // the blx instruction's own address
+        XCTAssertNil(cpu.lastError)
+        XCTAssertTrue(cpu.cpsr.thumbState)
+        XCTAssertEqual(cpu.registers.lr, 4) // return address: the next ARM instruction, already word-aligned
     }
 
     func testConditionalInstructionSkippedWhenConditionFails() {

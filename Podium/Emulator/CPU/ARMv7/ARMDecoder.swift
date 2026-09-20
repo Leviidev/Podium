@@ -278,10 +278,20 @@ enum ARMDecoder {
     }
 
     /// The `cond == 1111` "unconditional instruction extension" space.
-    /// `CPS`, the `DSB`/`DMB`/`ISB` barriers, and `BLX` (immediate) are
-    /// recognized; everything else there (PLD/PLI, SETEND, ...) decodes
-    /// to `.unsupported`.
+    /// `CPS`, the `DSB`/`DMB`/`ISB` barriers, `PLD` (immediate), and
+    /// `BLX` (immediate) are recognized; everything else there (`PLI`,
+    /// `PLD` register-offset, `SETEND`, ...) decodes to `.unsupported`.
     private static func decodeUnconditionalSpace(_ word: UInt32) -> ARMInstruction {
+        // PLD (immediate): bits[27:24] == 0101, bit21 == 0, bit20 == 1,
+        // bits[15:12] == 1111 (all fixed) — confirmed against a real
+        // word from the actual kernel ("pld [r1, #32]" at 0x80089798).
+        // A pure cache-prefetch hint: exactly like the DSB/DMB/ISB
+        // barriers below, correctly implementing it *is* treating it as
+        // a no-op, since this CPU has no cache model for it to hint to.
+        if word.bitField(27, 24) == 0b0101, !word.bit(21), word.bit(20), word.bitField(15, 12) == 0b1111 {
+            return .memoryBarrier
+        }
+
         // BLX (immediate): bits[27:25] == 0b101 (fixed) — always an
         // unconditional switch to Thumb state, confirmed against a real
         // word from the actual kernel at 0x802b985c ("blx 0x802b8268",
