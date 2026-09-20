@@ -11,14 +11,19 @@ enum CPUError: Error, Equatable {
 /// with all memory access going through the injected `MemoryBus`.
 ///
 /// What this does *not* do yet, honestly: Thumb decode, exceptions and
-/// interrupts, MMU-mediated addressing (reads/writes go straight to
-/// physical addresses), and several ARM-state instruction families —
-/// multiply, block transfer (LDM/STM), register-offset/register-shifted
-/// operands, MSR/MRS, coprocessor, SWI (see `ARMDecoder`'s doc comment
-/// for the exact list). Hitting any of those sets `lastError` and halts
-/// rather than skipping the instruction or guessing at its effect —
-/// silently pressing on past something this CPU doesn't actually
-/// understand would make broken execution look like progress.
+/// interrupts (the `I`/`F` CPSR mask bits `CPS` sets are tracked, but
+/// nothing actually raises an interrupt for them to gate), MMU-mediated
+/// addressing (reads/writes go straight to physical addresses, and
+/// `MCR`/`MRC` transfers to/from CP15 are stored/returned as a plain
+/// register file — see `CP15State` — not acted on), and several
+/// ARM-state instruction families: multiply, block transfer (LDM/STM),
+/// register-shifted-by-register operands, MSR/MRS, most of the
+/// coprocessor and unconditional-instruction spaces, SWI (see
+/// `ARMDecoder`'s doc comment for the exact list). Hitting any of those
+/// sets `lastError` and halts rather than skipping the instruction or
+/// guessing at its effect — silently pressing on past something this
+/// CPU doesn't actually understand would make broken execution look
+/// like progress.
 ///
 /// `jit`, if provided, lets `run()` (not `step()` — single-stepping
 /// always interprets, which is what you want while debugging) execute
@@ -30,6 +35,7 @@ final class ARMv7CPU: CPU {
     private(set) var registers = Registers()
     private(set) var cpsr = CPSR()
     private(set) var lastError: CPUError?
+    private(set) var cp15 = CP15State()
 
     let jit: JITEngine?
 
@@ -138,12 +144,60 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeLoadStore(instr)
 
+        case .movWide(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeMovWide(instr)
+
+        case .coprocessorRegisterTransfer(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeCoprocessorRegisterTransfer(instr)
+
+        case .changeProcessorState(let instr):
+            executeChangeProcessorState(instr)
+
+        case .memoryBarrier:
+            // A real no-op: see ARMInstruction.memoryBarrier's doc comment.
+            break
+
         case .unsupported:
             lastError = .unsupportedInstruction(rawWord: rawWord, address: instructionAddress)
 
         case .undefined:
             lastError = .undefinedInstruction(rawWord: rawWord, address: instructionAddress)
         }
+    }
+
+    private func executeMovWide(_ instr: MovWideInstruction) {
+        if instr.isTop {
+            registers[instr.rd] = (registers[instr.rd] & 0x0000_FFFF) | (UInt32(instr.imm16) << 16)
+        } else {
+            registers[instr.rd] = UInt32(instr.imm16)
+        }
+    }
+
+    private func executeCoprocessorRegisterTransfer(_ instr: CoprocessorRegisterTransferInstruction) {
+        if instr.isLoad {
+            let value = cp15.read(coprocessor: instr.coprocessor, opc1: instr.opc1, crn: instr.crn, crm: instr.crm, opc2: instr.opc2)
+            if instr.rt == Registers.pcIndex {
+                // MRC into r15 updates just the NZCV flags on real
+                // hardware (an oddity of that one encoding); not
+                // meaningful without real CP15 semantics behind it, so
+                // this is simply not modeled rather than guessed at.
+                return
+            }
+            registers[instr.rt] = value
+        } else {
+            let value = operandValue(for: instr.rt)
+            cp15.write(coprocessor: instr.coprocessor, opc1: instr.opc1, crn: instr.crn, crm: instr.crm, opc2: instr.opc2, value: value)
+        }
+    }
+
+    private func executeChangeProcessorState(_ instr: ChangeProcessorStateInstruction) {
+        if instr.affectsIRQ { cpsr.irqDisabled = !instr.enable }
+        if instr.affectsFIQ { cpsr.fiqDisabled = !instr.enable }
+        // affectsAbort (the 'A' bit) isn't modeled: CPSR doesn't expose
+        // an abort mask bit yet, and nothing raises an abort exception
+        // for it to gate.
     }
 
     private func operandValue(for register: Int) -> UInt32 {
@@ -231,7 +285,15 @@ final class ARMv7CPU: CPU {
 
     private func executeLoadStore(_ instr: LoadStoreInstruction) {
         let base = operandValue(for: instr.rn)
-        let offsetAddress = instr.addOffset ? base &+ instr.immediateOffset : base &- instr.immediateOffset
+        let offsetValue: UInt32
+        switch instr.offset {
+        case .immediate(let value):
+            offsetValue = value
+        case .register(let rm, let shiftType, let shiftAmount):
+            let operand = ShifterOperand.shiftedRegister(rm: rm, shiftType: shiftType, shiftAmount: shiftAmount)
+            offsetValue = operand.resolve(registers: registers, currentCarry: cpsr.carry).value
+        }
+        let offsetAddress = instr.addOffset ? base &+ offsetValue : base &- offsetValue
         let transferAddress = instr.preIndexed ? offsetAddress : base
 
         do {

@@ -6,9 +6,12 @@ import Foundation
 ///
 /// SPSR (the banked "saved" CPSR used to restore state on exception
 /// return) is not modeled yet — there is no exception entry/exit for it
-/// to matter to. Only the condition flags (N/Z/C/V) are used by this CPU
-/// slice; the mode/T/I/F bits are stored faithfully but not yet acted on
-/// (no mode banking, no Thumb decode, no interrupt masking).
+/// to matter to. The condition flags (N/Z/C/V) are read by every
+/// conditional instruction, and `irqDisabled`/`fiqDisabled` are real,
+/// `CPS`-settable state — but since this CPU never raises an interrupt,
+/// nothing yet reads them back to decide whether one should be taken.
+/// The mode bits are stored faithfully but not yet acted on (no mode
+/// banking, no Thumb decode).
 struct CPSR {
     var rawValue: UInt32
 
@@ -16,6 +19,8 @@ struct CPSR {
     private static let zeroBit: UInt32 = 1 << 30
     private static let carryBit: UInt32 = 1 << 29
     private static let overflowBit: UInt32 = 1 << 28
+    private static let irqDisabledBit: UInt32 = 1 << 7
+    private static let fiqDisabledBit: UInt32 = 1 << 6
     private static let thumbBit: UInt32 = 1 << 5
 
     /// System mode (0b11111): all registers unbanked, matching
@@ -46,6 +51,16 @@ struct CPSR {
     var overflow: Bool {
         get { rawValue & Self.overflowBit != 0 }
         set { setBit(Self.overflowBit, newValue) }
+    }
+
+    var irqDisabled: Bool {
+        get { rawValue & Self.irqDisabledBit != 0 }
+        set { setBit(Self.irqDisabledBit, newValue) }
+    }
+
+    var fiqDisabled: Bool {
+        get { rawValue & Self.fiqDisabledBit != 0 }
+        set { setBit(Self.fiqDisabledBit, newValue) }
     }
 
     var thumbState: Bool {

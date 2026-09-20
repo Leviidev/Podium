@@ -6,17 +6,31 @@ import Foundation
 /// what makes it independently unit-testable and, eventually, reusable
 /// by a JIT front end without dragging CPU state along.
 ///
-/// Covers data-processing (both operand2 forms), branch (B/BL), and
-/// single-register load/store with an immediate offset. Everything else
-/// — multiply, block transfer (LDM/STM), register-offset load/store,
-/// MSR/MRS, coprocessor, SWI, Thumb — decodes to `.unsupported` rather
-/// than being misinterpreted.
+/// Covers data-processing (both operand2 forms), `MOVW`/`MOVT`, branch
+/// (B/BL), single-register load/store (immediate *and* register
+/// offset), `MCR`/`MRC`, `CPS`, and the `DSB`/`DMB`/`ISB` barriers.
+/// Everything else — multiply, block transfer (LDM/STM), register-
+/// shifted-by-register operand2, MSR/MRS, most of the coprocessor and
+/// unconditional-instruction-extension spaces, SWI, Thumb — decodes to
+/// `.unsupported` rather than being misinterpreted. Every case added
+/// here so far was verified against real, disassembled instruction
+/// words from the actual iPod4,1 6.1.6 kernel, not written from
+/// specification alone.
 enum ARMDecoder {
     static func decode(_ word: UInt32) -> ARMInstruction {
-        let condition = ARMCondition(rawBits: word.bitField(31, 28))
-        if condition == .never {
-            return .undefined(rawWord: word)
+        let condBits = word.bitField(31, 28)
+        guard condBits != 0b1111 else {
+            // Not "never execute" — ARMv6+ repurposes this as a whole
+            // separate "unconditional instruction extension" space
+            // (CPS, barriers, PLD/PLI, SETEND, BLX-immediate, ...),
+            // always executed regardless of flags. Conflating it with
+            // the reserved NV condition would make CPS/barrier
+            // instructions (which real boot code uses almost
+            // immediately) look "undefined" instead of "not decoded
+            // yet" — a materially different, less honest status.
+            return decodeUnconditionalSpace(word)
         }
+        let condition = ARMCondition(rawBits: condBits)
 
         switch word.bitField(27, 26) {
         case 0b00:
@@ -26,11 +40,27 @@ enum ARMDecoder {
         case 0b10:
             return decodeBranchOrBlockTransfer(word, condition: condition)
         default:
-            return .unsupported(rawWord: word) // Coprocessor / SWI space.
+            return decodeCoprocessorBlock(word, condition: condition)
         }
     }
 
     private static func decodeDataProcessingBlock(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
+        // MOVW/MOVT (ARMv6T2+) share the data-processing block but are a
+        // structurally different instruction — a 16-bit immediate with
+        // no rotation, no Rn, no shifter carry-out — so they're checked
+        // before falling through to the classic opcode/operand2 logic
+        // that would otherwise misread their imm4/imm12 fields as an
+        // opcode and shift amount.
+        if word.bitField(27, 20) == 0b0011_0000 || word.bitField(27, 20) == 0b0011_0100 {
+            let imm16 = UInt16((word.bitField(19, 16) << 12) | word.bitField(11, 0))
+            return .movWide(MovWideInstruction(
+                condition: condition,
+                isTop: word.bit(22),
+                rd: Int(word.bitField(15, 12)),
+                imm16: imm16
+            ))
+        }
+
         let immediateOperand = word.bit(25)
 
         if !immediateOperand && word.bit(4) && word.bit(7) {
@@ -88,11 +118,26 @@ enum ARMDecoder {
     }
 
     private static func decodeLoadStoreBlock(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
-        // For load/store (unlike data-processing), bit 25 == 1 means a
-        // *register* offset — the opposite convention from the I bit
-        // above. That form isn't decoded yet.
+        let offset: LoadStoreOffset
         if word.bit(25) {
-            return .unsupported(rawWord: word)
+            // Register offset — the *opposite* convention from data-
+            // processing's I bit, but the same bits[11:4] shift encoding.
+            // bit4==1 here is the same "register-specified shift amount"
+            // form data-processing doesn't decode either, for the same
+            // reason: it isn't safe to reinterpret Rs as a shift-immediate.
+            if word.bit(4) {
+                return .unsupported(rawWord: word)
+            }
+            guard let shiftType = ShiftType(rawValue: UInt8(word.bitField(6, 5))) else {
+                return .unsupported(rawWord: word)
+            }
+            offset = .register(
+                rm: Int(word.bitField(3, 0)),
+                shiftType: shiftType,
+                shiftAmount: UInt8(word.bitField(11, 7))
+            )
+        } else {
+            offset = .immediate(word.bitField(11, 0))
         }
 
         return .loadStore(LoadStoreInstruction(
@@ -104,7 +149,7 @@ enum ARMDecoder {
             writeback: word.bit(21),
             rn: Int(word.bitField(19, 16)),
             rd: Int(word.bitField(15, 12)),
-            immediateOffset: word.bitField(11, 0)
+            offset: offset
         ))
     }
 
@@ -118,5 +163,65 @@ enum ARMDecoder {
         let signedOffset = signExtended << 2
 
         return .branch(BranchInstruction(condition: condition, link: word.bit(24), signedOffset: signedOffset))
+    }
+
+    /// `MCR`/`MRC` (coprocessor register transfer) — the one coprocessor
+    /// instruction shape decoded so far. Identified by bits[27:24]==1110
+    /// and bit4==1 (the same "1" that also distinguishes MCR/MRC from
+    /// CDP within this space); everything else in the coprocessor block
+    /// (CDP, LDC/STC, MCRR/MRRC) stays `.unsupported`.
+    private static func decodeCoprocessorBlock(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
+        guard word.bitField(27, 24) == 0b1110, word.bit(4) else {
+            return .unsupported(rawWord: word)
+        }
+
+        return .coprocessorRegisterTransfer(CoprocessorRegisterTransferInstruction(
+            condition: condition,
+            isLoad: word.bit(20),
+            coprocessor: Int(word.bitField(11, 8)),
+            opc1: Int(word.bitField(23, 21)),
+            rt: Int(word.bitField(15, 12)),
+            crn: Int(word.bitField(19, 16)),
+            crm: Int(word.bitField(3, 0)),
+            opc2: Int(word.bitField(7, 5))
+        ))
+    }
+
+    /// The `cond == 1111` "unconditional instruction extension" space.
+    /// Only `CPS` and the `DSB`/`DMB`/`ISB` barriers are recognized;
+    /// everything else there (PLD/PLI, SETEND, BLX-immediate, ...)
+    /// decodes to `.unsupported`.
+    private static func decodeUnconditionalSpace(_ word: UInt32) -> ARMInstruction {
+        // CPS: bits[27:20] == 0b0001_0000 (fixed).
+        if word.bitField(27, 20) == 0b0001_0000 {
+            let imod = word.bitField(19, 18)
+            // imod == 0b10/0b11 select enable/disable; 0b00/0b01 are
+            // reserved for a form (changing mode without touching masks)
+            // this CPU doesn't model.
+            guard imod == 0b10 || imod == 0b11 else {
+                return .unsupported(rawWord: word)
+            }
+            return .changeProcessorState(ChangeProcessorStateInstruction(
+                enable: imod == 0b10,
+                affectsAbort: word.bit(8),
+                affectsIRQ: word.bit(7),
+                affectsFIQ: word.bit(6)
+            ))
+        }
+
+        // DSB/DMB/ISB: bits[27:8] fixed at 0x57FF0, with bits[7:4]
+        // selecting which barrier (0100/0101/0110) — a distinction this
+        // CPU doesn't need since all three are no-ops for a strictly-
+        // in-order interpreter with no cache model. bits[3:0] (the
+        // "option", typically 0b1111 = SY) aren't checked at all.
+        if word.bitField(27, 8) == 0x5_7FF0 {
+            let barrierKind = word.bitField(7, 4)
+            guard (0b0100...0b0110).contains(barrierKind) else {
+                return .unsupported(rawWord: word)
+            }
+            return .memoryBarrier
+        }
+
+        return .unsupported(rawWord: word)
     }
 }

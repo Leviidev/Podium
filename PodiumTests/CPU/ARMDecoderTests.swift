@@ -102,7 +102,7 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertFalse(instr.writeback)
         XCTAssertEqual(instr.rn, 1)
         XCTAssertEqual(instr.rd, 0)
-        XCTAssertEqual(instr.immediateOffset, 4)
+        XCTAssertEqual(instr.offset, .immediate(4))
     }
 
     func testDecodesStoreWordPostIndexedSubtract() {
@@ -115,17 +115,33 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertFalse(instr.addOffset)
         XCTAssertEqual(instr.rn, 3)
         XCTAssertEqual(instr.rd, 2)
-        XCTAssertEqual(instr.immediateOffset, 8)
+        XCTAssertEqual(instr.offset, .immediate(8))
     }
 
-    func testRegisterOffsetLoadStoreIsUnsupported() {
-        // Same family as LDR/STR but bit 25 == 1 -> register offset, not decoded.
-        let word: UInt32 = 0xE791_0002
-        if case .unsupported = ARMDecoder.decode(word) {
-            // expected
-        } else {
-            XCTFail("Expected .unsupported for register-offset load/store")
+    func testDecodesRegisterOffsetLoad() {
+        // LDR r0, [r1, r2] — verified against the real iPod4,1 6.1.6
+        // kernel's "ldr lr, [pc, lr]" at 0x80086090 (raw 0xE79FE00E),
+        // using r0/r1/r2 here just to keep the fixture simple.
+        guard case .loadStore(let instr) = ARMDecoder.decode(0xE791_0002) else {
+            return XCTFail("Expected loadStore")
         }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertTrue(instr.preIndexed)
+        XCTAssertTrue(instr.addOffset)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertEqual(instr.offset, .register(rm: 2, shiftType: .lsl, shiftAmount: 0))
+    }
+
+    func testDecodesRealKernelRegisterOffsetLoad() {
+        // The actual instruction from the real kernel this was verified against.
+        guard case .loadStore(let instr) = ARMDecoder.decode(0xE79F_E00E) else {
+            return XCTFail("Expected loadStore")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertEqual(instr.rn, Registers.pcIndex)
+        XCTAssertEqual(instr.rd, Registers.lrIndex)
+        XCTAssertEqual(instr.offset, .register(rm: Registers.lrIndex, shiftType: .lsl, shiftAmount: 0))
     }
 
     func testMultiplyEncodingSpaceIsUnsupportedNotDataProcessing() {
@@ -137,12 +153,71 @@ final class ARMDecoderTests: XCTestCase {
         }
     }
 
-    func testNeverConditionIsUndefined() {
-        let word: UInt32 = 0xF3A0_0005 // cond bits 1111
-        if case .undefined = ARMDecoder.decode(word) {
+    func testUnrecognizedUnconditionalSpaceEncodingIsUnsupportedNotUndefined() {
+        // cond bits 1111 ("NV") no longer means "never execute" from
+        // ARMv6 on — it's the unconditional-instruction-extension space
+        // (CPS, barriers, ...). An encoding within that space this
+        // decoder doesn't recognize is honestly "not decoded yet"
+        // (.unsupported), not "genuinely invalid" (.undefined).
+        let word: UInt32 = 0xF3A0_0005
+        if case .unsupported = ARMDecoder.decode(word) {
             // expected
         } else {
-            XCTFail("Expected .undefined for the NV condition")
+            XCTFail("Expected .unsupported for an unrecognized unconditional-space encoding")
         }
+    }
+
+    func testDecodesMovwFromRealKernel() {
+        // movw lr, #0xc42c — the actual instruction that first halted
+        // execution of the real iPod4,1 6.1.6 kernel, at 0x80086088.
+        guard case .movWide(let instr) = ARMDecoder.decode(0xE30C_E42C) else {
+            return XCTFail("Expected movWide")
+        }
+        XCTAssertFalse(instr.isTop)
+        XCTAssertEqual(instr.rd, Registers.lrIndex)
+        XCTAssertEqual(instr.imm16, 0xC42C)
+    }
+
+    func testDecodesMovtFromRealKernel() {
+        // movt lr, #0x24 — the very next instruction in the same kernel.
+        guard case .movWide(let instr) = ARMDecoder.decode(0xE340_E024) else {
+            return XCTFail("Expected movWide")
+        }
+        XCTAssertTrue(instr.isTop)
+        XCTAssertEqual(instr.rd, Registers.lrIndex)
+        XCTAssertEqual(instr.imm16, 0x0024)
+    }
+
+    func testDecodesCpsidFromRealKernel() {
+        // cpsid if — disables IRQ and FIQ, from the real kernel at 0x80086094.
+        guard case .changeProcessorState(let instr) = ARMDecoder.decode(0xF10C_00C0) else {
+            return XCTFail("Expected changeProcessorState")
+        }
+        XCTAssertFalse(instr.enable)
+        XCTAssertFalse(instr.affectsAbort)
+        XCTAssertTrue(instr.affectsIRQ)
+        XCTAssertTrue(instr.affectsFIQ)
+    }
+
+    func testDecodesIsbFromRealKernel() {
+        // isb sy, from the real kernel at 0x8008609c.
+        guard case .memoryBarrier = ARMDecoder.decode(0xF57F_F06F) else {
+            return XCTFail("Expected memoryBarrier")
+        }
+    }
+
+    func testDecodesMcrFromRealKernel() {
+        // mcr p15, #0, r11, c7, c5, #0 (instruction-cache invalidate),
+        // from the real kernel at 0x80086098.
+        guard case .coprocessorRegisterTransfer(let instr) = ARMDecoder.decode(0xEE07_BF15) else {
+            return XCTFail("Expected coprocessorRegisterTransfer")
+        }
+        XCTAssertFalse(instr.isLoad) // MCR: ARM register -> coprocessor
+        XCTAssertEqual(instr.coprocessor, 15)
+        XCTAssertEqual(instr.opc1, 0)
+        XCTAssertEqual(instr.rt, 11)
+        XCTAssertEqual(instr.crn, 7)
+        XCTAssertEqual(instr.crm, 5)
+        XCTAssertEqual(instr.opc2, 0)
     }
 }
