@@ -8,13 +8,14 @@ import Foundation
 ///
 /// Covers data-processing (both operand2 forms), `MOVW`/`MOVT`, branch
 /// (B/BL), single-register load/store (immediate *and* register
-/// offset), `MCR`/`MRC`, `CPS`, and the `DSB`/`DMB`/`ISB` barriers.
-/// Everything else — multiply, block transfer (LDM/STM), register-
-/// shifted-by-register operand2, MSR/MRS, most of the coprocessor and
-/// unconditional-instruction-extension spaces, SWI, Thumb — decodes to
-/// `.unsupported` rather than being misinterpreted. Every case added
-/// here so far was verified against real, disassembled instruction
-/// words from the actual iPod4,1 6.1.6 kernel, not written from
+/// offset), `MRS`/`MSR` (CPSR only), `MCR`/`MRC`, `CPS`, and the
+/// `DSB`/`DMB`/`ISB` barriers. Everything else — multiply, block
+/// transfer (LDM/STM), register-shifted-by-register operand2, SPSR
+/// access, most of the coprocessor and unconditional-instruction-
+/// extension spaces, SWI, Thumb — decodes to `.unsupported` rather than
+/// being misinterpreted. Every case added here so far was verified
+/// against real, disassembled instruction words from the actual
+/// iPod4,1 6.1.6 kernel, not written from
 /// specification alone.
 enum ARMDecoder {
     static func decode(_ word: UInt32) -> ARMInstruction {
@@ -79,8 +80,34 @@ enum ARMDecoder {
 
         if !setFlags && op.isComparison {
             // TST/TEQ/CMP/CMN with S==0 isn't that comparison — this
-            // encoding is where MSR/MRS (status register access) live.
-            return .unsupported(rawWord: word)
+            // encoding (bits[24:23]=="10", true for all four of those
+            // opcodes) is where MRS/MSR (status register access) live.
+            // bit22 (R) selects CPSR/SPSR; bit21 selects MRS/MSR within
+            // that — both confirmed against real instruction words from
+            // the actual iPod4,1 6.1.6 kernel ("mrs r11, apsr" and
+            // "msr CPSR_x, r11").
+            guard !word.bit(22) else {
+                return .unsupported(rawWord: word) // SPSR access — not modeled.
+            }
+
+            if word.bit(21) {
+                let fieldMask = UInt8(word.bitField(19, 16))
+                let source: MSRSource
+                if immediateOperand {
+                    let rotateAmount = word.bitField(11, 8) * 2
+                    let imm8 = word.bitField(7, 0)
+                    source = .immediate(ShifterOperand.rotateRight(imm8, by: rotateAmount))
+                } else {
+                    guard word.bitField(11, 4) == 0 else { return .unsupported(rawWord: word) }
+                    source = .register(Int(word.bitField(3, 0)))
+                }
+                return .moveToStatusRegister(MSRInstruction(condition: condition, fieldMask: fieldMask, source: source))
+            } else {
+                guard !immediateOperand, word.bitField(19, 16) == 0b1111, word.bitField(11, 0) == 0 else {
+                    return .unsupported(rawWord: word)
+                }
+                return .moveFromStatusRegister(MRSInstruction(condition: condition, rd: rd))
+            }
         }
 
         let operand2: ShifterOperand

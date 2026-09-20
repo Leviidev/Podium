@@ -72,6 +72,7 @@ final class MachOLoaderTests: XCTestCase {
         let image = try MachOLoader.load(machO, into: memory)
 
         XCTAssertEqual(image.entryPointPC, entryPC)
+        XCTAssertEqual(image.highestAddressUsed, vmaddr &+ UInt32(payload.count))
         XCTAssertEqual(try memory.readByte(at: vmaddr), 0xDE)
         XCTAssertEqual(try memory.readByte(at: vmaddr + 1), 0xAD)
         XCTAssertEqual(try memory.readByte(at: vmaddr + 2), 0xBE)

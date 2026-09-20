@@ -164,6 +164,37 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 1, crm: 0, opc2: 0), 42)
     }
 
+    func testEnablingMMUHaltsHonestlyInsteadOfSilentlyContinuing() {
+        let cpu = makeCPU(program: [
+            0xE3A0_0001, // MOV r0, #1
+            0xEE01_0F10, // MCR p15, #0, r0, c1, c0, #0  (SCTLR write, M bit set)
+            0xE3A0_00FF, // would set r0 to 0xFF if this ever wrongly executed
+        ])
+        cpu.step() // MOV
+        cpu.step() // MCR — should halt here
+
+        guard case .unimplementedHardwareFeature(let description, let address) = cpu.lastError else {
+            return XCTFail("Expected .unimplementedHardwareFeature, got \(String(describing: cpu.lastError))")
+        }
+        XCTAssertTrue(description.contains("MMU"))
+        XCTAssertEqual(address, 4) // the MCR instruction's own address
+        XCTAssertEqual(cpu.registers[0], 1, "The third instruction must not have run")
+    }
+
+    func testWritingSCTLRWithoutMMUBitSetDoesNotHalt() {
+        // Same register, but writing a value with bit 0 clear (e.g. just
+        // enabling caches) is exactly what the real kernel does before
+        // it ever touches the MMU bit, and must keep executing normally.
+        let cpu = makeCPU(program: [
+            0xE3A0_0C18, // MOV r0, #0x1800 (bits 11/12 — icache + branch prediction, no MMU bit)
+            0xEE01_0F10, // MCR p15, #0, r0, c1, c0, #0
+        ])
+        cpu.step(); cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 1, crm: 0, opc2: 0), 0x1800)
+    }
+
     func testUnwrittenCP15RegisterReadsAsZero() {
         let cpu = makeCPU(program: [
             0xEE11_4F10, // MRC p15, #0, r4, c1, c0, #0 -- never written
@@ -211,6 +242,43 @@ final class ARMv7CPUTests: XCTestCase {
         // register reads as 0) leaves r11 == 6144, which then gets
         // written back to the same CP15 slot.
         XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 1, crm: 0, opc2: 0), 6144)
+    }
+
+    func testMrsReadsCpsrIntoRegister() {
+        let cpu = makeCPU(program: [
+            0xE3B0_0001, // MOVS r0, #1  -- sets Z=0, and leaves N/C/V clear
+            0xE10F_B000, // mrs r11, apsr -- real word from the actual kernel
+        ])
+        cpu.step(); cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[11], cpu.cpsr.rawValue)
+    }
+
+    func testMsrWritesOnlySelectedByteOfCpsr() {
+        let cpu = makeCPU(program: [
+            0xE3E0_B000, // MVN r11, #0  -- r11 = 0xFFFFFFFF
+            0xE122_F00B, // msr CPSR_x, r11 -- real word from the actual kernel (byte 1 only)
+        ])
+        let before = cpu.cpsr.rawValue
+        cpu.step(); cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Only bits [15:8] (the 'x' field) should have changed; everything
+        // else in CPSR must be untouched, per the fieldMask.
+        XCTAssertEqual(cpu.cpsr.rawValue, before | 0x0000_FF00)
+    }
+
+    func testMsrImmediateWritesFlagsByteOnly() {
+        // msr CPSR_f, #0xF0000000 -- N,Z,C,V all set via the immediate form.
+        let cpu = makeCPU(program: [0xE328_F20F])
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertTrue(cpu.cpsr.negative)
+        XCTAssertTrue(cpu.cpsr.zero)
+        XCTAssertTrue(cpu.cpsr.carry)
+        XCTAssertTrue(cpu.cpsr.overflow)
     }
 
     func testConditionalInstructionSkippedWhenConditionFails() {

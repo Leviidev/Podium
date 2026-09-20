@@ -114,6 +114,8 @@ struct DeveloperSettingsScreen: View {
             return "Undefined instruction \(hex(word)) at \(hex(address))"
         case .memoryFault(let fault, let address):
             return "Memory fault at \(hex(address)): \(fault)"
+        case .unimplementedHardwareFeature(let description, let address):
+            return "\(description), at \(hex(address))"
         }
     }
 }

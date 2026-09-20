@@ -120,8 +120,34 @@ final class EmulatorCore {
             return
         }
 
+        // XNU's ARM entry code expects r0 to hold a boot_args pointer —
+        // normally filled in and passed by iBoot, which Podium doesn't
+        // run. Placed on the next page boundary past the kernel's own
+        // highest used address, which MachOLoader reports precisely
+        // rather than this guessing at a gap that's big enough.
+        let bootArgsAddress = (image.highestAddressUsed + 0xFFF) & ~UInt32(0xFFF)
+        let bootArgs = BootArgsBuilder.build(
+            virtBase: Self.physicalMemoryBaseAddress,
+            physBase: Self.physicalMemoryBaseAddress,
+            memSize: UInt32(Self.physicalMemorySize),
+            topOfKernelData: bootArgsAddress + UInt32(BootArgsBuilder.structSize),
+            deviceTreeP: 0, // No device tree extracted/passed yet — honestly absent, not guessed at.
+            deviceTreeLength: 0
+        )
+        do {
+            try memory.writeBytes(bootArgs, at: bootArgsAddress)
+        } catch {
+            status = .error("Podium couldn't set up this firmware's boot arguments.")
+            appendLog("boot_args write failed: \(error)")
+            return
+        }
+
+        var initialRegisters = image.initialRegisters
+        initialRegisters[0] = bootArgsAddress
+
         armCPU.reset()
-        armCPU.loadInitialRegisters(image.initialRegisters)
+        armCPU.loadInitialRegisters(initialRegisters)
+        appendLog("boot_args written at 0x\(bootArgsAddress.hexString8) (virtBase=physBase=0x\(Self.physicalMemoryBaseAddress.hexString8), memSize=\(Int64(Self.physicalMemorySize).formattedByteCount)); r0 points there.")
         appendLog("Kernel loaded. Entry point: 0x\(image.entryPointPC.hexString8). Starting execution…")
 
         let stepBudget = Self.maxBootUnits
@@ -146,6 +172,8 @@ final class EmulatorCore {
             return "undefined instruction 0x\(word.hexString8) at 0x\(address.hexString8)"
         case .memoryFault(let fault, let address):
             return "memory fault at 0x\(address.hexString8) (\(fault))"
+        case .unimplementedHardwareFeature(let description, let address):
+            return "\(description), at 0x\(address.hexString8)"
         }
     }
 

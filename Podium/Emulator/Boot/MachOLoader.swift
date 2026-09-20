@@ -27,6 +27,14 @@ struct LoadedKernelImage {
     /// against).
     let initialRegisters: [UInt32]
 
+    /// One past the highest address any `LC_SEGMENT` occupies (`vmaddr +
+    /// vmsize`, not just the file-backed portion — a segment's zero-fill
+    /// tail still claims that address range). Lets callers place
+    /// anything else they need in guest memory (like a `boot_args`
+    /// struct) somewhere that's provably past the loaded kernel, instead
+    /// of guessing a gap is big enough.
+    let highestAddressUsed: UInt32
+
     var entryPointPC: UInt32 { initialRegisters[Registers.pcIndex] }
 }
 
@@ -58,6 +66,7 @@ enum MachOLoader {
         let ncmds = Int(machO.readUInt32LE(at: 16))
         var offset = machHeaderSize
         var initialRegisters: [UInt32]?
+        var highestAddressUsed: UInt32 = 0
 
         for _ in 0..<ncmds {
             guard offset + 8 <= machO.count else { break }
@@ -67,7 +76,8 @@ enum MachOLoader {
 
             switch cmd {
             case lcSegment:
-                try loadSegment(machO, commandOffset: offset, into: memory)
+                let segmentEnd = try loadSegment(machO, commandOffset: offset, into: memory)
+                highestAddressUsed = max(highestAddressUsed, segmentEnd)
             case lcUnixThread:
                 initialRegisters = readUnixThreadRegisters(machO, commandOffset: offset, cmdSize: cmdSize)
             default:
@@ -78,29 +88,36 @@ enum MachOLoader {
         }
 
         guard let registers = initialRegisters else { throw MachOLoaderError.noEntryPoint }
-        return LoadedKernelImage(initialRegisters: registers)
+        return LoadedKernelImage(initialRegisters: registers, highestAddressUsed: highestAddressUsed)
     }
 
-    private static func loadSegment(_ machO: Data, commandOffset offset: Int, into memory: MemoryBus) throws {
-        guard offset + segmentCommandSize <= machO.count else { return }
+    /// Loads one segment's file-backed bytes into memory and returns
+    /// `vmaddr + vmsize` — the address one past everything this segment
+    /// claims, including any zero-fill tail beyond what's file-backed.
+    @discardableResult
+    private static func loadSegment(_ machO: Data, commandOffset offset: Int, into memory: MemoryBus) throws -> UInt32 {
+        guard offset + segmentCommandSize <= machO.count else { return 0 }
 
         let vmaddr = machO.readUInt32LE(at: offset + 24)
+        let vmsize = machO.readUInt32LE(at: offset + 28)
         let fileoff = Int(machO.readUInt32LE(at: offset + 32))
         let filesize = Int(machO.readUInt32LE(at: offset + 36))
 
-        guard filesize > 0, fileoff >= 0, fileoff + filesize <= machO.count else { return }
-
-        let start = machO.startIndex + fileoff
-        let segmentData = machO.subdata(in: start..<(start + filesize))
-        do {
-            try memory.writeBytes(segmentData, at: vmaddr)
-        } catch let error as MemoryAccessError {
-            throw MachOLoaderError.memoryWriteFailed(error)
+        if filesize > 0, fileoff >= 0, fileoff + filesize <= machO.count {
+            let start = machO.startIndex + fileoff
+            let segmentData = machO.subdata(in: start..<(start + filesize))
+            do {
+                try memory.writeBytes(segmentData, at: vmaddr)
+            } catch let error as MemoryAccessError {
+                throw MachOLoaderError.memoryWriteFailed(error)
+            }
         }
+        // vmsize can exceed filesize (zero-fill / .bss-style regions); a
+        // freshly-allocated FlatPhysicalMemory already reads zero
+        // everywhere, so there's nothing further to write for that gap —
+        // it still counts toward highestAddressUsed below, though.
 
-        // vmsize can exceed filesize (zero-fill / .bss-style regions);
-        // a freshly-allocated FlatPhysicalMemory already reads zero
-        // everywhere, so there's nothing further to write for that gap.
+        return vmaddr &+ vmsize
     }
 
     private static func readUnixThreadRegisters(_ machO: Data, commandOffset offset: Int, cmdSize: Int) -> [UInt32]? {

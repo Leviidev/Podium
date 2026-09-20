@@ -88,6 +88,33 @@ struct LoadStoreInstruction {
     let offset: LoadStoreOffset
 }
 
+/// `MRS Rd, CPSR`: reads the whole CPSR into a register. SPSR access
+/// (the same instruction shape with R==1) isn't decoded — there's no
+/// exception entry/exit yet for a saved SPSR to matter to.
+struct MRSInstruction: Equatable {
+    let condition: ARMCondition
+    let rd: Int
+}
+
+enum MSRSource: Equatable {
+    case register(Int)
+    /// Already resolved at decode time, same as data-processing's
+    /// immediate operand2 — a rotated 8-bit constant needs nothing from
+    /// register state to compute.
+    case immediate(UInt32)
+}
+
+/// `MSR CPSR_<fields>, Rm`/`#imm`: writes selected *bytes* of the CPSR.
+/// `fieldMask` bit0=c(control, bits[7:0]), bit1=x(extension, [15:8]),
+/// bit2=s(status, [23:16]), bit3=f(flags, [31:24]) — the same order and
+/// meaning as the real mask field, so it can be used directly to build a
+/// byte-granular write mask at execute time.
+struct MSRInstruction: Equatable {
+    let condition: ARMCondition
+    let fieldMask: UInt8
+    let source: MSRSource
+}
+
 /// `MOVW`/`MOVT` (ARMv6T2+): load a 16-bit immediate into a register's
 /// low or high half, the other half left alone (`MOVT`) or zeroed
 /// (`MOVW`). Distinct from classic data-processing `MOV` — no rotation,
@@ -137,6 +164,8 @@ enum ARMInstruction: Equatable {
     case branch(BranchInstruction)
     case loadStore(LoadStoreInstruction)
     case movWide(MovWideInstruction)
+    case moveFromStatusRegister(MRSInstruction)
+    case moveToStatusRegister(MSRInstruction)
     case coprocessorRegisterTransfer(CoprocessorRegisterTransferInstruction)
     case changeProcessorState(ChangeProcessorStateInstruction)
     /// `DSB`/`DMB`/`ISB`: memory/instruction ordering barriers. Podium's
@@ -147,11 +176,11 @@ enum ARMInstruction: Equatable {
     case memoryBarrier
     /// A recognized-but-not-yet-implemented instruction family: multiply,
     /// block data transfer (LDM/STM), register-shifted-by-register
-    /// operand2, MSR/MRS (full CPSR/SPSR access — distinct from `CPS`,
-    /// which only touches the interrupt/abort mask bits), most of the
-    /// coprocessor space (anything but MCR/MRC), SWI, and most of the
-    /// unconditional-instruction-extension space (anything but CPS and
-    /// the DSB/DMB/ISB barriers).
+    /// operand2, SPSR access (the MRS/MSR encodings with R==1 — there's
+    /// no exception entry/exit yet for a saved SPSR to matter to), most
+    /// of the coprocessor space (anything but MCR/MRC), SWI, and most of
+    /// the unconditional-instruction-extension space (anything but CPS
+    /// and the DSB/DMB/ISB barriers).
     case unsupported(rawWord: UInt32)
     /// A genuinely undefined/reserved encoding.
     case undefined(rawWord: UInt32)

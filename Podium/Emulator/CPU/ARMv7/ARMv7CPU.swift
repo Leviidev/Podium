@@ -4,6 +4,15 @@ enum CPUError: Error, Equatable {
     case unsupportedInstruction(rawWord: UInt32, address: UInt32)
     case undefinedInstruction(rawWord: UInt32, address: UInt32)
     case memoryFault(MemoryAccessError, address: UInt32)
+    /// The guest executed and decoded fine, but asked for real hardware
+    /// behavior this CPU doesn't implement and can't safely pretend to —
+    /// right now, specifically: enabling the MMU (SCTLR.M). Continuing
+    /// past that point would mean every subsequent memory access is
+    /// address-translated on real hardware and isn't here, so results
+    /// would silently diverge rather than cleanly stop. Halting here is
+    /// the honest choice; a normal "unsupported instruction" halt
+    /// wouldn't be accurate, since the instruction *is* understood.
+    case unimplementedHardwareFeature(description: String, address: UInt32)
 }
 
 /// The ARM-state ARMv7 interpreter: `ARMDecoder` turns each fetched word
@@ -15,10 +24,13 @@ enum CPUError: Error, Equatable {
 /// nothing actually raises an interrupt for them to gate), MMU-mediated
 /// addressing (reads/writes go straight to physical addresses, and
 /// `MCR`/`MRC` transfers to/from CP15 are stored/returned as a plain
-/// register file — see `CP15State` — not acted on), and several
-/// ARM-state instruction families: multiply, block transfer (LDM/STM),
-/// register-shifted-by-register operands, MSR/MRS, most of the
-/// coprocessor and unconditional-instruction spaces, SWI (see
+/// register file — see `CP15State` — not acted on; enabling the MMU via
+/// SCTLR.M is specifically detected and halts with
+/// `.unimplementedHardwareFeature` rather than silently continuing with
+/// untranslated addresses), and several ARM-state instruction families:
+/// multiply, block transfer (LDM/STM), register-shifted-by-register
+/// operands, SPSR access, most of the coprocessor and unconditional-
+/// instruction spaces, SWI (see
 /// `ARMDecoder`'s doc comment for the exact list). Hitting any of those
 /// sets `lastError` and halts rather than skipping the instruction or
 /// guessing at its effect — silently pressing on past something this
@@ -148,9 +160,17 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeMovWide(instr)
 
+        case .moveFromStatusRegister(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeMoveFromStatusRegister(instr)
+
+        case .moveToStatusRegister(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeMoveToStatusRegister(instr)
+
         case .coprocessorRegisterTransfer(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
-            executeCoprocessorRegisterTransfer(instr)
+            executeCoprocessorRegisterTransfer(instr, instructionAddress: instructionAddress)
 
         case .changeProcessorState(let instr):
             executeChangeProcessorState(instr)
@@ -175,7 +195,40 @@ final class ARMv7CPU: CPU {
         }
     }
 
-    private func executeCoprocessorRegisterTransfer(_ instr: CoprocessorRegisterTransferInstruction) {
+    private func executeMoveFromStatusRegister(_ instr: MRSInstruction) {
+        registers[instr.rd] = cpsr.rawValue
+    }
+
+    /// `fieldMask` bytes that are clear leave the corresponding CPSR byte
+    /// untouched — a real `MSR` only ever writes the byte lanes it names.
+    private static let msrByteMasks: [UInt32] = [0x0000_00FF, 0x0000_FF00, 0x00FF_0000, 0xFF00_0000]
+
+    private func executeMoveToStatusRegister(_ instr: MSRInstruction) {
+        let value: UInt32
+        switch instr.source {
+        case .register(let rm): value = operandValue(for: rm)
+        case .immediate(let imm): value = imm
+        }
+
+        var writeMask: UInt32 = 0
+        for bit in 0..<4 where instr.fieldMask & (1 << bit) != 0 {
+            writeMask |= Self.msrByteMasks[bit]
+        }
+
+        cpsr.rawValue = (cpsr.rawValue & ~writeMask) | (value & writeMask)
+    }
+
+    /// CP15 (coprocessor, opc1, CRn, CRm, opc2) for the register real
+    /// ARMv7 calls SCTLR (System Control Register) — where the MMU
+    /// enable bit lives.
+    private static let sctlrCoprocessor = 15
+    private static let sctlrOpc1 = 0
+    private static let sctlrCRn = 1
+    private static let sctlrCRm = 0
+    private static let sctlrOpc2 = 0
+    private static let sctlrMMUEnableBit: UInt32 = 1 << 0
+
+    private func executeCoprocessorRegisterTransfer(_ instr: CoprocessorRegisterTransferInstruction, instructionAddress: UInt32) {
         if instr.isLoad {
             let value = cp15.read(coprocessor: instr.coprocessor, opc1: instr.opc1, crn: instr.crn, crm: instr.crm, opc2: instr.opc2)
             if instr.rt == Registers.pcIndex {
@@ -188,6 +241,25 @@ final class ARMv7CPU: CPU {
             registers[instr.rt] = value
         } else {
             let value = operandValue(for: instr.rt)
+
+            if instr.coprocessor == Self.sctlrCoprocessor, instr.opc1 == Self.sctlrOpc1,
+               instr.crn == Self.sctlrCRn, instr.crm == Self.sctlrCRm, instr.opc2 == Self.sctlrOpc2,
+               value & Self.sctlrMMUEnableBit != 0 {
+                // The guest is enabling the MMU. From this point on, a
+                // real CPU translates every memory access through page
+                // tables it just set up — this one still wouldn't,
+                // since there's no MMU/page-table walker implemented.
+                // Continuing past here would mean execution keeps going
+                // but silently stops being trustworthy; halting cleanly
+                // is more honest than that, even though the instruction
+                // itself decoded and would otherwise execute fine.
+                lastError = .unimplementedHardwareFeature(
+                    description: "guest enabled the MMU (SCTLR.M) — no MMU/page-table translation is implemented",
+                    address: instructionAddress
+                )
+                return
+            }
+
             cp15.write(coprocessor: instr.coprocessor, opc1: instr.opc1, crn: instr.crn, crm: instr.crm, opc2: instr.opc2, value: value)
         }
     }
