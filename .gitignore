@@ -1,0 +1,13 @@
+.DS_Store
+build/
+DerivedData/
+*.xcodeproj
+!default.xcodeproj
+xcuserdata/
+*.xcuserstate
+.swiftpm/
+.build/
+*.ipa
+
+# Imported firmware never belongs in git (large binaries, user data)
+*.ipsw
