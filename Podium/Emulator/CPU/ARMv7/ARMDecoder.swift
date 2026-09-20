@@ -92,6 +92,13 @@ enum ARMDecoder {
             // ("strh r1, [r0, #2]" at 0x8007d3e4).
             let sh = word.bitField(6, 5)
             guard sh != 0 else {
+                // Synchronization primitives (SWP/LDREX/STREX family) —
+                // only LDREX's exact bit pattern is decoded so far.
+                if word.bitField(27, 20) == 0b0001_1001, word.bitField(11, 8) == 0b1111, word.bitField(3, 0) == 0b1111 {
+                    return .loadExclusive(LoadExclusiveInstruction(
+                        condition: condition, rt: Int(word.bitField(15, 12)), rn: Int(word.bitField(19, 16))
+                    ))
+                }
                 return .unsupported(rawWord: word)
             }
             let isLoad = word.bit(20)

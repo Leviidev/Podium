@@ -269,6 +269,21 @@ struct ClzInstruction: Equatable {
     let rm: Int
 }
 
+/// `LDREX Rt, [Rn]`: an ordinary word load architecturally paired with
+/// tagging the address for exclusive access (checked by a later
+/// `STREX`, not yet decoded — no real word has confirmed it). Lives in
+/// the "synchronization primitives" space, sharing the multiply/extra-
+/// load-store gate's `!I && bit7 && bit4` shape with `SH == 0` (the
+/// other three `SH` values are the halfword/signed-byte transfers
+/// already decoded there); disambiguated by the full bits[27:20]/
+/// [11:8]/[3:0] pattern, verified against a real `ldrex r0, [ip]` word
+/// from the actual kernel.
+struct LoadExclusiveInstruction: Equatable {
+    let condition: ARMCondition
+    let rt: Int
+    let rn: Int
+}
+
 /// `REV Rd, Rm`: reverses the byte order of a word (`Rd.byte[i] =
 /// Rm.byte[3-i]`) — also lives in the media-instructions space (a
 /// unary sibling of `UQSUB8`, hence no `Rn`), verified against a real
@@ -297,6 +312,7 @@ enum ARMInstruction: Equatable {
     case uqsub8(UQSub8Instruction)
     case rev(RevInstruction)
     case clz(ClzInstruction)
+    case loadExclusive(LoadExclusiveInstruction)
     /// `DSB`/`DMB`/`ISB` (memory/instruction ordering barriers) and
     /// `PLD` (immediate, a cache-prefetch hint). Podium's interpreter
     /// executes everything strictly in program order with no caching,

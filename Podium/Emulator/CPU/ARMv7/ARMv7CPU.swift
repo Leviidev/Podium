@@ -227,6 +227,10 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeClz(instr)
 
+        case .loadExclusive(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeLoadExclusive(instr)
+
         case .memoryBarrier:
             // A real no-op: see ARMInstruction.memoryBarrier's doc comment.
             break
@@ -364,6 +368,21 @@ final class ARMv7CPU: CPU {
 
     private func executeClz(_ instr: ClzInstruction) {
         registers[instr.rd] = UInt32(registers[instr.rm].leadingZeroBitCount)
+    }
+
+    /// `LDREX`: an ordinary word load. Tagging the address for a later
+    /// `STREX` to check isn't modeled yet — no real word has confirmed
+    /// `STREX`, so there is nothing yet that would read that tag.
+    private func executeLoadExclusive(_ instr: LoadExclusiveInstruction) {
+        let address = operandValue(for: instr.rn)
+        do {
+            let physicalAddress = try translatedAddress(address, access: .read)
+            registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: address)
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(address), address: address)
+        }
     }
 
     func operandValue(for register: Int) -> UInt32 {
