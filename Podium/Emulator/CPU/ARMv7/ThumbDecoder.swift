@@ -20,7 +20,8 @@ import Foundation
 /// (sharing the same op table), `BL`, `BLX` (immediate), `B.W` (both the
 /// unconditional T4 form and the conditional T3 form, which carries its
 /// own condition field the same way 16-bit `Bcond` does), `LDR`/`STR`/
-/// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDM`/
+/// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDRSB`
+/// (immediate, T3 and T4), `LDM`/
 /// `STM` (T2, both IA and DB), and `MCR`/`MRC` (reusing ARM state's
 /// exact field layout — see `decode32Coprocessor`'s doc comment).
 /// Everything else — `ADD`/`SUB` (format 2, register or 3-bit
@@ -224,6 +225,13 @@ enum ThumbDecoder {
         case 0b11110:
             return decode32DataProcessingOrBranch(hw0, hw1)
         case 0b11111:
+            // bit[8] splits plain byte/word/register load-store
+            // (`0`, `0xF8` prefix) from the signed-load family (`1`,
+            // `0xF9`/`0xFB` prefix) — verified against real words from
+            // each branch.
+            if hw0.bit16(8) {
+                return decode32LoadStoreSignedByte(hw0, hw1)
+            }
             return decode32LoadStoreSingle(hw0, hw1)
         default:
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
@@ -325,7 +333,8 @@ enum ThumbDecoder {
         if hw0.bit16(7) {
             // T3: 12-bit unsigned immediate, always add, never writeback.
             return .loadStoreWide(ThumbLoadStoreWideInstruction(
-                isLoad: isLoad, isByte: isByte, rn: rn, rt: rt, preIndexed: true, addOffset: true, writeback: false,
+                isLoad: isLoad, isByte: isByte, isSigned: false, rn: rn, rt: rt,
+                preIndexed: true, addOffset: true, writeback: false,
                 offset: UInt32(hw1.bitField16(11, 0))
             ))
         }
@@ -334,7 +343,7 @@ enum ThumbDecoder {
         // verified against a real `ldr.w r3, [r5, r0, lsl #3]` word).
         if hw1.bit16(11) {
             return .loadStoreWide(ThumbLoadStoreWideInstruction(
-                isLoad: isLoad, isByte: isByte, rn: rn, rt: rt,
+                isLoad: isLoad, isByte: isByte, isSigned: false, rn: rn, rt: rt,
                 preIndexed: hw1.bit16(10), addOffset: hw1.bit16(9), writeback: hw1.bit16(8),
                 offset: UInt32(hw1.bitField16(7, 0))
             ))
@@ -345,6 +354,39 @@ enum ThumbDecoder {
         return .loadStoreRegister(ThumbLoadStoreRegisterInstruction(
             isLoad: isLoad, isByte: isByte, rn: rn, rt: rt,
             rm: Int(hw1.bitField16(3, 0)), shiftAmount: Int(hw1.bitField16(5, 4))
+        ))
+    }
+
+    /// `LDRSB` (immediate) — the sign-extending sibling of the T3/T4
+    /// forms above, sharing their exact hw1 (Rt/P/U/W/imm) layout and
+    /// the same bit[7] T3-vs-T4 selector role, but with a different
+    /// fixed hw0 prefix: bits[15:8] `0xF9` (bits[15:9] `1111100`, same
+    /// as every single load/store, with bit[8] `1` marking the
+    /// signed-load family vs `0` for the plain byte/word forms above),
+    /// and bits[6:5] `00` (byte size, mirroring the plain family's
+    /// scheme — `01`/halfword, `LDRSH`, isn't decoded, since no real
+    /// word has confirmed it). Verified against a real
+    /// `ldrsb r0, [r5, #1]!` word from the actual kernel.
+    private static func decode32LoadStoreSignedByte(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
+        guard hw0.bitField16(15, 8) == 0b1111_1001, hw0.bitField16(6, 5) == 0 else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        let rn = Int(hw0.bitField16(3, 0))
+        let rt = Int(hw1.bitField16(15, 12))
+        if hw0.bit16(7) {
+            return .loadStoreWide(ThumbLoadStoreWideInstruction(
+                isLoad: true, isByte: true, isSigned: true, rn: rn, rt: rt,
+                preIndexed: true, addOffset: true, writeback: false,
+                offset: UInt32(hw1.bitField16(11, 0))
+            ))
+        }
+        guard hw1.bit16(11) else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        return .loadStoreWide(ThumbLoadStoreWideInstruction(
+            isLoad: true, isByte: true, isSigned: true, rn: rn, rt: rt,
+            preIndexed: hw1.bit16(10), addOffset: hw1.bit16(9), writeback: hw1.bit16(8),
+            offset: UInt32(hw1.bitField16(7, 0))
         ))
     }
 

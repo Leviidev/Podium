@@ -349,4 +349,17 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[1], 70)
     }
+
+    func testLdrsbSignExtendsNegativeByteRealKernelWordAndWritesBack() {
+        let cpu = makeThumbCPU(program: [
+            0xf915, 0x0f01, // ldrsb r0, [r5, #1]!, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[5] = 10
+        try! (cpu.memory as! FlatPhysicalMemory).writeByte(0xFF, at: 11) // -1 as a signed byte.
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0xFFFF_FFFF)
+        XCTAssertEqual(cpu.registers[5], 11) // pre-indexed with writeback.
+    }
 }

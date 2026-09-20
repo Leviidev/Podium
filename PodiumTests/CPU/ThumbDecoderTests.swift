@@ -362,4 +362,20 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.shiftType, .lsl)
         XCTAssertEqual(instr.shiftAmount, 0)
     }
+
+    func testDecodesLdrsbFromRealKernel() {
+        // ldrsb r0, [r5, #1]! — from the real kernel at 0x8001ff9a.
+        guard case .loadStoreWide(let instr) = ThumbDecoder.decode(0xf915, 0x0f01) else {
+            return XCTFail("Expected loadStoreWide")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertTrue(instr.isByte)
+        XCTAssertTrue(instr.isSigned)
+        XCTAssertEqual(instr.rn, 5)
+        XCTAssertEqual(instr.rt, 0)
+        XCTAssertTrue(instr.preIndexed)
+        XCTAssertTrue(instr.addOffset)
+        XCTAssertTrue(instr.writeback)
+        XCTAssertEqual(instr.offset, 1)
+    }
 }

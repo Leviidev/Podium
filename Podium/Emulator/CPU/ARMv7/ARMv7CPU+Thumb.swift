@@ -556,9 +556,12 @@ extension ARMv7CPU {
         do {
             let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
-                let value = instr.isByte
+                var value = instr.isByte
                     ? UInt32(try memory.readByte(at: physicalAddress))
                     : try memory.readWord32(at: physicalAddress)
+                if instr.isSigned {
+                    value = UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: value))))
+                }
                 if instr.rt == Registers.pcIndex {
                     cpsr.thumbState = value.bit(0)
                     registers.pc = value & ~UInt32(0b1)
