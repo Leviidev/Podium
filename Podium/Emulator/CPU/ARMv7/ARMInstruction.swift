@@ -256,6 +256,18 @@ struct UQSub8Instruction: Equatable {
     let rm: Int
 }
 
+/// `REV Rd, Rm`: reverses the byte order of a word (`Rd.byte[i] =
+/// Rm.byte[3-i]`) — also lives in the media-instructions space (a
+/// unary sibling of `UQSUB8`, hence no `Rn`), verified against a real
+/// word from the actual kernel via Capstone. `REV16`/`REVSH` (halfword
+/// and signed-halfword variants sharing this same top-level shape)
+/// aren't decoded yet.
+struct RevInstruction: Equatable {
+    let condition: ARMCondition
+    let rd: Int
+    let rm: Int
+}
+
 enum ARMInstruction: Equatable {
     case dataProcessing(DataProcessingInstruction)
     case branch(BranchInstruction)
@@ -270,6 +282,7 @@ enum ARMInstruction: Equatable {
     case coprocessorRegisterTransfer(CoprocessorRegisterTransferInstruction)
     case changeProcessorState(ChangeProcessorStateInstruction)
     case uqsub8(UQSub8Instruction)
+    case rev(RevInstruction)
     /// `DSB`/`DMB`/`ISB` (memory/instruction ordering barriers) and
     /// `PLD` (immediate, a cache-prefetch hint). Podium's interpreter
     /// executes everything strictly in program order with no caching,

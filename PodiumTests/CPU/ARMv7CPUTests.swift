@@ -545,6 +545,17 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[2], 0x00FE_000F)
     }
 
+    func testRevByteSwapsRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE6BF_2F32, // rev r2, r2 -- real word from the actual kernel
+        ])
+        cpu.registers[2] = 0x1234_5678
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[2], 0x7856_3412)
+    }
+
     func testConditionalInstructionSkippedWhenConditionFails() {
         let cpu = makeCPU(program: [
             0xE3A0_0000, // MOV r0, #0  (also clears Z, since S==0 here it does NOT touch flags —

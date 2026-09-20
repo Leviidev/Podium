@@ -219,6 +219,10 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeUqsub8(instr)
 
+        case .rev(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeRev(instr)
+
         case .memoryBarrier:
             // A real no-op: see ARMInstruction.memoryBarrier's doc comment.
             break
@@ -343,6 +347,10 @@ final class ARMv7CPU: CPU {
             result |= clamped << shift
         }
         registers[instr.rd] = result
+    }
+
+    private func executeRev(_ instr: RevInstruction) {
+        registers[instr.rd] = registers[instr.rm].byteSwapped
     }
 
     func operandValue(for register: Int) -> UInt32 {

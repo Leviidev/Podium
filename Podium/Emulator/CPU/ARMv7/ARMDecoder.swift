@@ -15,11 +15,12 @@ import Foundation
 /// (immediate *and* register offset), the halfword/signed-byte "extra
 /// load/store" instructions (`LDRH`/`STRH`/`LDRSB`/`LDRSH`), block data
 /// transfer (`LDM`/`STM`, ordinary form only), `MRS`/`MSR` (CPSR only),
-/// `MCR`/`MRC`, `CPS`, `PLD` (immediate), `UQSUB8` (the one instruction
-/// decoded from ARMv6's much larger "media instructions" space — see
-/// `decodeMediaInstructions`'s doc comment), and the `DSB`/`DMB`/`ISB`
-/// barriers. Everything else — multiply, the `S`-bit block-transfer
-/// form, the rest of the media-instructions space, SPSR access, most of
+/// `MCR`/`MRC`, `CPS`, `PLD` (immediate), `UQSUB8`/`REV` (two
+/// instructions decoded from ARMv6's much larger "media instructions"
+/// space — see `decodeMediaInstructions`'s doc comment), and the
+/// `DSB`/`DMB`/`ISB` barriers. Everything else — multiply, the `S`-bit
+/// block-transfer form, the rest of the media-instructions space
+/// (including `REV`'s own `REV16`/`REVSH` siblings), SPSR access, most of
 /// the coprocessor and unconditional-instruction-extension spaces, SWI —
 /// decodes to `.unsupported` rather than being misinterpreted. Every
 /// case added here so far was verified against real, disassembled
@@ -274,17 +275,22 @@ enum ARMDecoder {
     }
 
     /// ARMv6's "media instructions" space (bits[27:25]==011, bit4==1).
-    /// Only `UQSUB8` is decoded — see its doc comment — via bits[27:20]
-    /// == 0b01100110 (parallel add/sub, unsigned, saturating) and
-    /// bits[7:5] == 0b111 (the SUB8 op2 within that); everything else in
-    /// this large space is `.unsupported`.
+    /// Only `UQSUB8` and `REV` are decoded — see their doc comments —
+    /// via bits[27:20] == 0b01100110 (parallel add/sub, unsigned,
+    /// saturating) with bits[7:5] == 0b111 (the SUB8 op2) for `UQSUB8`,
+    /// or bits[27:20] == 0b01101011 with bits[7:4] == 0b0011 for `REV`;
+    /// everything else in this large space is `.unsupported`.
     private static func decodeMediaInstructions(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
-        guard word.bitField(27, 20) == 0b0110_0110, word.bitField(7, 5) == 0b111, word.bitField(11, 8) == 0b1111 else {
-            return .unsupported(rawWord: word)
+        if word.bitField(27, 20) == 0b0110_0110, word.bitField(7, 5) == 0b111, word.bitField(11, 8) == 0b1111 {
+            return .uqsub8(UQSub8Instruction(
+                condition: condition, rd: Int(word.bitField(15, 12)), rn: Int(word.bitField(19, 16)), rm: Int(word.bitField(3, 0))
+            ))
         }
-        return .uqsub8(UQSub8Instruction(
-            condition: condition, rd: Int(word.bitField(15, 12)), rn: Int(word.bitField(19, 16)), rm: Int(word.bitField(3, 0))
-        ))
+        if word.bitField(27, 20) == 0b0110_1011, word.bitField(11, 8) == 0b1111, word.bitField(7, 4) == 0b0011,
+           word.bitField(19, 16) == 0b1111 {
+            return .rev(RevInstruction(condition: condition, rd: Int(word.bitField(15, 12)), rm: Int(word.bitField(3, 0))))
+        }
+        return .unsupported(rawWord: word)
     }
 
     /// `MCR`/`MRC` (coprocessor register transfer) — the one coprocessor
