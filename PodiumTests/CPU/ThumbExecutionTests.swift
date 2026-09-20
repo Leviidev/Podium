@@ -194,6 +194,23 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[1], 0xDD)
     }
 
+    func testPushWDbDirectionStoresBelowOriginalSP() {
+        let cpu = makeThumbCPU(program: [
+            0xe92d, 0x0d00, // push.w {r8, sl, fp}, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers.sp = 100
+        cpu.registers[8] = 0x8888_8888
+        cpu.registers[10] = 0xAAAA_AAAA
+        cpu.registers[11] = 0xBBBB_BBBB
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers.sp, 88) // 100 - 3*4
+        XCTAssertEqual(try! cpu.memory.readWord32(at: 88), 0x8888_8888) // r8, lowest register, lowest address
+        XCTAssertEqual(try! cpu.memory.readWord32(at: 92), 0xAAAA_AAAA) // r10
+        XCTAssertEqual(try! cpu.memory.readWord32(at: 96), 0xBBBB_BBBB) // r11
+    }
+
     func testStmWStoresRegistersRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xe881, 0x0009, // stm.w r1, {r0, r3}, real word from the actual kernel

@@ -18,7 +18,7 @@ import Foundation
 /// Covers (32-bit): `MOVW`/`MOVT`, the data-processing modified-
 /// immediate family, `BL`, `BLX` (immediate), unconditional `B.W`,
 /// `LDR`/`STR`/`LDRB`/`STRB` (immediate, T3 and T4), and `LDM`/`STM`
-/// (T2, IA direction only). Everything else — `ADD`/`SUB` (format 2,
+/// (T2, both IA and DB). Everything else — `ADD`/`SUB` (format 2,
 /// register or 3-bit immediate), signed-byte/halfword loads (format 8),
 /// PC-relative `LDR` (format 6), register-offset load/store (format 7),
 /// `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate beyond
@@ -205,18 +205,26 @@ enum ThumbDecoder {
         }
     }
 
-    /// `LDM`/`STM` (T2, IA form): verified against a real `pop.w` (load)
-    /// and a real `stm.w` (store) word from the actual kernel — both
-    /// share the exact same bits[15:7]/[6] fixed pattern, differing only
-    /// in bit4 (L). The DB-direction encoding (used by `push.w`/
-    /// `stmdb.w`, when it doesn't fit the 16-bit `PUSH` format) isn't
-    /// decoded yet, since no real word has confirmed its bit layout.
+    /// `LDM`/`STM` (T2): verified against real `pop.w` (load, IA),
+    /// `stm.w` (store, IA), and `push.w` (store, DB) words from the
+    /// actual kernel. bits[15:9] (`1110100`) and bit6 (`0`) are truly
+    /// fixed; bits[8:7] is a 2-bit direction selector this codebase
+    /// originally (incorrectly) folded into what looked like one long
+    /// fixed prefix, having only ever seen the IA case — `01` selects
+    /// IA, `10` selects DB; `00`/`11` (`RFE`/`SRS`/reserved) aren't
+    /// decoded.
     private static func decode32LoadStoreMultiple(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard hw0.bitField16(15, 7) == 0b111010001, !hw0.bit16(6) else {
+        guard hw0.bitField16(15, 9) == 0b111_0100, !hw0.bit16(6) else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
+        let isIncrement: Bool
+        switch hw0.bitField16(8, 7) {
+        case 0b01: isIncrement = true
+        case 0b10: isIncrement = false
+        default: return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
         return .blockDataTransfer(ThumbBlockDataTransferInstruction(
-            isLoad: hw0.bit16(4), isIncrement: true, writeback: hw0.bit16(5),
+            isLoad: hw0.bit16(4), isIncrement: isIncrement, writeback: hw0.bit16(5),
             rn: Int(hw0.bitField16(3, 0)), registerList: hw1
         ))
     }
