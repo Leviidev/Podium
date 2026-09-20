@@ -325,6 +325,18 @@ struct ThumbBlockDataTransferInstruction: Equatable {
     let registerList: UInt16
 }
 
+/// `TBB`/`TBH` (table branch) — verified against a real
+/// `tbh [pc, r1, lsl #1]` word from the actual kernel. Reads a
+/// byte (`TBB`) or halfword (`TBH`) from `[Rn, Rm]` (`Rm` scaled by 2
+/// for `TBH`), doubles it, and adds it to the address just after this
+/// instruction — a compiler-emitted jump table, always staying in
+/// Thumb state (unlike `BX`/`BLX`, this never switches ISA).
+struct ThumbTableBranchInstruction: Equatable {
+    let rn: Int
+    let rm: Int
+    let isHalfword: Bool
+}
+
 enum ThumbInstruction: Equatable {
     /// `MCR`/`MRC`: Thumb-2's coprocessor instructions reuse ARM state's
     /// exact same (opc1, L, CRn, Rt, coproc, opc2, CRm) field layout —
@@ -360,6 +372,7 @@ enum ThumbInstruction: Equatable {
     case loadStoreWide(ThumbLoadStoreWideInstruction)
     case loadStoreRegister(ThumbLoadStoreRegisterInstruction)
     case blockDataTransfer(ThumbBlockDataTransferInstruction)
+    case tableBranch(ThumbTableBranchInstruction)
     /// A recognized-but-not-yet-implemented Thumb instruction family —
     /// see `ThumbDecoder`'s doc comment for what's covered so far.
     case unsupported(rawHalfword: UInt16, secondHalfword: UInt16?)

@@ -400,4 +400,14 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rn, 1)
         XCTAssertEqual(instr.rm, 0)
     }
+
+    func testDecodesTbhFromRealKernel() {
+        // tbh [pc, r1, lsl #1] — from the real kernel at 0x80020176.
+        guard case .tableBranch(let instr) = ThumbDecoder.decode(0xe8df, 0xf011) else {
+            return XCTFail("Expected tableBranch")
+        }
+        XCTAssertEqual(instr.rn, Registers.pcIndex)
+        XCTAssertEqual(instr.rm, 1)
+        XCTAssertTrue(instr.isHalfword)
+    }
 }

@@ -154,6 +154,8 @@ extension ARMv7CPU {
             executeThumbLoadStoreRegister(instr)
         case .blockDataTransfer(let instr):
             executeThumbBlockDataTransfer(instr)
+        case .tableBranch(let instr):
+            executeThumbTableBranch(instr, instructionAddress: instructionAddress)
         case .branch(let instr):
             executeThumbBranch(instr, instructionAddress: instructionAddress)
         case .extend(let instr):
@@ -455,6 +457,36 @@ extension ARMv7CPU {
         if instr.writeback {
             registers[instr.rn] = instr.isIncrement ? baseValue &+ transferSize : baseValue &- transferSize
         }
+    }
+
+    /// `TBB`/`TBH`: `Rn == PC` reads through `Align(PC,4)` (the
+    /// instruction's own address rounded down to a word, +4 — the
+    /// usual Thumb PC-read-as-operand rule, additionally word-aligned
+    /// since the jump table follows this instruction in the code
+    /// stream regardless of its own alignment); the branch target is
+    /// always relative to the address just after this instruction,
+    /// the same base every other Thumb branch uses.
+    private func executeThumbTableBranch(_ instr: ThumbTableBranchInstruction, instructionAddress: UInt32) {
+        let base = instr.rn == Registers.pcIndex
+            ? (instructionAddress &+ 4) & ~UInt32(0b11)
+            : registers[instr.rn]
+        let indexAddress = instr.isHalfword ? base &+ (registers[instr.rm] &* 2) : base &+ registers[instr.rm]
+
+        let tableValue: UInt32
+        do {
+            let physicalAddress = try translatedAddress(indexAddress, access: .read)
+            tableValue = instr.isHalfword
+                ? UInt32(try memory.readWord16(at: physicalAddress))
+                : UInt32(try memory.readByte(at: physicalAddress))
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: indexAddress)
+            return
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(indexAddress), address: indexAddress)
+            return
+        }
+
+        registers.pc = (instructionAddress &+ 4) &+ (tableValue &* 2)
     }
 
     // MARK: - Branches

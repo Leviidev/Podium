@@ -413,4 +413,18 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[2], 0xFFFF_8000)
     }
+
+    func testTbhRealKernelWordBranchesThroughJumpTable() {
+        let cpu = makeThumbCPU(program: [
+            0xe8df, 0xf011, // tbh [pc, r1, lsl #1], real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[1] = 2 // index 2 into the halfword table.
+        // Table follows the instruction at Align(instructionAddress+4, 4) == 4;
+        // entry 2 is at 4 + 2*2 == 8.
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord16(5, at: 8)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers.pc, 14) // (0 + 4) + 5*2
+    }
 }

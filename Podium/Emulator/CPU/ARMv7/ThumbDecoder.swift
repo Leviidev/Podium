@@ -26,12 +26,13 @@ import Foundation
 /// own condition field the same way 16-bit `Bcond` does), `LDR`/`STR`/
 /// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDRSB`
 /// (immediate, T3 and T4), `LDM`/
-/// `STM` (T2, both IA and DB), and `MCR`/`MRC` (reusing ARM state's
-/// exact field layout — see `decode32Coprocessor`'s doc comment).
-/// Everything else — PC-relative `LDR` (format 6),
-/// `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate
-/// beyond 16-bit `MUL`, table branches, the rest of the coprocessor
-/// space (`CDP`/`LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
+/// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), and
+/// `MCR`/`MRC` (reusing ARM state's exact field layout — see
+/// `decode32Coprocessor`'s doc comment). Everything else — PC-relative
+/// `LDR` (format 6), `REV`/`REV16`/`REVSH`, multiply/multiply-
+/// accumulate beyond 16-bit `MUL`, `LDREX`/`STREX`/`LDRD`/`STRD`, the
+/// rest of the coprocessor space (`CDP`/`LDC`/`STC`), SIMD/VFP —
+/// decodes to `.unsupported`.
 enum ThumbDecoder {
     /// Whether `firstHalfword` opens a 32-bit Thumb-2 instruction (in
     /// which case the caller must fetch a second halfword before
@@ -317,7 +318,14 @@ enum ThumbDecoder {
     /// IA, `10` selects DB; `00`/`11` (`RFE`/`SRS`/reserved) aren't
     /// decoded.
     private static func decode32LoadStoreMultiple(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard hw0.bitField16(15, 9) == 0b111_0100, !hw0.bit16(6) else {
+        // bit[6] == 1 within this same bits[15:9] prefix is architecturally
+        // a different sub-family: load/store dual/exclusive and table
+        // branch (`TBB`/`TBH`) — try that first since LDM/STM never sets
+        // bit[6].
+        if hw0.bit16(6) {
+            return decode32TableBranch(hw0, hw1)
+        }
+        guard hw0.bitField16(15, 9) == 0b111_0100 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         let isIncrement: Bool
@@ -329,6 +337,22 @@ enum ThumbDecoder {
         return .blockDataTransfer(ThumbBlockDataTransferInstruction(
             isLoad: hw0.bit16(4), isIncrement: isIncrement, writeback: hw0.bit16(5),
             rn: Int(hw0.bitField16(3, 0)), registerList: hw1
+        ))
+    }
+
+    /// `TBB`/`TBH` (table branch) — verified against a real
+    /// `tbh [pc, r1, lsl #1]` word from the actual kernel. The wider
+    /// "load/store dual/exclusive" sub-family sharing this same
+    /// bit[6]==1 branch (`LDREX`/`STREX`/`LDRD`/`STRD`) isn't decoded,
+    /// since no real word has confirmed any of it — only `TBB`/`TBH`'s
+    /// exact 12-bit hw0 prefix (`111010001101`) and 11-bit hw1 prefix
+    /// (`11110000000`) are matched.
+    private static func decode32TableBranch(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
+        guard hw0.bitField16(15, 4) == 0b1110_1000_1101, hw1.bitField16(15, 5) == 0b111_1000_0000 else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        return .tableBranch(ThumbTableBranchInstruction(
+            rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0)), isHalfword: hw1.bit16(4)
         ))
     }
 
