@@ -170,40 +170,6 @@ extension ARMv7CPU {
         cpsr.overflow = result.overflow
     }
 
-    /// `Shift_C()` for a *register*-specified amount (ARM DDI 0406C
-    /// A2.2.1) — format 4's `LSL`/`LSR`/`ASR`/`ROR Rdn, Rm`. Distinct
-    /// from `ShifterOperand`'s immediate-shift logic: an encoded 0
-    /// there means "LSR/ASR #32" or ROR's RRX, reserved-value
-    /// conventions that only make sense for a shift amount fixed at
-    /// decode time. Here, where the amount is a runtime register value,
-    /// 0 always means "no shift, value and carry unchanged" for every
-    /// shift type, per the ARM ARM.
-    private static func registerSpecifiedShift(_ type: ShiftType, value: UInt32, by amount: UInt32, currentCarry: Bool) -> (UInt32, Bool) {
-        guard amount != 0 else { return (value, currentCarry) }
-        switch type {
-        case .lsl:
-            if amount >= 32 {
-                return (0, amount == 32 && (value & 1 != 0))
-            }
-            return (value << amount, (value >> (32 - amount)) & 1 != 0)
-        case .lsr:
-            if amount >= 32 {
-                return (0, amount == 32 && (value & 0x8000_0000 != 0))
-            }
-            return (value >> amount, (value >> (amount - 1)) & 1 != 0)
-        case .asr:
-            let signed = Int32(bitPattern: value)
-            if amount >= 32 {
-                let allOnes = signed < 0
-                return (allOnes ? 0xFFFF_FFFF : 0, allOnes)
-            }
-            return (UInt32(bitPattern: signed >> amount), (value >> (amount - 1)) & 1 != 0)
-        case .ror:
-            let rotated = ShifterOperand.rotateRight(value, by: amount)
-            return (rotated, rotated & 0x8000_0000 != 0)
-        }
-    }
-
     // MARK: - Format 1: LSL/LSR/ASR by immediate
 
     private func executeThumbShiftImmediate(_ instr: ThumbShiftImmediateInstruction) {
@@ -259,9 +225,9 @@ extension ARMv7CPU {
             setNZ(rdn & rm)
         case .lsl, .lsr, .asr, .ror:
             let shiftType: ShiftType = instr.op == .lsl ? .lsl : (instr.op == .lsr ? .lsr : (instr.op == .asr ? .asr : .ror))
-            let (value, carry) = Self.registerSpecifiedShift(shiftType, value: rdn, by: rm & 0xFF, currentCarry: cpsr.carry)
-            registers[instr.rdn] = value
-            cpsr.negative = value.bit(31); cpsr.zero = value == 0; cpsr.carry = carry
+            let resolved = ShifterOperand.applyRegisterSpecifiedShift(shiftType, to: rdn, by: rm & 0xFF, currentCarry: cpsr.carry)
+            registers[instr.rdn] = resolved.value
+            cpsr.negative = resolved.value.bit(31); cpsr.zero = resolved.value == 0; cpsr.carry = resolved.carryOut
         case .adc:
             let r = ALU.addWithCarry(rdn, rm, carryIn: cpsr.carry)
             registers[instr.rdn] = r.value

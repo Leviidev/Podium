@@ -289,6 +289,8 @@ extension ShifterOperand: Equatable {
             return lv == rv && lc == rc
         case (.shiftedRegister(let lrm, let lst, let lsa), .shiftedRegister(let rrm, let rst, let rsa)):
             return lrm == rrm && lst == rst && lsa == rsa
+        case (.shiftedRegisterByRegister(let lrm, let lst, let lrs), .shiftedRegisterByRegister(let rrm, let rst, let rrs)):
+            return lrm == rrm && lst == rst && lrs == rrs
         default:
             return false
         }

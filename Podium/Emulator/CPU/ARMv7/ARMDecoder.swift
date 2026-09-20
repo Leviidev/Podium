@@ -6,20 +6,25 @@ import Foundation
 /// what makes it independently unit-testable and, eventually, reusable
 /// by a JIT front end without dragging CPU state along.
 ///
-/// Covers data-processing (both operand2 forms), `MOVW`/`MOVT`, branch
-/// (B/BL), `BX`, `BLX` (immediate — decoded so it can halt with a
-/// specific "this needs Thumb" message, not executed), single-register
-/// load/store (immediate *and* register offset), the halfword/signed-
-/// byte "extra load/store" instructions (`LDRH`/`STRH`/`LDRSB`/`LDRSH`),
-/// block data transfer (`LDM`/`STM`, ordinary form only), `MRS`/`MSR`
-/// (CPSR only), `MCR`/`MRC`, `CPS`, and the `DSB`/`DMB`/`ISB` barriers.
-/// Everything else — multiply, the `S`-bit block-transfer form,
-/// register-shifted-by-register operand2, SPSR access, most of the
-/// coprocessor and unconditional-instruction-extension spaces, SWI,
-/// Thumb itself — decodes to `.unsupported` rather than being
-/// misinterpreted. Every case added here so far was verified against
-/// real, disassembled instruction words from the actual iPod4,1 6.1.6
-/// kernel, not written from specification alone.
+/// Covers data-processing (all three operand2 forms, including
+/// register-shifted-by-register — `.shiftedRegisterByRegister`, resolved
+/// at execute time since the shift amount is a runtime register value),
+/// `MOVW`/`MOVT`, branch (B/BL), `BX`, `BLX` (immediate — a real,
+/// executable interworking branch to Thumb now that
+/// `ARMv7CPU+Thumb.swift` exists), single-register load/store
+/// (immediate *and* register offset), the halfword/signed-byte "extra
+/// load/store" instructions (`LDRH`/`STRH`/`LDRSB`/`LDRSH`), block data
+/// transfer (`LDM`/`STM`, ordinary form only), `MRS`/`MSR` (CPSR only),
+/// `MCR`/`MRC`, `CPS`, `PLD` (immediate), and the `DSB`/`DMB`/`ISB`
+/// barriers. Everything else — multiply, the `S`-bit block-transfer
+/// form, register-shifted-by-register *addressing* (load/store's own
+/// register-offset form still only decodes an immediate shift amount,
+/// unlike data-processing's operand2), SPSR access, most of the
+/// coprocessor and unconditional-instruction-extension spaces, SWI —
+/// decodes to `.unsupported` rather than being misinterpreted. Every
+/// case added here so far was verified against real, disassembled
+/// instruction words from the actual iPod4,1 6.1.6 kernel, not written
+/// from specification alone.
 enum ARMDecoder {
     static func decode(_ word: UInt32) -> ARMInstruction {
         let condBits = word.bitField(31, 28)
@@ -167,15 +172,23 @@ enum ARMDecoder {
             operand2 = .immediate(value: rotated, forcedCarryOut: forcedCarryOut)
         } else {
             // bit4 distinguishes immediate shift amount (0) from
-            // register-specified shift amount (1, the `Rs` form). Only
-            // the immediate form is decoded — the multiply-space check
-            // above only ruled out bit4==1 *combined with* bit7==1, so
-            // bit4==1 with bit7==0 (a valid but unimplemented Rs-shift
-            // data-processing instruction) still needs its own check
-            // here. Without this, its Rs field would silently get
-            // misread as a shift-immediate instead of being refused.
+            // register-specified shift amount (1, the `Rs` form). The
+            // multiply-space check above only ruled out bit4==1
+            // *combined with* bit7==1, so bit4==1 with bit7==0 (a valid
+            // Rs-shift data-processing instruction) still needs its own
+            // handling here rather than falling through to have its Rs
+            // field misread as a shift-immediate — confirmed against a
+            // real word from the actual kernel ("orr r1, r1, r3, lsr r2").
             if word.bit(4) {
-                return .unsupported(rawWord: word)
+                guard !word.bit(7), let shiftType = ShiftType(rawValue: UInt8(word.bitField(6, 5))) else {
+                    return .unsupported(rawWord: word)
+                }
+                operand2 = .shiftedRegisterByRegister(
+                    rm: Int(word.bitField(3, 0)), shiftType: shiftType, rs: Int(word.bitField(11, 8))
+                )
+                return .dataProcessing(DataProcessingInstruction(
+                    condition: condition, op: op, setFlags: setFlags, rn: rn, rd: rd, operand2: operand2
+                ))
             }
             guard let shiftType = ShiftType(rawValue: UInt8(word.bitField(6, 5))) else {
                 return .unsupported(rawWord: word)

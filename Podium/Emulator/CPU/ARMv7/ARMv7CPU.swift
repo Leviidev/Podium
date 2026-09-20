@@ -33,11 +33,11 @@ enum CPUError: Error, Equatable {
 /// the ones that walk directly reads (like SCTLR, TTBR0/1, TTBCR, DACR)
 /// are still just a stored value — see `CP15State` — not acted on (cache
 /// maintenance, TLB invalidation, etc). Several ARM-state instruction
-/// families are also unimplemented: multiply, register-shifted-by-
-/// register operands, SPSR access, most of the coprocessor and
-/// unconditional-instruction spaces, SWI (see `ARMDecoder`'s doc comment
-/// for the exact list); Thumb has its own, separate coverage gaps (see
-/// `ThumbDecoder`'s doc comment). Hitting any of those sets `lastError`
+/// families are also unimplemented: multiply, SPSR access, most of the
+/// coprocessor and unconditional-instruction spaces, SWI (see
+/// `ARMDecoder`'s doc comment for the exact list); Thumb has its own,
+/// separate coverage gaps (see `ThumbDecoder`'s doc comment). Hitting
+/// any of those sets `lastError`
 /// and halts rather than skipping the instruction or guessing at its
 /// effect — silently pressing on past something this CPU doesn't
 /// actually understand would make broken execution look like progress.

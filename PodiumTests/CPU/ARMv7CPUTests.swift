@@ -501,6 +501,34 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers.lr, 4) // return address: the next ARM instruction, already word-aligned
     }
 
+    func testOrrRegisterShiftedByRegisterRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE181_1233, // orr r1, r1, r3, lsr r2 -- real word from the actual kernel
+        ])
+        cpu.registers[1] = 0x0000_00F0
+        cpu.registers[2] = 4 // shift amount, from a register
+        cpu.registers[3] = 0x0000_0F00
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // r3 >> 4 == 0xF0; ORR with r1 (0xF0) == 0xF0.
+        XCTAssertEqual(cpu.registers[1], 0x0000_00F0)
+    }
+
+    func testRegisterShiftedByRegisterWithZeroAmountLeavesValueAndCarryUnchanged() {
+        let cpu = makeCPU(program: [
+            0xE3A0_2000, // MOV r2, #0  (shift amount register, S=0: carry unaffected)
+            0xE1A0_0231, // MOV r0, r1, lsr r2  (register-shifted-by-register, amount 0)
+        ])
+        cpu.registers[1] = 0x8000_0001
+        cpu.step(); cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Amount 0 means "no shift" for the register-specified form,
+        // unlike the immediate form's "LSR #0 means #32" convention.
+        XCTAssertEqual(cpu.registers[0], 0x8000_0001)
+    }
+
     func testConditionalInstructionSkippedWhenConditionFails() {
         let cpu = makeCPU(program: [
             0xE3A0_0000, // MOV r0, #0  (also clears Z, since S==0 here it does NOT touch flags —

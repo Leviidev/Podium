@@ -29,16 +29,23 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.operand2, .shiftedRegister(rm: 2, shiftType: .lsl, shiftAmount: 0))
     }
 
-    func testRegisterSpecifiedShiftIsUnsupportedNotMisreadAsImmediateShift() {
+    func testRegisterSpecifiedShiftDecodesRsNotAsAnImmediateShiftAmount() {
         // ADD r0, r1, r2, LSL r3 — bit4==1 (register-specified shift
-        // amount) with bit7==0, so it's valid data-processing, just a
-        // form this decoder doesn't decode. Regression test for a bug
-        // where this fell through and had Rs (bits 11:8) misread as a
-        // 5-bit shift-immediate instead of being refused.
-        let word: UInt32 = 0xE081_0312
-        if case .dataProcessing = ARMDecoder.decode(word) {
-            XCTFail("Register-specified shift must not be misdecoded as an immediate shift amount")
+        // amount) with bit7==0. Regression test for a bug where this
+        // fell through and had Rs (bits 11:8) misread as a 5-bit
+        // shift-immediate instead of being decoded as the real Rs form.
+        guard case .dataProcessing(let instr) = ARMDecoder.decode(0xE081_0312) else {
+            return XCTFail("Expected dataProcessing")
         }
+        XCTAssertEqual(instr.op, .add)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.rd, 0)
+        guard case .shiftedRegisterByRegister(let rm, let shiftType, let rs) = instr.operand2 else {
+            return XCTFail("Expected shiftedRegisterByRegister, not a misread immediate shift")
+        }
+        XCTAssertEqual(rm, 2)
+        XCTAssertEqual(shiftType, .lsl)
+        XCTAssertEqual(rs, 3)
     }
 
     func testDecodesSubsSettingFlags() {
@@ -90,6 +97,22 @@ final class ARMDecoderTests: XCTestCase {
         }
         XCTAssertTrue(instr.isLoad)
         XCTAssertEqual(instr.registerList, 0x0001)
+    }
+
+    func testDecodesOrrRegisterShiftedByRegisterFromRealKernel() {
+        // orr r1, r1, r3, lsr r2 — from the real kernel at 0x80089bbc.
+        guard case .dataProcessing(let instr) = ARMDecoder.decode(0xE181_1233) else {
+            return XCTFail("Expected dataProcessing")
+        }
+        XCTAssertEqual(instr.op, .orr)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.rd, 1)
+        guard case .shiftedRegisterByRegister(let rm, let shiftType, let rs) = instr.operand2 else {
+            return XCTFail("Expected shiftedRegisterByRegister")
+        }
+        XCTAssertEqual(rm, 3)
+        XCTAssertEqual(shiftType, .lsr)
+        XCTAssertEqual(rs, 2)
     }
 
     func testDecodesLoadWordImmediateOffset() {
