@@ -389,4 +389,15 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rn, 7)
         XCTAssertEqual(instr.operand2, .immediate(4))
     }
+
+    func testDecodesLdrbRegisterOffsetFromRealKernel() {
+        // ldrb r0, [r1, r0] — from the real kernel at 0x800207ce.
+        guard case .loadStoreRegisterOffset(let instr) = ThumbDecoder.decode(0x5c08, 0) else {
+            return XCTFail("Expected loadStoreRegisterOffset")
+        }
+        XCTAssertEqual(instr.op, .ldrb)
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.rm, 0)
+    }
 }

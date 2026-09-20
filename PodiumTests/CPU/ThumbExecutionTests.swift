@@ -387,4 +387,30 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[0], 8)
     }
+
+    func testLdrbRegisterOffsetRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0x5c08, // ldrb r0, [r1, r0], real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[1] = 10
+        cpu.registers[0] = 5
+        try! (cpu.memory as! FlatPhysicalMemory).writeByte(0xAB, at: 15)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0xAB)
+    }
+
+    func testLdrshRegisterOffsetSignExtends() {
+        let cpu = makeThumbCPU(program: [
+            0x5f1a, // ldrsh r2, [r3, r4]
+        ], memorySize: 256)
+        cpu.registers[3] = 10
+        cpu.registers[4] = 4
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord16(0x8000, at: 14) // -32768 as a signed halfword.
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[2], 0xFFFF_8000)
+    }
 }

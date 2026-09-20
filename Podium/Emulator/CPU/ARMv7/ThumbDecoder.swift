@@ -11,8 +11,11 @@ import Foundation
 /// `ADD`/`SUB` register or 3-bit immediate (format 2), immediate
 /// `MOV`/`CMP`/`ADD`/`SUB` (format 3), the two-register ALU family
 /// (format 4), hi-register `ADD`/`CMP`/`MOV` and `BX`/`BLX` (format 5),
-/// word/byte load-store with a 5-bit immediate (format 9), halfword
-/// load-store with a 5-bit immediate (format 10), SP-relative (format
+/// register-offset `STR`/`STRH`/`STRB`/`LDRSB`/`LDR`/`LDRH`/`LDRB`/
+/// `LDRSH` (formats 7 and 8, which share one contiguous 3-bit opcode
+/// field and so are decoded together), word/byte load-store with a
+/// 5-bit immediate (format 9), halfword load-store with a 5-bit
+/// immediate (format 10), SP-relative (format
 /// 11), `ADD Rd,PC/SP,#imm` (format 12), SP adjustment (format 13),
 /// `PUSH`/`POP` (format 14), `SXTH`/`SXTB`/`UXTH`/`UXTB`, conditional
 /// and unconditional branch (formats 16/18), `CBZ`/`CBNZ`, and `IT`.
@@ -25,10 +28,8 @@ import Foundation
 /// (immediate, T3 and T4), `LDM`/
 /// `STM` (T2, both IA and DB), and `MCR`/`MRC` (reusing ARM state's
 /// exact field layout — see `decode32Coprocessor`'s doc comment).
-/// Everything else — signed-halfword loads (format 8, `LDRSB`'s
-/// halfword sibling `LDRSH`), PC-relative `LDR` (format 6), 16-bit
-/// register-offset load/store (format 7), `REV`/`REV16`/`REVSH`,
-/// multiply/multiply-accumulate
+/// Everything else — PC-relative `LDR` (format 6),
+/// `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate
 /// beyond 16-bit `MUL`, table branches, the rest of the coprocessor
 /// space (`CDP`/`LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
@@ -106,6 +107,17 @@ enum ThumbDecoder {
             }
             let rdn = (h1 ? 8 : 0) + Int(hw0.bitField16(2, 0))
             return .hiRegister(ThumbHiRegisterInstruction(op: op, rdn: rdn, rm: rm))
+        }
+
+        // Formats 7/8: register-offset STR/STRH/STRB/LDRSB/LDR/LDRH/
+        // LDRB/LDRSH Rd, [Rn, Rm]. bits[15:12] == 0101 (fixed),
+        // bits[11:9] select the 8-way opcode. Verified against a real
+        // `ldrb r0, [r1, r0]` word from the actual kernel.
+        if hw0.bitField16(15, 12) == 0b0101 {
+            let op = ThumbLoadStoreRegisterOffsetInstruction.Op(rawValue: UInt8(hw0.bitField16(11, 9)))!
+            return .loadStoreRegisterOffset(ThumbLoadStoreRegisterOffsetInstruction(
+                op: op, rd: Int(hw0.bitField16(2, 0)), rn: Int(hw0.bitField16(5, 3)), rm: Int(hw0.bitField16(8, 6))
+            ))
         }
 
         // Format 9: word/byte LDR/STR Rd, [Rn, #imm5] (word: ×4; byte: ×1).

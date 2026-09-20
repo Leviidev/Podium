@@ -132,6 +132,8 @@ extension ARMv7CPU {
             executeThumbBranchExchange(instr, instructionAddress: instructionAddress)
         case .loadStoreImmediate(let instr):
             executeThumbLoadStoreImmediate(instr)
+        case .loadStoreRegisterOffset(let instr):
+            executeThumbLoadStoreRegisterOffset(instr)
         case .address(let instr):
             executeThumbAddress(instr, instructionAddress: instructionAddress)
         case .adjustStack(let instr):
@@ -357,6 +359,32 @@ extension ARMv7CPU {
                 case .byte: try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
                 case .halfword: try memory.writeWord16(UInt16(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
                 }
+            }
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: address)
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(address), address: address)
+        }
+    }
+
+    // MARK: - Formats 7/8: register-offset load/store
+
+    private func executeThumbLoadStoreRegisterOffset(_ instr: ThumbLoadStoreRegisterOffsetInstruction) {
+        let address = registers[instr.rn] &+ registers[instr.rm]
+        do {
+            let isLoad = instr.op != .str && instr.op != .strh && instr.op != .strb
+            let physicalAddress = try translatedAddress(address, access: isLoad ? .read : .write)
+            switch instr.op {
+            case .str: try memory.writeWord32(registers[instr.rd], at: physicalAddress)
+            case .strh: try memory.writeWord16(UInt16(truncatingIfNeeded: registers[instr.rd]), at: physicalAddress)
+            case .strb: try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rd]), at: physicalAddress)
+            case .ldr: registers[instr.rd] = try memory.readWord32(at: physicalAddress)
+            case .ldrh: registers[instr.rd] = UInt32(try memory.readWord16(at: physicalAddress))
+            case .ldrb: registers[instr.rd] = UInt32(try memory.readByte(at: physicalAddress))
+            case .ldrsb:
+                registers[instr.rd] = UInt32(bitPattern: Int32(Int8(bitPattern: try memory.readByte(at: physicalAddress))))
+            case .ldrsh:
+                registers[instr.rd] = UInt32(bitPattern: Int32(Int16(bitPattern: try memory.readWord16(at: physicalAddress))))
             }
         } catch let memoryError as MemoryAccessError {
             lastError = .memoryFault(memoryError, address: address)

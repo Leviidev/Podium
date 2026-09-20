@@ -85,6 +85,28 @@ enum ThumbLoadStoreSize: Equatable {
     case halfword
 }
 
+/// Formats 7 and 8 (they share one contiguous 3-bit opcode field, so
+/// this codebase decodes them together): register-offset `STR`/
+/// `STRH`/`STRB`/`LDRSB`/`LDR`/`LDRH`/`LDRB`/`LDRSH Rd, [Rn, Rm]`.
+/// Verified against a real `ldrb r0, [r1, r0]` word from the actual
+/// kernel.
+struct ThumbLoadStoreRegisterOffsetInstruction: Equatable {
+    enum Op: UInt8 {
+        case str = 0b000
+        case strh = 0b001
+        case strb = 0b010
+        case ldrsb = 0b011
+        case ldr = 0b100
+        case ldrh = 0b101
+        case ldrb = 0b110
+        case ldrsh = 0b111
+    }
+    let op: Op
+    let rd: Int
+    let rn: Int
+    let rm: Int
+}
+
 struct ThumbLoadStoreImmediateInstruction: Equatable {
     let isLoad: Bool
     let size: ThumbLoadStoreSize
@@ -321,6 +343,7 @@ enum ThumbInstruction: Equatable {
     case hiRegister(ThumbHiRegisterInstruction)
     case branchExchange(ThumbBranchExchangeInstruction)
     case loadStoreImmediate(ThumbLoadStoreImmediateInstruction)
+    case loadStoreRegisterOffset(ThumbLoadStoreRegisterOffsetInstruction)
     case address(ThumbAddressInstruction)
     case adjustStack(ThumbAdjustStackInstruction)
     case pushPop(ThumbPushPopInstruction)
