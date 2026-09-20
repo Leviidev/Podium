@@ -347,13 +347,17 @@ extension ARMv7CPU {
         do {
             let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
-                registers[instr.rt] = instr.isByte
-                    ? UInt32(try memory.readByte(at: physicalAddress))
-                    : try memory.readWord32(at: physicalAddress)
-            } else if instr.isByte {
-                try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+                switch instr.size {
+                case .word: registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+                case .byte: registers[instr.rt] = UInt32(try memory.readByte(at: physicalAddress))
+                case .halfword: registers[instr.rt] = UInt32(try memory.readWord16(at: physicalAddress))
+                }
             } else {
-                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+                switch instr.size {
+                case .word: try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+                case .byte: try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+                case .halfword: try memory.writeWord16(UInt16(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+                }
             }
         } catch let memoryError as MemoryAccessError {
             lastError = .memoryFault(memoryError, address: address)

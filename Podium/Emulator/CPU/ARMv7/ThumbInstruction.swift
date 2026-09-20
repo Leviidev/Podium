@@ -64,13 +64,19 @@ struct ThumbBranchExchangeInstruction: Equatable {
 /// Format 9/10/11: `LDR`/`STR` (word or byte) with a 5-bit immediate
 /// offset (`Rn` base) or `Rn = SP` (format 11's own 8-bit immediate,
 /// normalized into the same shape here).
+enum ThumbLoadStoreSize: Equatable {
+    case word
+    case byte
+    case halfword
+}
+
 struct ThumbLoadStoreImmediateInstruction: Equatable {
     let isLoad: Bool
-    let isByte: Bool
+    let size: ThumbLoadStoreSize
     let rn: Int
     let rt: Int
-    /// Already scaled (×4 for word, ×1 for byte) — the raw field's own
-    /// scale factor differs per format, resolved at decode time.
+    /// Already scaled (×4 word, ×1 byte, ×2 halfword) — the raw field's
+    /// own scale factor differs per format, resolved at decode time.
     let offset: UInt32
 }
 

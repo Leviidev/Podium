@@ -240,6 +240,18 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.imm5, 8)
     }
 
+    func testDecodesLdrhFromRealKernel() {
+        // ldrh r0, [r4, #42] — from the real kernel at 0x8027b9f8.
+        guard case .loadStoreImmediate(let instr) = ThumbDecoder.decode(0x8D60, 0) else {
+            return XCTFail("Expected loadStoreImmediate")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertEqual(instr.size, .halfword)
+        XCTAssertEqual(instr.rn, 4)
+        XCTAssertEqual(instr.rt, 0)
+        XCTAssertEqual(instr.offset, 42)
+    }
+
     func testDecodesStrbFromRealKernel() {
         // strb r0, [r6, #0x64] — from the real kernel at 0x8027b9f2.
         guard case .loadStoreWide(let instr) = ThumbDecoder.decode(0xF886, 0x0064) else {

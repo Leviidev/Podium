@@ -156,6 +156,31 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertTrue(cpu.cpsr.carry) // bit 31 shifted out last
     }
 
+    func testStrhThenLdrhRoundTripsOnlyTheLowHalfword() {
+        let cpu = makeThumbCPU(program: [
+            0x8091, // strh r1, [r2, #4]
+            0x8890, // ldrh r0, [r2, #4]
+        ])
+        cpu.registers[1] = 0xAABB_CCDD
+        cpu.registers[2] = 0
+        cpu.step(); cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0xCCDD)
+    }
+
+    func testLdrhRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0x8D60, // ldrh r0, [r4, #42], real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[4] = 0
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord16(0xBEEF, at: 42)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0xBEEF)
+    }
+
     func testStrbThenLdrbRoundTripsOnlyTheLowByte() {
         let cpu = makeThumbCPU(program: [
             0xF886, 0x0064, // strb r0, [r6, #0x64], real word from the actual kernel

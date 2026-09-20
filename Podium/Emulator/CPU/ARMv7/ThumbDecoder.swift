@@ -10,17 +10,18 @@ import Foundation
 /// Covers (16-bit): `LSL`/`LSR`/`ASR` by immediate (format 1), immediate
 /// `MOV`/`CMP`/`ADD`/`SUB` (format 3), the two-register ALU family
 /// (format 4), hi-register `ADD`/`CMP`/`MOV` and `BX`/`BLX` (format 5),
-/// word/byte load-store with a 5-bit immediate (format 9) and
-/// SP-relative (format 11), `ADD Rd,PC/SP,#imm` (format 12), SP
-/// adjustment (format 13), `PUSH`/`POP` (format 14), `SXTH`/`SXTB`/
-/// `UXTH`/`UXTB`, conditional and unconditional branch (formats 16/18),
-/// `CBZ`/`CBNZ`, and `IT`. Covers (32-bit): `MOVW`/`MOVT`, the
-/// data-processing modified-immediate family, `BL`, `BLX` (immediate),
-/// unconditional `B.W`, `LDR`/`STR` (immediate, T3 and T4), and
-/// `LDM`/`STM` (T2, load-only so far). Everything else — `ADD`/`SUB`
-/// (format 2, register or 3-bit immediate), halfword/signed-byte loads,
-/// PC-relative `LDR` (format 6), register-offset load/store (formats
-/// 7/8), `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate beyond
+/// word/byte load-store with a 5-bit immediate (format 9), halfword
+/// load-store with a 5-bit immediate (format 10), SP-relative (format
+/// 11), `ADD Rd,PC/SP,#imm` (format 12), SP adjustment (format 13),
+/// `PUSH`/`POP` (format 14), `SXTH`/`SXTB`/`UXTH`/`UXTB`, conditional
+/// and unconditional branch (formats 16/18), `CBZ`/`CBNZ`, and `IT`.
+/// Covers (32-bit): `MOVW`/`MOVT`, the data-processing modified-
+/// immediate family, `BL`, `BLX` (immediate), unconditional `B.W`,
+/// `LDR`/`STR`/`LDRB`/`STRB` (immediate, T3 and T4), and `LDM`/`STM`
+/// (T2, load-only so far). Everything else — `ADD`/`SUB` (format 2,
+/// register or 3-bit immediate), signed-byte/halfword loads (format 8),
+/// PC-relative `LDR` (format 6), register-offset load/store (format 7),
+/// `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate beyond
 /// 16-bit `MUL`, table branches, conditional `B.W` (T3), `STM.W`,
 /// coprocessor, SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
@@ -92,16 +93,25 @@ enum ThumbDecoder {
             let isLoad = hw0.bit16(11)
             let imm5 = UInt32(hw0.bitField16(10, 6))
             return .loadStoreImmediate(ThumbLoadStoreImmediateInstruction(
-                isLoad: isLoad, isByte: isByte,
+                isLoad: isLoad, size: isByte ? .byte : .word,
                 rn: Int(hw0.bitField16(5, 3)), rt: Int(hw0.bitField16(2, 0)),
                 offset: isByte ? imm5 : imm5 * 4
+            ))
+        }
+
+        // Format 10: halfword LDRH/STRH Rd, [Rn, #imm5] (×2).
+        if hw0.bitField16(15, 12) == 0b1000 {
+            return .loadStoreImmediate(ThumbLoadStoreImmediateInstruction(
+                isLoad: hw0.bit16(11), size: .halfword,
+                rn: Int(hw0.bitField16(5, 3)), rt: Int(hw0.bitField16(2, 0)),
+                offset: UInt32(hw0.bitField16(10, 6)) * 2
             ))
         }
 
         // Format 11: SP-relative LDR/STR Rd, [SP, #imm8*4].
         if hw0.bitField16(15, 12) == 0b1001 {
             return .loadStoreImmediate(ThumbLoadStoreImmediateInstruction(
-                isLoad: hw0.bit16(11), isByte: false,
+                isLoad: hw0.bit16(11), size: .word,
                 rn: Registers.spIndex, rt: Int(hw0.bitField16(10, 8)),
                 offset: UInt32(hw0.bitField16(7, 0)) * 4
             ))
