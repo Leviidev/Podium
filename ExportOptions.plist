@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>method</key>
-    <string>development</string>
+    <string>debugging</string>
     <key>teamID</key>
-    <string>9MU26DDJGW</string>
+    <string>H6WR7UCPC9</string>
     <key>signingStyle</key>
     <string>automatic</string>
     <key>compileBitcode</key>
