@@ -362,4 +362,29 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 0xFFFF_FFFF)
         XCTAssertEqual(cpu.registers[5], 11) // pre-indexed with writeback.
     }
+
+    func testSubsImmediate3RealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0x1f3c, // subs r4, r7, #4, real word from the actual kernel
+        ])
+        cpu.registers[7] = 10
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[4], 6)
+        XCTAssertFalse(cpu.cpsr.zero)
+        XCTAssertTrue(cpu.cpsr.carry) // No borrow.
+    }
+
+    func testAddsRegisterFormat2() {
+        let cpu = makeThumbCPU(program: [
+            0x1888, // adds r0, r1, r2 (format 2, register)
+        ])
+        cpu.registers[1] = 5
+        cpu.registers[2] = 3
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 8)
+    }
 }

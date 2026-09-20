@@ -122,6 +122,8 @@ extension ARMv7CPU {
             executeThumbShiftImmediate(instr)
         case .immediate(let instr):
             executeThumbImmediate(instr)
+        case .addSub(let instr):
+            executeThumbAddSub(instr)
         case .alu(let instr):
             executeThumbAlu(instr)
         case .hiRegister(let instr):
@@ -215,6 +217,20 @@ extension ARMv7CPU {
             registers[instr.rdn] = r.value
             setNZCV(r)
         }
+    }
+
+    // MARK: - Format 2: ADD/SUB Rd, Rn, Rm/#imm3
+
+    private func executeThumbAddSub(_ instr: ThumbAddSubInstruction) {
+        let rn = registers[instr.rn]
+        let operand2: UInt32
+        switch instr.operand2 {
+        case .register(let rm): operand2 = registers[rm]
+        case .immediate(let imm3): operand2 = imm3
+        }
+        let r = instr.isSub ? ALU.subtract(rn, operand2) : ALU.add(rn, operand2)
+        registers[instr.rd] = r.value
+        setNZCV(r)
     }
 
     // MARK: - Format 4: two-register ALU

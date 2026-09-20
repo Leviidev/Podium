@@ -378,4 +378,15 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertTrue(instr.writeback)
         XCTAssertEqual(instr.offset, 1)
     }
+
+    func testDecodesSubsImmediate3FromRealKernel() {
+        // subs r4, r7, #4 — from the real kernel at 0x80287ed0.
+        guard case .addSub(let instr) = ThumbDecoder.decode(0x1f3c, 0) else {
+            return XCTFail("Expected addSub")
+        }
+        XCTAssertTrue(instr.isSub)
+        XCTAssertEqual(instr.rd, 4)
+        XCTAssertEqual(instr.rn, 7)
+        XCTAssertEqual(instr.operand2, .immediate(4))
+    }
 }

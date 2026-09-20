@@ -35,6 +35,21 @@ struct ThumbImmediateInstruction: Equatable {
     let imm8: UInt32
 }
 
+/// Format 2: `ADDS`/`SUBS Rd, Rn, Rm` (register) and `ADDS`/`SUBS Rd,
+/// Rn, #imm3` (3-bit immediate) — always flag-setting, like every
+/// other low-register Thumb-1 data-processing form. Verified against a
+/// real `subs r4, r7, #4` word from the actual kernel.
+struct ThumbAddSubInstruction: Equatable {
+    enum Operand2: Equatable {
+        case register(Int)
+        case immediate(UInt32)
+    }
+    let isSub: Bool
+    let rd: Int
+    let rn: Int
+    let operand2: Operand2
+}
+
 /// Format 4: two-register ALU operations (`AND`/`EOR`/.../`MVN`),
 /// always flag-setting, always `Rdn = Rdn OP Rm`.
 struct ThumbAluInstruction: Equatable {
@@ -301,6 +316,7 @@ enum ThumbInstruction: Equatable {
     case coprocessorRegisterTransfer(CoprocessorRegisterTransferInstruction)
     case shiftImmediate(ThumbShiftImmediateInstruction)
     case immediate(ThumbImmediateInstruction)
+    case addSub(ThumbAddSubInstruction)
     case alu(ThumbAluInstruction)
     case hiRegister(ThumbHiRegisterInstruction)
     case branchExchange(ThumbBranchExchangeInstruction)

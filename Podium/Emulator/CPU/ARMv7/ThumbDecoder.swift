@@ -7,7 +7,8 @@ import Foundation
 /// kernel's Thumb-compiled code (confirmed present via a real `BLX` this
 /// CPU used to be unable to follow — see `ARMv7CPU`'s doc comment).
 ///
-/// Covers (16-bit): `LSL`/`LSR`/`ASR` by immediate (format 1), immediate
+/// Covers (16-bit): `LSL`/`LSR`/`ASR` by immediate (format 1),
+/// `ADD`/`SUB` register or 3-bit immediate (format 2), immediate
 /// `MOV`/`CMP`/`ADD`/`SUB` (format 3), the two-register ALU family
 /// (format 4), hi-register `ADD`/`CMP`/`MOV` and `BX`/`BLX` (format 5),
 /// word/byte load-store with a 5-bit immediate (format 9), halfword
@@ -24,10 +25,10 @@ import Foundation
 /// (immediate, T3 and T4), `LDM`/
 /// `STM` (T2, both IA and DB), and `MCR`/`MRC` (reusing ARM state's
 /// exact field layout — see `decode32Coprocessor`'s doc comment).
-/// Everything else — `ADD`/`SUB` (format 2, register or 3-bit
-/// immediate), signed-byte/halfword loads (format 8), PC-relative `LDR`
-/// (format 6), 16-bit register-offset load/store (format 7),
-/// `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate
+/// Everything else — signed-halfword loads (format 8, `LDRSB`'s
+/// halfword sibling `LDRSH`), PC-relative `LDR` (format 6), 16-bit
+/// register-offset load/store (format 7), `REV`/`REV16`/`REVSH`,
+/// multiply/multiply-accumulate
 /// beyond 16-bit `MUL`, table branches, the rest of the coprocessor
 /// space (`CDP`/`LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
@@ -60,6 +61,20 @@ enum ThumbDecoder {
                 shiftType: shiftType, rd: Int(hw0.bitField16(2, 0)), rm: Int(hw0.bitField16(5, 3)),
                 imm5: UInt8(hw0.bitField16(10, 6))
             ))
+        }
+
+        // Format 2: ADD/SUB Rd, Rn, Rm (register) or Rd, Rn, #imm3 —
+        // bits[15:11] == 00011 (the marker format 1's guard above
+        // steers around), bit[10] selects immediate vs register, bit[9]
+        // selects SUB vs ADD. Verified against a real
+        // `subs r4, r7, #4` word from the actual kernel.
+        if hw0.bitField16(15, 11) == 0b00011 {
+            let rd = Int(hw0.bitField16(2, 0))
+            let rn = Int(hw0.bitField16(5, 3))
+            let operand2: ThumbAddSubInstruction.Operand2 = hw0.bit16(10)
+                ? .immediate(UInt32(hw0.bitField16(8, 6)))
+                : .register(Int(hw0.bitField16(8, 6)))
+            return .addSub(ThumbAddSubInstruction(isSub: hw0.bit16(9), rd: rd, rn: rn, operand2: operand2))
         }
 
         // Format 3: MOV/CMP/ADD/SUB Rd, #imm8.
