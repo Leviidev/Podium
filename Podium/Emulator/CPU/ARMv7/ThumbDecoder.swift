@@ -16,14 +16,15 @@ import Foundation
 /// `PUSH`/`POP` (format 14), `SXTH`/`SXTB`/`UXTH`/`UXTB`, conditional
 /// and unconditional branch (formats 16/18), `CBZ`/`CBNZ`, and `IT`.
 /// Covers (32-bit): `MOVW`/`MOVT`, the data-processing modified-
-/// immediate family, `BL`, `BLX` (immediate), unconditional `B.W`,
-/// `LDR`/`STR`/`LDRB`/`STRB` (immediate, T3 and T4), and `LDM`/`STM`
-/// (T2, both IA and DB). Everything else — `ADD`/`SUB` (format 2,
-/// register or 3-bit immediate), signed-byte/halfword loads (format 8),
-/// PC-relative `LDR` (format 6), register-offset load/store (format 7),
-/// `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate beyond
-/// 16-bit `MUL`, table branches, conditional `B.W` (T3), `STM.W`,
-/// coprocessor, SIMD/VFP — decodes to `.unsupported`.
+/// immediate family, `BL`, `BLX` (immediate), `B.W` (both the
+/// unconditional T4 form and the conditional T3 form, which carries its
+/// own condition field the same way 16-bit `Bcond` does), `LDR`/`STR`/
+/// `LDRB`/`STRB` (immediate, T3 and T4), and `LDM`/`STM` (T2, both IA
+/// and DB). Everything else — `ADD`/`SUB` (format 2, register or 3-bit
+/// immediate), signed-byte/halfword loads (format 8), PC-relative `LDR`
+/// (format 6), register-offset load/store (format 7), `REV`/`REV16`/
+/// `REVSH`, multiply/multiply-accumulate beyond 16-bit `MUL`, table
+/// branches, coprocessor, SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
     /// Whether `firstHalfword` opens a 32-bit Thumb-2 instruction (in
     /// which case the caller must fetch a second halfword before
@@ -309,13 +310,23 @@ enum ThumbDecoder {
             return .branchLink(ThumbBranchLinkInstruction(switchesToARM: switchesToARM, signedOffset: offset))
         }
         if branchKind == 0b10, hw1.bit16(12) {
-            // B.W (T4, unconditional). The conditional T3 form (bit12==0)
-            // isn't decoded yet — no real word to verify it against.
+            // B.W (T4, unconditional).
             let offset = decodeBLOffset(hw0, hw1)
             return .branchWide(ThumbBranchWideInstruction(condition: .always, signedOffset: offset))
         }
         if branchKind == 0b10, !hw1.bit16(12) {
-            return .unsupported(rawHalfword: hw0, secondHalfword: hw1) // B.W (T3, conditional) — not yet verified/decoded.
+            // B.W (T3, conditional) — a real, but shorter-range, cond
+            // field (bits[9:6]) is available here, so cond==1110/1111
+            // (AL/never) aren't valid encodings (those go through T4 or
+            // the unconditional space instead); reserved rather than
+            // guessed at. Verified against a real "beq.w" word from the
+            // actual kernel.
+            let condBits = hw0.bitField16(9, 6)
+            guard condBits != 0b1110, condBits != 0b1111 else {
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+            }
+            let offset = decodeConditionalBWOffset(hw0, hw1)
+            return .branchWide(ThumbBranchWideInstruction(condition: ARMCondition(rawBits: UInt32(condBits)), signedOffset: offset))
         }
 
         return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
@@ -337,6 +348,24 @@ enum ThumbDecoder {
             imm25 = imm25 &- (1 << 25)
         }
         return Int32(bitPattern: imm25)
+    }
+
+    /// The shorter-range `S:J2:J1:imm6:imm11:0` offset used only by
+    /// conditional `B.W` (T3) — a plain concatenation, unlike
+    /// `decodeBLOffset`'s `I1`/`I2` `NOT`-XOR scheme for `BL`/`BLX`/
+    /// unconditional `B.W`. Verified against a real `beq.w` word from
+    /// the actual kernel.
+    private static func decodeConditionalBWOffset(_ hw0: UInt16, _ hw1: UInt16) -> Int32 {
+        let s = hw0.bit16(10) ? UInt32(1) : 0
+        let imm6 = UInt32(hw0.bitField16(5, 0))
+        let j1 = hw1.bit16(13) ? UInt32(1) : 0
+        let j2 = hw1.bit16(11) ? UInt32(1) : 0
+        let imm11 = UInt32(hw1.bitField16(10, 0))
+        var imm21 = (s << 20) | (j2 << 19) | (j1 << 18) | (imm6 << 12) | (imm11 << 1)
+        if s != 0 {
+            imm21 = imm21 &- (1 << 21)
+        }
+        return Int32(bitPattern: imm21)
     }
 
     /// Thumb-2's "modified immediate" 12-bit encoding (`i:imm3:imm8`) —

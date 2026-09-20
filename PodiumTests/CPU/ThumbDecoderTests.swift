@@ -264,6 +264,15 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.registerList, 0x0009) // r0, r3
     }
 
+    func testDecodesBeqWConditionalFromRealKernel() {
+        // beq.w #0x80020924 — from the real kernel at 0x8001ff66.
+        guard case .branchWide(let instr) = ThumbDecoder.decode(0xf000, 0x84dd) else {
+            return XCTFail("Expected branchWide")
+        }
+        XCTAssertEqual(instr.condition, .equal)
+        XCTAssertEqual(0x8001_FF66 &+ 4 &+ UInt32(bitPattern: instr.signedOffset), 0x8002_0924)
+    }
+
     func testDecodesPushWDbDirectionFromRealKernel() {
         // push.w {r8, sl, fp} — from the real kernel at 0x8027ad44,
         // the DB-direction form (16-bit PUSH can't reach r8-r11).

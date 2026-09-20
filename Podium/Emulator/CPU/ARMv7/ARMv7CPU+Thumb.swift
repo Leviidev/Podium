@@ -93,6 +93,19 @@ extension ARMv7CPU {
             advanceThumbITState()
             executeThumbCompareBranch(instr, instructionAddress: instructionAddress)
 
+        case .branchWide(let instr):
+            // B.W (T3, conditional) carries its own real condition, the
+            // same as 16-bit Bcond — never gated by ITSTATE. The
+            // unconditional T4 form's `.always` here bypasses ITSTATE
+            // too; real hardware would still apply an active IT block's
+            // condition to it, but an unconditional B.W placed inside an
+            // IT block is not a pattern real compiled code produces, so
+            // this is a deliberate, narrow simplification rather than
+            // being left silently wrong.
+            advanceThumbITState()
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeThumbBranchWide(instr, instructionAddress: instructionAddress)
+
         default:
             let condition = currentThumbCondition()
             advanceThumbITState()
@@ -127,8 +140,6 @@ extension ARMv7CPU {
             executeThumbDataProcessingImmediate(instr)
         case .branchLink(let instr):
             executeThumbBranchLink(instr, instructionAddress: instructionAddress)
-        case .branchWide(let instr):
-            executeThumbBranchWide(instr, instructionAddress: instructionAddress)
         case .loadStoreWide(let instr):
             executeThumbLoadStoreWide(instr)
         case .blockDataTransfer(let instr):
@@ -137,7 +148,7 @@ extension ARMv7CPU {
             executeThumbBranch(instr, instructionAddress: instructionAddress)
         case .extend(let instr):
             executeThumbExtend(instr)
-        case .conditionalBranch, .it, .compareBranch:
+        case .conditionalBranch, .it, .compareBranch, .branchWide:
             preconditionFailure("handled in stepThumb before reaching executeThumb")
         case .unsupported(let raw, let second):
             lastError = .unsupportedInstruction(rawWord: Self.combinedRawWord(raw, second), address: instructionAddress)

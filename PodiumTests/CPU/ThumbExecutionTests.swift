@@ -194,6 +194,31 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[1], 0xDD)
     }
 
+    func testBeqWBranchesWhenZeroFlagSet() {
+        let cpu = makeThumbCPU(program: [
+            0x2000, // movs r0, #0   (sets Z)
+            0xf000, 0x8001, // beq.w +2 (real word shape from the actual kernel, retargeted for this small test buffer)
+            0x2101, // movs r1, #1 -- must NOT execute
+        ])
+        cpu.step() // movs r0, #0
+        cpu.step() // beq.w -- branches since Z is set
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers.pc, 8) // instrAddr(2) + 4 + offset(2) == 8, landing past the "must not execute" word
+    }
+
+    func testBeqWSkippedWhenZeroFlagClear() {
+        let cpu = makeThumbCPU(program: [
+            0x2001, // movs r0, #1   (clears Z)
+            0xf000, 0x8001, // beq.w +2
+            0x2101, // movs r1, #1 -- must execute since the branch is not taken
+        ])
+        for _ in 0..<3 { cpu.step() }
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 1)
+    }
+
     func testPushWDbDirectionStoresBelowOriginalSP() {
         let cpu = makeThumbCPU(program: [
             0xe92d, 0x0d00, // push.w {r8, sl, fp}, real word from the actual kernel
