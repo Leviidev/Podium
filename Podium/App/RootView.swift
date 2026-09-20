@@ -6,6 +6,7 @@ import SwiftUI
 struct RootView: View {
     @State private var firmwareLibrary = FirmwareLibrary()
     @State private var emulatorCore = EmulatorCore()
+    @State private var referenceFirmwareDownloader = ReferenceFirmwareDownloader()
 
     @AppStorage(AppStorageKeys.appearance) private var appearanceRawValue = AppearanceOption.system.rawValue
 
@@ -17,7 +18,11 @@ struct RootView: View {
         MainScreen()
             .environment(firmwareLibrary)
             .environment(emulatorCore)
+            .environment(referenceFirmwareDownloader)
             .preferredColorScheme(preferredColorScheme)
+            .task {
+                await referenceFirmwareDownloader.downloadIfNeeded(into: firmwareLibrary)
+            }
     }
 }
 

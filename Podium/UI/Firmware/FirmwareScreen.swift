@@ -3,11 +3,22 @@ import UniformTypeIdentifiers
 
 struct FirmwareScreen: View {
     @Environment(FirmwareLibrary.self) private var firmwareLibrary
+    @Environment(ReferenceFirmwareDownloader.self) private var downloader
     @State private var isPresentingImporter = false
     @State private var importError: ImportErrorPresentation?
 
     var body: some View {
         List {
+            if downloader.phase != .idle && downloader.phase != .completed {
+                FirmwareDownloadBanner(
+                    phase: downloader.phase,
+                    onCancel: { downloader.cancel() },
+                    onRetry: { Task { await downloader.retry(into: firmwareLibrary) } }
+                )
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+            }
+
             if firmwareLibrary.firmwares.isEmpty {
                 emptyState
             } else {
@@ -52,10 +63,21 @@ struct FirmwareScreen: View {
     }
 
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label("No Firmware Imported", systemImage: "square.and.arrow.down")
-        } description: {
-            Text("Import an IPSW to get started. Podium currently supports \(DeviceCatalog.iPodTouch4.marketingName) on iOS \(ReferenceFirmware.productVersion).")
+        VStack(spacing: 16) {
+            ContentUnavailableView {
+                Label("No Firmware Imported", systemImage: "square.and.arrow.down")
+            } description: {
+                Text("Import an IPSW to get started. Podium currently supports \(DeviceCatalog.iPodTouch4.marketingName) on iOS \(ReferenceFirmware.productVersion).")
+            }
+
+            if !downloader.phase.isActive {
+                Button {
+                    Task { await downloader.retry(into: firmwareLibrary) }
+                } label: {
+                    Label("Download iOS \(ReferenceFirmware.productVersion) for \(DeviceCatalog.iPodTouch4.shortName)", systemImage: "arrow.down.circle")
+                }
+                .font(.subheadline.weight(.medium))
+            }
         }
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
@@ -90,4 +112,5 @@ private struct ImportErrorPresentation: Identifiable {
         FirmwareScreen()
     }
     .environment(FirmwareLibrary())
+    .environment(ReferenceFirmwareDownloader())
 }

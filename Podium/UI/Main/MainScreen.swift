@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MainScreen: View {
     @Environment(FirmwareLibrary.self) private var firmwareLibrary
+    @Environment(ReferenceFirmwareDownloader.self) private var downloader
 
     private var activeFirmware: ImportedFirmware? {
         firmwareLibrary.activeFirmware
@@ -20,6 +21,12 @@ struct MainScreen: View {
                     DevicePreviewView()
                         .frame(maxWidth: 260)
                         .padding(.vertical, 4)
+
+                    FirmwareDownloadBanner(
+                        phase: downloader.phase,
+                        onCancel: { downloader.cancel() },
+                        onRetry: { Task { await downloader.retry(into: firmwareLibrary) } }
+                    )
 
                     launchButton
 
@@ -63,7 +70,7 @@ struct MainScreen: View {
             .buttonStyle(.podiumPrimary(isDisabled: !canLaunch))
             .disabled(!canLaunch)
 
-            if !canLaunch {
+            if !canLaunch, !downloader.phase.isActive {
                 Text(activeFirmware == nil ? "Import firmware to begin." : "Selected firmware isn't compatible yet.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -105,4 +112,5 @@ struct MainScreen: View {
 #Preview {
     MainScreen()
         .environment(FirmwareLibrary())
+        .environment(ReferenceFirmwareDownloader())
 }

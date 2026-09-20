@@ -53,6 +53,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.leviidev.podium.tests
+        DEVELOPMENT_TEAM: H6WR7UCPC9
+        CODE_SIGN_STYLE: Automatic
         GENERATE_INFOPLIST_FILE: "YES"
     scheme:
       testTargets:
