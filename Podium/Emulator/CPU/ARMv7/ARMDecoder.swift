@@ -15,7 +15,7 @@ import Foundation
 /// (immediate *and* register offset), the halfword/signed-byte "extra
 /// load/store" instructions (`LDRH`/`STRH`/`LDRSB`/`LDRSH`), block data
 /// transfer (`LDM`/`STM`, ordinary form only), `MRS`/`MSR` (CPSR only),
-/// `MCR`/`MRC`, `CPS`, `PLD` (immediate), `UQSUB8`/`REV` (two
+/// `MCR`/`MRC`, `CPS`, `PLD` (immediate), `CLZ`, `UQSUB8`/`REV` (two
 /// instructions decoded from ARMv6's much larger "media instructions"
 /// space — see `decodeMediaInstructions`'s doc comment), and the
 /// `DSB`/`DMB`/`ISB` barriers. Everything else — multiply, the `S`-bit
@@ -133,6 +133,17 @@ enum ARMDecoder {
         let rd = Int(word.bitField(15, 12))
 
         if !setFlags && op.isComparison {
+            // CLZ (fixed bits[27:20]==0x16, [19:16]==[11:4]=="all 1s"
+            // except the low nibble of [11:4], which is 0001) shares
+            // this same "op is a comparison with S==0" shape but is a
+            // completely different instruction — confirmed against a
+            // real word from the actual kernel via Capstone. Checked
+            // before the MRS/MSR logic below, which would otherwise
+            // treat this word as an (incorrectly) refused SPSR access.
+            if word.bitField(27, 20) == 0x16, word.bitField(19, 16) == 0b1111, word.bitField(11, 4) == 0b1111_0001 {
+                return .clz(ClzInstruction(condition: condition, rd: rd, rm: Int(word.bitField(3, 0))))
+            }
+
             // TST/TEQ/CMP/CMN with S==0 isn't that comparison — this
             // encoding (bits[24:23]=="10", true for all four of those
             // opcodes) is where MRS/MSR (status register access) live.

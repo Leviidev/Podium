@@ -223,6 +223,10 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeRev(instr)
 
+        case .clz(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeClz(instr)
+
         case .memoryBarrier:
             // A real no-op: see ARMInstruction.memoryBarrier's doc comment.
             break
@@ -351,6 +355,10 @@ final class ARMv7CPU: CPU {
 
     private func executeRev(_ instr: RevInstruction) {
         registers[instr.rd] = registers[instr.rm].byteSwapped
+    }
+
+    private func executeClz(_ instr: ClzInstruction) {
+        registers[instr.rd] = UInt32(registers[instr.rm].leadingZeroBitCount)
     }
 
     func operandValue(for register: Int) -> UInt32 {

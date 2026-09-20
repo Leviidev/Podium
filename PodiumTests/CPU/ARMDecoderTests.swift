@@ -136,6 +136,16 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rm, 2)
     }
 
+    func testDecodesClzFromRealKernel() {
+        // clz r2, r2 — from the real kernel at 0x80089be8, confirmed
+        // via Capstone.
+        guard case .clz(let instr) = ARMDecoder.decode(0xE16F_2F12) else {
+            return XCTFail("Expected clz")
+        }
+        XCTAssertEqual(instr.rd, 2)
+        XCTAssertEqual(instr.rm, 2)
+    }
+
     func testDecodesLoadWordImmediateOffset() {
         // LDR r0, [r1, #4]
         guard case .loadStore(let instr) = ARMDecoder.decode(0xE591_0004) else {

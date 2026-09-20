@@ -556,6 +556,28 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[2], 0x7856_3412)
     }
 
+    func testClzCountsLeadingZerosRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE16F_2F12, // clz r2, r2 -- real word from the actual kernel
+        ])
+        cpu.registers[2] = 0x0000_0010 // bit 4 set: 27 leading zeros
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[2], 27)
+    }
+
+    func testClzOfZeroIsThirtyTwo() {
+        let cpu = makeCPU(program: [
+            0xE16F_2F12, // clz r2, r2
+        ])
+        cpu.registers[2] = 0
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[2], 32)
+    }
+
     func testConditionalInstructionSkippedWhenConditionFails() {
         let cpu = makeCPU(program: [
             0xE3A0_0000, // MOV r0, #0  (also clears Z, since S==0 here it does NOT touch flags —

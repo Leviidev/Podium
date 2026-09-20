@@ -256,6 +256,19 @@ struct UQSub8Instruction: Equatable {
     let rm: Int
 }
 
+/// `CLZ Rd, Rm`: counts leading zero bits (32 if `Rm` is zero). Lives in
+/// the "miscellaneous instructions" region of the data-processing block
+/// — the exact same top-level shape (`!setFlags && op.isComparison`)
+/// `MRS`/`MSR` already decode from, disambiguated by the full
+/// bits[27:20]/[19:16]/[11:4] pattern rather than the `op`/`S` fields
+/// alone, which aren't enough on their own to tell them apart. Verified
+/// against a real word from the actual kernel via Capstone.
+struct ClzInstruction: Equatable {
+    let condition: ARMCondition
+    let rd: Int
+    let rm: Int
+}
+
 /// `REV Rd, Rm`: reverses the byte order of a word (`Rd.byte[i] =
 /// Rm.byte[3-i]`) — also lives in the media-instructions space (a
 /// unary sibling of `UQSUB8`, hence no `Rn`), verified against a real
@@ -283,6 +296,7 @@ enum ARMInstruction: Equatable {
     case changeProcessorState(ChangeProcessorStateInstruction)
     case uqsub8(UQSub8Instruction)
     case rev(RevInstruction)
+    case clz(ClzInstruction)
     /// `DSB`/`DMB`/`ISB` (memory/instruction ordering barriers) and
     /// `PLD` (immediate, a cache-prefetch hint). Podium's interpreter
     /// executes everything strictly in program order with no caching,
