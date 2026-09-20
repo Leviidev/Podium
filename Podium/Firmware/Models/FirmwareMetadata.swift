@@ -18,6 +18,12 @@ struct FirmwareMetadata: Codable, Hashable {
     /// "kernelcache.release.n81" — `nil` if the manifest didn't declare
     /// one. Needed to locate the kernel for Milestone 4 boot attempts.
     let kernelCachePath: String?
+    /// Path of the device tree inside the IPSW, e.g.
+    /// "Firmware/all_flash/all_flash.n81ap.production/DeviceTree.n81ap.img3"
+    /// — `nil` if the manifest didn't declare one. Needed so real boot
+    /// attempts can hand XNU an actual device tree instead of leaving
+    /// `boot_args.deviceTreeP` honestly zero.
+    let deviceTreePath: String?
 
     /// The primary device this firmware targets, for display purposes.
     /// IPSWs for this era of device are effectively single-device, so the

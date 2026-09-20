@@ -34,4 +34,15 @@ enum ReferenceFirmwareKeys {
         key: Data(hex: "9ad44a5686bfb9604cf9a519fd6b6ad3e443184d00052fc2291d442363f94863"),
         iv: Data(hex: "d8ab4ff8b9e5c9af89b7c77842eb80bb")
     )
+
+    /// Verified the same way as `kernelcache`: decrypting
+    /// `DeviceTree.n81ap.img3`'s DATA payload with this key/IV yields
+    /// readable Apple DeviceTree property strings ("device-tree",
+    /// "model", "iPod4,1", "N81AP", ...), confirmed directly against
+    /// the actual reference firmware file via `openssl enc -d
+    /// -aes-256-cbc` before writing any decryption code.
+    static let deviceTree = ComponentKey(
+        key: Data(hex: "fd12079909ae24b2f8140720854608d12c066def4dc07b66f142259d2970426c"),
+        iv: Data(hex: "830c518baddc2e82ad27de186a56e451")
+    )
 }

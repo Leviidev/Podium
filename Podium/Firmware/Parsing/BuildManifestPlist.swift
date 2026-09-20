@@ -58,4 +58,11 @@ struct BuildManifestPlist: Decodable {
     var kernelCachePath: String? {
         buildIdentities.first?.manifest["KernelCache"]?.info.path
     }
+
+    /// The path (inside the IPSW) of the device tree this manifest
+    /// describes — same "first `BuildIdentity`" simplification as
+    /// `kernelCachePath`.
+    var deviceTreePath: String? {
+        buildIdentities.first?.manifest["DeviceTree"]?.info.path
+    }
 }

@@ -31,6 +31,18 @@ struct IMG3Container {
     let identifier: String
     let isEncrypted: Bool
     let payload: Data
+    /// The DATA tag's own declared length sub-field — deliberately
+    /// *not* what `payload` is sliced to (see `payload`'s discovery
+    /// story above). For the kernelcache this undercounts by the
+    /// AES-CBC block-padding remainder and is safe to ignore, since
+    /// `AppleLZSS` decompression naturally stops at the real logical
+    /// end regardless of trailing pad bytes. For an uncompressed
+    /// component like the device tree, this is the real, exact byte
+    /// count to keep after decryption — confirmed against the actual
+    /// reference firmware's `DeviceTree.n81ap.img3`: `payload.count`
+    /// is 62560, this field is 62556, and the decrypted payload's last
+    /// 4 bytes are zero padding, not real device-tree content.
+    let declaredDataLength: UInt32
 
     private static let headerSize = 20
     private static let tagHeaderSize = 12
@@ -44,6 +56,7 @@ struct IMG3Container {
         var offset = Self.headerSize
         var encrypted = false
         var dataPayload: Data?
+        var declaredLength: UInt32?
 
         while offset + Self.tagHeaderSize <= data.count {
             let tagMagic = data.readReversedASCIITag(at: offset, length: 4)
@@ -68,13 +81,15 @@ struct IMG3Container {
                 let payloadStart = offset + Self.tagHeaderSize
                 let payloadLength = totalLength - Self.tagHeaderSize
                 dataPayload = data.subdata(in: payloadStart..<(payloadStart + payloadLength))
+                declaredLength = data.readUInt32LE(at: offset + 8)
             }
 
             offset += totalLength
         }
 
-        guard let payload = dataPayload else { throw IMG3Error.missingDataTag }
+        guard let payload = dataPayload, let declaredLength else { throw IMG3Error.missingDataTag }
         self.isEncrypted = encrypted
         self.payload = payload
+        self.declaredDataLength = declaredLength
     }
 }

@@ -13,7 +13,8 @@ final class DeviceCompatibilityTests: XCTestCase {
             buildVersion: buildVersion,
             fileSizeBytes: 123,
             originalFileName: "test.ipsw",
-            kernelCachePath: "kernelcache.release.n81"
+            kernelCachePath: "kernelcache.release.n81",
+            deviceTreePath: "Firmware/all_flash/all_flash.n81ap.production/DeviceTree.n81ap.img3"
         )
     }
 

@@ -75,15 +75,16 @@ final class EmulatorCore {
         appendLog("No guest firmware is loaded yet.")
     }
 
-    /// Extracts the kernel from `firmware`'s stored IPSW, loads it into
-    /// guest memory, points the CPU at its real entry point, and runs a
-    /// bounded number of instructions. This is Milestone 4's own stated
-    /// goal — "get the guest kernel executing" — not a claim that it
-    /// boots to anything further: real XNU boot code uses instruction
-    /// families (multiply, coprocessor/MMU control, block transfer) this
-    /// CPU doesn't implement yet, so halting on `.unsupportedInstruction`
-    /// within the first stretch of real execution is the expected,
-    /// honest outcome right now, not a bug in the loader.
+    /// Extracts the kernel (and, best-effort, the device tree) from
+    /// `firmware`'s stored IPSW, loads them into guest memory, points
+    /// the CPU at its real entry point, and runs a bounded number of
+    /// instructions. This is Milestone 4's own stated goal — "get the
+    /// guest kernel executing" — not a claim that it boots to
+    /// anything further: real XNU boot code still exercises
+    /// instruction families and kernel subsystems this emulator
+    /// doesn't fully model yet, so halting on `.unsupportedInstruction`
+    /// or a memory fault partway through real execution remains the
+    /// expected, honest outcome, not a bug in the loader.
     func attemptBoot(firmware: ImportedFirmware, storedAt fileURL: URL) async {
         activateCoreIfNeeded()
         guard let armCPU = cpu as? ARMv7CPU, let memory else { return }
@@ -106,6 +107,23 @@ final class EmulatorCore {
             return
         }
         appendLog("Kernel extracted and decompressed: \(Int64(machO.count).formattedByteCount).")
+
+        var deviceTree: Data?
+        do {
+            let extracted = try await Task.detached(priority: .userInitiated) {
+                try DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: fileURL)
+            }.value
+            deviceTree = extracted
+            appendLog("Device tree extracted: \(Int64(extracted.count).formattedByteCount).")
+        } catch let error as FriendlyError {
+            // Not fatal — some firmware may not declare/have a usable
+            // device tree, and XNU's very early entry code doesn't
+            // touch it. boot_args.deviceTreeP is left honestly zero
+            // rather than this failure blocking the boot attempt.
+            appendLog("Device tree extraction skipped: \(error.developerDetail)")
+        } catch {
+            appendLog("Device tree extraction skipped: \(error.localizedDescription)")
+        }
 
         let image: LoadedKernelImage
         do {
@@ -137,17 +155,28 @@ final class EmulatorCore {
         // this can't happen because iBoot always hands the kernel an
         // aligned value, so this rounds up the same way rather than
         // reproducing an address a real bootloader would never produce.
-        let topOfKernelData = (bootArgsAddress + UInt32(BootArgsBuilder.structSize) + 0x3FFF) & ~UInt32(0x3FFF)
+        // The device tree, if extracted, is placed on its own page right
+        // after boot_args — real iBoot page-aligns each component it
+        // hands the kernel, and `topOfKernelData` below is computed to
+        // cover it, so there's no risk of the kernel's own early
+        // allocator reusing this range.
+        let deviceTreeAddress = (bootArgsAddress + UInt32(BootArgsBuilder.structSize) + 0xFFF) & ~UInt32(0xFFF)
+        let deviceTreeLength = UInt32(deviceTree?.count ?? 0)
+        let topOfKernelData = (deviceTreeAddress + deviceTreeLength + 0x3FFF) & ~UInt32(0x3FFF)
         let bootArgs = BootArgsBuilder.build(
             virtBase: Self.physicalMemoryBaseAddress,
             physBase: Self.physicalMemoryBaseAddress,
             memSize: UInt32(Self.physicalMemorySize),
             topOfKernelData: topOfKernelData,
-            deviceTreeP: 0, // No device tree extracted/passed yet — honestly absent, not guessed at.
-            deviceTreeLength: 0
+            deviceTreeP: deviceTree != nil ? deviceTreeAddress : 0,
+            deviceTreeLength: deviceTreeLength
         )
         do {
             try memory.writeBytes(bootArgs, at: bootArgsAddress)
+            if let deviceTree {
+                try memory.writeBytes(deviceTree, at: deviceTreeAddress)
+                appendLog("Device tree written at 0x\(deviceTreeAddress.hexString8) (\(Int64(deviceTree.count).formattedByteCount)).")
+            }
         } catch {
             status = .error("Podium couldn't set up this firmware's boot arguments.")
             appendLog("boot_args write failed: \(error)")

@@ -40,7 +40,8 @@ enum IPSWParser {
             buildVersion: manifest.productBuildVersion,
             fileSizeBytes: fileSize,
             originalFileName: fileURL.lastPathComponent,
-            kernelCachePath: manifest.kernelCachePath
+            kernelCachePath: manifest.kernelCachePath,
+            deviceTreePath: manifest.deviceTreePath
         )
 
         return ParsedFirmware(

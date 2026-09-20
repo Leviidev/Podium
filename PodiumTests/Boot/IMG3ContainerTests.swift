@@ -86,6 +86,18 @@ final class IMG3ContainerTests: XCTestCase {
         XCTAssertEqual(container.payload, payload)
     }
 
+    func testExposesDeclaredDataLengthSeparatelyFromPayload() throws {
+        // Mirrors the real DeviceTree.n81ap.img3 shape: a declared
+        // length smaller than the block-aligned payload, by exactly
+        // the AES padding remainder.
+        let payload = Data(repeating: 0xEF, count: 32)
+        let file = makeIMG3(ident: "dtre", payload: payload, includeKBAG: false, declaredDataLengthOverride: 28)
+
+        let container = try IMG3Container(data: file)
+        XCTAssertEqual(container.payload, payload)
+        XCTAssertEqual(container.declaredDataLength, 28)
+    }
+
     func testRejectsNonIMG3Data() {
         let bogus = Data(repeating: 0, count: 64)
         XCTAssertThrowsError(try IMG3Container(data: bogus)) { error in
