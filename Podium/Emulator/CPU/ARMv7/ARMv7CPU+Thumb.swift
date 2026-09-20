@@ -97,11 +97,11 @@ extension ARMv7CPU {
             let condition = currentThumbCondition()
             advanceThumbITState()
             guard cpsr.isSatisfied(condition) else { return }
-            executeThumb(instruction, hw0: hw0, instructionAddress: instructionAddress)
+            executeThumb(instruction, instructionAddress: instructionAddress)
         }
     }
 
-    private func executeThumb(_ instruction: ThumbInstruction, hw0: UInt16, instructionAddress: UInt32) {
+    private func executeThumb(_ instruction: ThumbInstruction, instructionAddress: UInt32) {
         switch instruction {
         case .shiftImmediate(let instr):
             executeThumbShiftImmediate(instr)
@@ -139,11 +139,21 @@ extension ARMv7CPU {
             executeThumbExtend(instr)
         case .conditionalBranch, .it, .compareBranch:
             preconditionFailure("handled in stepThumb before reaching executeThumb")
-        case .unsupported:
-            lastError = .unsupportedInstruction(rawWord: UInt32(hw0), address: instructionAddress)
-        case .undefined:
-            lastError = .undefinedInstruction(rawWord: UInt32(hw0), address: instructionAddress)
+        case .unsupported(let raw, let second):
+            lastError = .unsupportedInstruction(rawWord: Self.combinedRawWord(raw, second), address: instructionAddress)
+        case .undefined(let raw, let second):
+            lastError = .undefinedInstruction(rawWord: Self.combinedRawWord(raw, second), address: instructionAddress)
         }
+    }
+
+    /// For diagnostics only: a 32-bit instruction's halt is reported as
+    /// `(hw0 << 16) | hw1` — the same order the two halfwords appear in
+    /// the instruction stream — so the printed word matches what a
+    /// disassembler would show, not just the first (and least
+    /// informative) half of it.
+    private static func combinedRawWord(_ first: UInt16, _ second: UInt16?) -> UInt32 {
+        guard let second else { return UInt32(first) }
+        return (UInt32(first) << 16) | UInt32(second)
     }
 
     // MARK: - Flags
@@ -514,13 +524,17 @@ extension ARMv7CPU {
         do {
             let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
-                let value = try memory.readWord32(at: physicalAddress)
+                let value = instr.isByte
+                    ? UInt32(try memory.readByte(at: physicalAddress))
+                    : try memory.readWord32(at: physicalAddress)
                 if instr.rt == Registers.pcIndex {
                     cpsr.thumbState = value.bit(0)
                     registers.pc = value & ~UInt32(0b1)
                 } else {
                     registers[instr.rt] = value
                 }
+            } else if instr.isByte {
+                try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
             } else {
                 try memory.writeWord32(registers[instr.rt], at: physicalAddress)
             }

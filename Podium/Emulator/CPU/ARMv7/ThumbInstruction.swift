@@ -213,12 +213,15 @@ struct ThumbBranchWideInstruction: Equatable {
     let signedOffset: Int32
 }
 
-/// Thumb-2 `LDR`/`STR` (immediate), both the T3 (12-bit unsigned,
-/// always pre-indexed, never writeback) and T4 (8-bit signed,
+/// Thumb-2 `LDR`/`STR`/`LDRB`/`STRB` (immediate), both the T3 (12-bit
+/// unsigned, always pre-indexed, never writeback) and T4 (8-bit signed,
 /// pre/post-indexed, optional writeback) sub-forms, unified the same
-/// way `LoadStoreInstruction` unifies ARM's equivalents.
+/// way `LoadStoreInstruction` unifies ARM's equivalents. Halfword
+/// (`LDRH`/`STRH`) and signed (`LDRSB`/`LDRSH`) forms share this same
+/// encoding space but aren't decoded yet.
 struct ThumbLoadStoreWideInstruction: Equatable {
     let isLoad: Bool
+    let isByte: Bool
     let rn: Int
     let rt: Int
     let preIndexed: Bool

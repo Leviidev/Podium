@@ -156,6 +156,19 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertTrue(cpu.cpsr.carry) // bit 31 shifted out last
     }
 
+    func testStrbThenLdrbRoundTripsOnlyTheLowByte() {
+        let cpu = makeThumbCPU(program: [
+            0xF886, 0x0064, // strb r0, [r6, #0x64], real word from the actual kernel
+            0xF896, 0x1064, // ldrb r1, [r6, #0x64]
+        ])
+        cpu.registers[0] = 0xAABB_CCDD
+        cpu.registers[6] = 0
+        cpu.step(); cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 0xDD)
+    }
+
     func testUxtbZeroExtendsLowByte() {
         let cpu = makeThumbCPU(program: [
             0xb2c0, // uxtb r0, r0, real word from the actual kernel

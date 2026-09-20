@@ -209,15 +209,22 @@ enum ThumbDecoder {
         ))
     }
 
-    /// `LDR`/`STR` (immediate) — T3 (12-bit unsigned offset, always
-    /// pre-indexed, no writeback) and T4 (8-bit signed offset,
-    /// pre/post-indexed, optional writeback). Verified against real
-    /// `str.w`/`ldr.w`/`str ...!`/`ldr ...,#4` words from the actual
-    /// kernel; byte/halfword variants (which share this class) aren't
-    /// decoded yet.
+    /// `LDR`/`STR`/`LDRB`/`STRB` (immediate) — T3 (12-bit unsigned
+    /// offset, always pre-indexed, no writeback) and T4 (8-bit signed
+    /// offset, pre/post-indexed, optional writeback). bits[6:5] select
+    /// size: `10` word, `00` byte (verified against real `str.w`/
+    /// `ldr.w`/`str ...!`/`ldr ...,#4`/`strb` words from the actual
+    /// kernel); `01` (halfword) isn't decoded yet, since no real word
+    /// has confirmed it.
     private static func decode32LoadStoreSingle(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard hw0.bitField16(15, 8) == 0b1111_1000, hw0.bit16(6), !hw0.bit16(5) else {
+        guard hw0.bitField16(15, 8) == 0b1111_1000 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        let isByte: Bool
+        switch hw0.bitField16(6, 5) {
+        case 0b10: isByte = false
+        case 0b00: isByte = true
+        default: return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         let isLoad = hw0.bit16(4)
         let rn = Int(hw0.bitField16(3, 0))
@@ -225,7 +232,7 @@ enum ThumbDecoder {
         if hw0.bit16(7) {
             // T3: 12-bit unsigned immediate, always add, never writeback.
             return .loadStoreWide(ThumbLoadStoreWideInstruction(
-                isLoad: isLoad, rn: rn, rt: rt, preIndexed: true, addOffset: true, writeback: false,
+                isLoad: isLoad, isByte: isByte, rn: rn, rt: rt, preIndexed: true, addOffset: true, writeback: false,
                 offset: UInt32(hw1.bitField16(11, 0))
             ))
         }
@@ -234,7 +241,7 @@ enum ThumbDecoder {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         return .loadStoreWide(ThumbLoadStoreWideInstruction(
-            isLoad: isLoad, rn: rn, rt: rt,
+            isLoad: isLoad, isByte: isByte, rn: rn, rt: rt,
             preIndexed: hw1.bit16(10), addOffset: hw1.bit16(9), writeback: hw1.bit16(8),
             offset: UInt32(hw1.bitField16(7, 0))
         ))
