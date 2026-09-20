@@ -441,4 +441,17 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[5], 0xFFFF_FFFE) // RdLo
         XCTAssertEqual(cpu.registers[2], 1) // RdHi
     }
+
+    func testMlaRealKernelWordMultipliesAndAccumulates() {
+        let cpu = makeThumbCPU(program: [
+            0xfb01, 0x2403, // mla r4, r1, r3, r2, real word from the actual kernel
+        ])
+        cpu.registers[1] = 6
+        cpu.registers[3] = 7
+        cpu.registers[2] = 100
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[4], 142) // 6*7 + 100
+    }
 }

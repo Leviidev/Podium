@@ -421,4 +421,15 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rn, 0)
         XCTAssertEqual(instr.rm, 3)
     }
+
+    func testDecodesMlaFromRealKernel() {
+        // mla r4, r1, r3, r2 — from the real kernel at 0x8008b8fc.
+        guard case .mla(let instr) = ThumbDecoder.decode(0xfb01, 0x2403) else {
+            return XCTFail("Expected mla")
+        }
+        XCTAssertEqual(instr.rd, 4)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.rm, 3)
+        XCTAssertEqual(instr.ra, 2)
+    }
 }

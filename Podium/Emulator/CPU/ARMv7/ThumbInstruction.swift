@@ -346,6 +346,22 @@ struct ThumbUmullInstruction: Equatable {
     let rm: Int
 }
 
+/// `MLA Rd, Rn, Rm, Ra`: `Rd = Rn * Rm + Ra`, never flag-setting.
+/// Shares `ThumbUmullInstruction`'s `0xFB` outer prefix but a
+/// different sub-table (hw0 bits[7:4] == `0000`, vs `UMULL`'s `1010`)
+/// and field layout (hw1 bits[15:12] == `Ra`, bits[11:8] == `Rd`, the
+/// reverse order from `UMULL`'s `RdLo`/`RdHi`). `Ra == 1111` is the
+/// no-accumulate `MUL` alias, not decoded here (no real word has
+/// confirmed it, so it isn't silently treated as `MLA` with `Ra` tied
+/// to the program counter). Verified against a real
+/// `mla r4, r1, r3, r2` word from the actual kernel.
+struct ThumbMlaInstruction: Equatable {
+    let rd: Int
+    let rn: Int
+    let rm: Int
+    let ra: Int
+}
+
 struct ThumbTableBranchInstruction: Equatable {
     let rn: Int
     let rm: Int
@@ -389,6 +405,7 @@ enum ThumbInstruction: Equatable {
     case blockDataTransfer(ThumbBlockDataTransferInstruction)
     case tableBranch(ThumbTableBranchInstruction)
     case umull(ThumbUmullInstruction)
+    case mla(ThumbMlaInstruction)
     /// A recognized-but-not-yet-implemented Thumb instruction family —
     /// see `ThumbDecoder`'s doc comment for what's covered so far.
     case unsupported(rawHalfword: UInt16, secondHalfword: UInt16?)

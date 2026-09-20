@@ -27,9 +27,10 @@ import Foundation
 /// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDRSB`
 /// (immediate, T3 and T4), `LDM`/
 /// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), `UMULL`,
-/// and `MCR`/`MRC` (reusing ARM state's exact field layout — see
-/// `decode32Coprocessor`'s doc comment). Everything else — PC-relative
-/// `LDR` (format 6), `REV`/`REV16`/`REVSH`, `SMULL`/`UMLAL`/`SMLAL`/
+/// `MLA`, and `MCR`/`MRC` (reusing ARM state's exact field layout —
+/// see `decode32Coprocessor`'s doc comment). Everything else —
+/// PC-relative `LDR` (format 6), `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2
+/// wide form and `MLS` (`MLA`'s siblings), `SMULL`/`UMLAL`/`SMLAL`/
 /// `SDIV`/`UDIV` (`UMULL`'s siblings), `LDREX`/`STREX`/`LDRD`/`STRD`,
 /// the rest of the coprocessor space (`CDP`/`LDC`/`STC`), SIMD/VFP —
 /// decodes to `.unsupported`.
@@ -450,17 +451,33 @@ enum ThumbDecoder {
         ))
     }
 
-    /// `UMULL` — see `ThumbUmullInstruction`'s doc comment for the
-    /// exact bit split and its sibling instructions that aren't
+    /// `UMULL`/`MLA` — bits[7:4] splits the shared `0xFB` prefix
+    /// between the "multiply, multiply accumulate" table (`0000`,
+    /// `MLA`) and the "long multiply" table (`1010`, `UMULL`); see
+    /// `ThumbMlaInstruction`/`ThumbUmullInstruction`'s doc comments for
+    /// the exact bit splits and their sibling instructions that aren't
     /// decoded.
     private static func decode32LongMultiply(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard hw0.bitField16(15, 8) == 0b1111_1011, hw0.bitField16(7, 4) == 0b1010, hw1.bitField16(7, 4) == 0 else {
+        guard hw0.bitField16(15, 8) == 0b1111_1011, hw1.bitField16(7, 4) == 0 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
-        return .umull(ThumbUmullInstruction(
-            rdLo: Int(hw1.bitField16(15, 12)), rdHi: Int(hw1.bitField16(11, 8)),
-            rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
-        ))
+        switch hw0.bitField16(7, 4) {
+        case 0b1010:
+            return .umull(ThumbUmullInstruction(
+                rdLo: Int(hw1.bitField16(15, 12)), rdHi: Int(hw1.bitField16(11, 8)),
+                rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
+            ))
+        case 0b0000:
+            guard hw1.bitField16(15, 12) != 0b1111 else {
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1) // MUL alias, not decoded.
+            }
+            return .mla(ThumbMlaInstruction(
+                rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)),
+                rm: Int(hw1.bitField16(3, 0)), ra: Int(hw1.bitField16(15, 12))
+            ))
+        default:
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
     }
 
     private static func decode32DataProcessingOrBranch(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
