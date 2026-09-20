@@ -80,14 +80,16 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.signedOffset, -4)
     }
 
-    func testBlockDataTransferIsUnsupported() {
-        // Same 27:26 block as branch, but bit 25 == 0 -> LDM/STM, not decoded.
-        let word: UInt32 = 0xE8BD_0001
-        if case .unsupported = ARMDecoder.decode(word) {
-            // expected
-        } else {
-            XCTFail("Expected .unsupported for block data transfer encoding")
+    func testDecodesBlockDataTransfer() {
+        // Same 27:26 block as branch, but bit 25 == 0 -> LDM/STM
+        // (LDMIA sp!, {r0}). See `testDecodesPushFromRealKernel` and
+        // `testDecodesPopWithPCFromRealKernel` for real-kernel-verified
+        // words exercising the full field set.
+        guard case .blockDataTransfer(let instr) = ARMDecoder.decode(0xE8BD_0001) else {
+            return XCTFail("Expected blockDataTransfer")
         }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertEqual(instr.registerList, 0x0001)
     }
 
     func testDecodesLoadWordImmediateOffset() {
@@ -241,6 +243,125 @@ final class ARMDecoderTests: XCTestCase {
             return XCTFail("Expected register source")
         }
         XCTAssertEqual(rm, 11)
+    }
+
+    func testDecodesBxFromRealKernel() {
+        // bx lr — from the real kernel at 0x80086424, a plain function
+        // return that used to misdecode as an attempted (and rejected)
+        // MSR before BX got its own explicit check.
+        guard case .branchExchange(let instr) = ARMDecoder.decode(0xE12F_FF1E) else {
+            return XCTFail("Expected branchExchange")
+        }
+        XCTAssertEqual(instr.rm, Registers.lrIndex)
+    }
+
+    func testDecodesPushFromRealKernel() {
+        // push {r4, r5, r6, r7, lr} — from the real kernel at 0x802b9768,
+        // a standard function prologue (STMDB sp!, {r4-r7,lr}).
+        guard case .blockDataTransfer(let instr) = ARMDecoder.decode(0xE92D_40F0) else {
+            return XCTFail("Expected blockDataTransfer")
+        }
+        XCTAssertFalse(instr.isLoad)
+        XCTAssertTrue(instr.preIndexed)
+        XCTAssertFalse(instr.addOffset)
+        XCTAssertTrue(instr.writeback)
+        XCTAssertEqual(instr.rn, Registers.spIndex)
+        XCTAssertEqual(instr.registerList, 0x40F0)
+    }
+
+    func testDecodesPopWithPCFromRealKernel() {
+        // pop {r4, r5, r6, r7, pc} — a real function epilogue (LDMIA
+        // sp!, {r4-r7,pc}), confirmed via llvm-objdump against the
+        // actual kernel binary (address varies by build; word verified
+        // directly).
+        guard case .blockDataTransfer(let instr) = ARMDecoder.decode(0xE8BD_80F0) else {
+            return XCTFail("Expected blockDataTransfer")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertFalse(instr.preIndexed)
+        XCTAssertTrue(instr.addOffset)
+        XCTAssertTrue(instr.writeback)
+        XCTAssertEqual(instr.rn, Registers.spIndex)
+        XCTAssertEqual(instr.registerList, 0x80F0)
+    }
+
+    func testBlockDataTransferWithSBitIsUnsupported() {
+        // Same shape as the real push above, but with bit22 (S) set —
+        // user-bank/exception-return semantics, not modeled.
+        let word: UInt32 = 0xE92D_40F0 | (1 << 22)
+        if case .unsupported = ARMDecoder.decode(word) {
+            // expected
+        } else {
+            XCTFail("Expected .unsupported for the S-bit block transfer form")
+        }
+    }
+
+    func testDecodesStrhFromRealKernel() {
+        // strh r1, [r0, #2] — the real word that halted execution of the
+        // actual iPod4,1 6.1.6 kernel at 0x8007d3e4 before this family
+        // was decoded.
+        guard case .halfwordDataTransfer(let instr) = ARMDecoder.decode(0xE1C0_10B2) else {
+            return XCTFail("Expected halfwordDataTransfer")
+        }
+        XCTAssertFalse(instr.isLoad)
+        XCTAssertEqual(instr.kind, .unsignedHalfword)
+        XCTAssertTrue(instr.preIndexed)
+        XCTAssertTrue(instr.addOffset)
+        XCTAssertFalse(instr.writeback)
+        XCTAssertEqual(instr.rn, 0)
+        XCTAssertEqual(instr.rd, 1)
+        XCTAssertEqual(instr.offset, .immediate(2))
+    }
+
+    func testDecodesLdrhImmediate() {
+        guard case .halfwordDataTransfer(let instr) = ARMDecoder.decode(0xE1D2_30B4) else {
+            return XCTFail("Expected halfwordDataTransfer")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertEqual(instr.kind, .unsignedHalfword)
+        XCTAssertEqual(instr.offset, .immediate(4))
+    }
+
+    func testDecodesLdrsbRegisterOffset() {
+        guard case .halfwordDataTransfer(let instr) = ARMDecoder.decode(0xE192_30D5) else {
+            return XCTFail("Expected halfwordDataTransfer")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertEqual(instr.kind, .signedByte)
+        XCTAssertEqual(instr.offset, .register(5))
+    }
+
+    func testDecodesLdrshNegativeImmediate() {
+        guard case .halfwordDataTransfer(let instr) = ARMDecoder.decode(0xE152_30F2) else {
+            return XCTFail("Expected halfwordDataTransfer")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertEqual(instr.kind, .signedHalfword)
+        XCTAssertFalse(instr.addOffset)
+        XCTAssertEqual(instr.offset, .immediate(2))
+    }
+
+    func testStoreWithSignedKindIsUnsupported() {
+        // STRSB/STRSH don't exist — SH==10 (signedByte) with L==0
+        // (store) is a reserved encoding, not an ordinary halfword store.
+        let word: UInt32 = 0xE1C0_10D2 // same shape as the real strh, but SH=10 instead of 01
+        if case .unsupported = ARMDecoder.decode(word) {
+            // expected
+        } else {
+            XCTFail("Expected .unsupported for a store with a signed SH field")
+        }
+    }
+
+    func testDecodesBlxImmediateFromRealKernel() {
+        // blx 0x802b8268 — from the real kernel at 0x802b985c. The
+        // target disassembles as garbage under ARM decoding, confirming
+        // it's genuine Thumb code (see ARMv7CPUTests for the execute-
+        // level halt this produces).
+        guard case .branchLinkExchangeImmediate(let instr) = ARMDecoder.decode(0xFAFF_FA81) else {
+            return XCTFail("Expected branchLinkExchangeImmediate")
+        }
+        // Target = (instruction address + 8) + signedOffset = 0x802b985c + 8 - 0x15fc = 0x802b8268.
+        XCTAssertEqual(instr.signedOffset, -0x15FC)
     }
 
     func testMrsWithSpsrBitSetIsUnsupported() {

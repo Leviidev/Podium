@@ -126,11 +126,23 @@ final class EmulatorCore {
         // highest used address, which MachOLoader reports precisely
         // rather than this guessing at a gap that's big enough.
         let bootArgsAddress = (image.highestAddressUsed + 0xFFF) & ~UInt32(0xFFF)
+        // The real kernel's own boot code reads topOfKernelData straight
+        // into TTBR0 (confirmed via llvm-objdump: `ldr r4, [r0, #0x10]`
+        // then `mcr p15, #0, r5, c2, c0, #0` with r5 built from r4) —
+        // and TTBR0's low 14 bits are architecturally reserved/ignored
+        // (ARM DDI 0406C B4.1.154), so a real MMU walk always masks them
+        // off. A topOfKernelData that isn't itself 16KB-aligned would
+        // silently have its own first-level table address rounded down
+        // to some earlier, unrelated 16KB boundary — on real hardware
+        // this can't happen because iBoot always hands the kernel an
+        // aligned value, so this rounds up the same way rather than
+        // reproducing an address a real bootloader would never produce.
+        let topOfKernelData = (bootArgsAddress + UInt32(BootArgsBuilder.structSize) + 0x3FFF) & ~UInt32(0x3FFF)
         let bootArgs = BootArgsBuilder.build(
             virtBase: Self.physicalMemoryBaseAddress,
             physBase: Self.physicalMemoryBaseAddress,
             memSize: UInt32(Self.physicalMemorySize),
-            topOfKernelData: bootArgsAddress + UInt32(BootArgsBuilder.structSize),
+            topOfKernelData: topOfKernelData,
             deviceTreeP: 0, // No device tree extracted/passed yet — honestly absent, not guessed at.
             deviceTreeLength: 0
         )

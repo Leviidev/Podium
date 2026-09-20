@@ -6,12 +6,15 @@ enum CPUError: Error, Equatable {
     case memoryFault(MemoryAccessError, address: UInt32)
     /// The guest executed and decoded fine, but asked for real hardware
     /// behavior this CPU doesn't implement and can't safely pretend to —
-    /// right now, specifically: enabling the MMU (SCTLR.M). Continuing
-    /// past that point would mean every subsequent memory access is
-    /// address-translated on real hardware and isn't here, so results
-    /// would silently diverge rather than cleanly stop. Halting here is
-    /// the honest choice; a normal "unsupported instruction" halt
-    /// wouldn't be accurate, since the instruction *is* understood.
+    /// right now: SCTLR.AFE (the access-flag AP model; see `ARMv7MMU`'s
+    /// doc comment for why that one specifically isn't implemented,
+    /// unlike MMU translation itself, which is), and a `BX`/`BLX`
+    /// interworking branch requesting Thumb state — `BLX` (immediate)
+    /// always does, `BX` only when its register's bit 0 is set — since
+    /// no Thumb decode exists to switch to. Halting here is the honest
+    /// choice; a normal
+    /// "unsupported instruction" halt wouldn't be accurate, since the
+    /// instruction *is* understood.
     case unimplementedHardwareFeature(description: String, address: UInt32)
 }
 
@@ -21,13 +24,14 @@ enum CPUError: Error, Equatable {
 ///
 /// What this does *not* do yet, honestly: Thumb decode, exceptions and
 /// interrupts (the `I`/`F` CPSR mask bits `CPS` sets are tracked, but
-/// nothing actually raises an interrupt for them to gate), MMU-mediated
-/// addressing (reads/writes go straight to physical addresses, and
-/// `MCR`/`MRC` transfers to/from CP15 are stored/returned as a plain
-/// register file — see `CP15State` — not acted on; enabling the MMU via
-/// SCTLR.M is specifically detected and halts with
-/// `.unimplementedHardwareFeature` rather than silently continuing with
-/// untranslated addresses), and several ARM-state instruction families:
+/// nothing actually raises an interrupt for them to gate). Address
+/// translation, once the guest sets SCTLR.M, *is* real — see `ARMv7MMU`
+/// — walking the guest's own translation tables for every instruction
+/// fetch and data access rather than leaving memory untranslated; CP15
+/// registers other than the ones that walk directly reads (like SCTLR,
+/// TTBR0/1, TTBCR, DACR) are still just a stored value — see
+/// `CP15State` — not acted on (cache maintenance, TLB invalidation,
+/// etc). Several ARM-state instruction families are also unimplemented:
 /// multiply, block transfer (LDM/STM), register-shifted-by-register
 /// operands, SPSR access, most of the coprocessor and unconditional-
 /// instruction spaces, SWI (see
@@ -85,7 +89,8 @@ final class ARMv7CPU: CPU {
         let instructionAddress = registers.pc
         let word: UInt32
         do {
-            word = try memory.readWord32(at: instructionAddress)
+            let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
+            word = try memory.readWord32(at: physicalAddress)
         } catch let memoryError as MemoryAccessError {
             lastError = .memoryFault(memoryError, address: instructionAddress)
             return
@@ -152,9 +157,25 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeBranch(instr)
 
+        case .branchExchange(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeBranchExchange(instr, instructionAddress: instructionAddress)
+
+        case .branchLinkExchangeImmediate(let instr):
+            // Always unconditional — see the struct's doc comment.
+            executeBranchLinkExchangeImmediate(instr, instructionAddress: instructionAddress)
+
         case .loadStore(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeLoadStore(instr)
+
+        case .blockDataTransfer(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeBlockDataTransfer(instr, instructionAddress: instructionAddress)
+
+        case .halfwordDataTransfer(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeHalfwordDataTransfer(instr)
 
         case .movWide(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
@@ -219,14 +240,30 @@ final class ARMv7CPU: CPU {
     }
 
     /// CP15 (coprocessor, opc1, CRn, CRm, opc2) for the register real
-    /// ARMv7 calls SCTLR (System Control Register) — where the MMU
-    /// enable bit lives.
+    /// ARMv7 calls SCTLR (System Control Register) — where the MMU-enable
+    /// and access-flag-enable bits live.
     private static let sctlrCoprocessor = 15
     private static let sctlrOpc1 = 0
     private static let sctlrCRn = 1
     private static let sctlrCRm = 0
     private static let sctlrOpc2 = 0
     private static let sctlrMMUEnableBit: UInt32 = 1 << 0
+    private static let sctlrAccessFlagEnableBit: UInt32 = 1 << 29
+
+    /// Whether address translation is currently active, read straight
+    /// from the live SCTLR value rather than tracked as separate state —
+    /// SCTLR.M is the one real source of truth for this, and deriving it
+    /// keeps a plain CP15 write (`cp15.write` below) sufficient to turn
+    /// the MMU on or off, exactly like real hardware.
+    private var mmuEnabled: Bool {
+        cp15.read(coprocessor: Self.sctlrCoprocessor, opc1: Self.sctlrOpc1, crn: Self.sctlrCRn, crm: Self.sctlrCRm, opc2: Self.sctlrOpc2)
+            & Self.sctlrMMUEnableBit != 0
+    }
+
+    private func translatedAddress(_ virtualAddress: UInt32, access: ARMv7MMU.Access) throws -> UInt32 {
+        guard mmuEnabled else { return virtualAddress }
+        return try ARMv7MMU.translate(virtualAddress: virtualAddress, access: access, cp15: cp15, memory: memory)
+    }
 
     private func executeCoprocessorRegisterTransfer(_ instr: CoprocessorRegisterTransferInstruction, instructionAddress: UInt32) {
         if instr.isLoad {
@@ -244,17 +281,16 @@ final class ARMv7CPU: CPU {
 
             if instr.coprocessor == Self.sctlrCoprocessor, instr.opc1 == Self.sctlrOpc1,
                instr.crn == Self.sctlrCRn, instr.crm == Self.sctlrCRm, instr.opc2 == Self.sctlrOpc2,
-               value & Self.sctlrMMUEnableBit != 0 {
-                // The guest is enabling the MMU. From this point on, a
-                // real CPU translates every memory access through page
-                // tables it just set up — this one still wouldn't,
-                // since there's no MMU/page-table walker implemented.
-                // Continuing past here would mean execution keeps going
-                // but silently stops being trustworthy; halting cleanly
-                // is more honest than that, even though the instruction
-                // itself decoded and would otherwise execute fine.
+               value & Self.sctlrAccessFlagEnableBit != 0 {
+                // AFE repurposes the AP encoding `ARMv7MMU` implements
+                // (the legacy 3-bit {APX,AP} permission model) into a
+                // different one built around a hardware-managed Access
+                // Flag — silently reusing the same bits under that model
+                // would misinterpret real permission data. No guest code
+                // Podium has run so far sets this, so it's refused
+                // outright rather than guessed at.
                 lastError = .unimplementedHardwareFeature(
-                    description: "guest enabled the MMU (SCTLR.M) — no MMU/page-table translation is implemented",
+                    description: "guest enabled SCTLR.AFE (access-flag AP model) — only the legacy 3-bit AP model is implemented",
                     address: instructionAddress
                 )
                 return
@@ -355,6 +391,93 @@ final class ARMv7CPU: CPU {
         registers.pc = target
     }
 
+    private func executeBranchExchange(_ instr: BranchExchangeInstruction, instructionAddress: UInt32) {
+        let target = operandValue(for: instr.rm)
+        guard !target.bit(0) else {
+            // The guest is requesting a switch to Thumb state — real,
+            // meaningfully different behavior this CPU can't provide
+            // (see `ARMDecoder`'s doc comment: no Thumb decode). Masking
+            // the bit off and continuing in ARM state would silently
+            // execute the wrong instruction stream at that address
+            // instead of honestly stopping.
+            lastError = .unimplementedHardwareFeature(
+                description: "guest requested a BX interworking branch to Thumb state at 0x\(target.hexString8) — no Thumb decode is implemented",
+                address: instructionAddress
+            )
+            return
+        }
+        registers.pc = target
+    }
+
+    private func executeBranchLinkExchangeImmediate(_ instr: BranchLinkExchangeImmediateInstruction, instructionAddress: UInt32) {
+        let target = UInt32(bitPattern: Int32(bitPattern: registers.pcForOperandRead) &+ instr.signedOffset)
+        // Unlike BX, there's no bit to check and no ARM-mode fallback:
+        // BLX (immediate) always switches to Thumb, so this always halts.
+        lastError = .unimplementedHardwareFeature(
+            description: "guest executed BLX (immediate) to 0x\(target.hexString8), an unconditional switch to Thumb state — no Thumb decode is implemented",
+            address: instructionAddress
+        )
+    }
+
+    /// ARM ARM's block-transfer addressing modes (IA/IB/DA/DB) only
+    /// choose *where in memory* the transfer starts — registers are
+    /// always moved in ascending register-number order into ascending
+    /// addresses from that point, regardless of direction. Deriving the
+    /// start address from `addOffset`/`preIndexed` and then always
+    /// walking the register list low-to-high, rather than special-casing
+    /// each of the four named modes separately, is both the standard
+    /// technique and the one least likely to get a direction/off-by-one
+    /// wrong.
+    private func executeBlockDataTransfer(_ instr: BlockDataTransferInstruction, instructionAddress: UInt32) {
+        let baseValue = operandValue(for: instr.rn)
+        let count = instr.registerList.nonzeroBitCount
+        guard count > 0 else { return } // Empty register list: UNPREDICTABLE on real hardware; nothing to do.
+        let transferSize = UInt32(count) * 4
+
+        let startAddress: UInt32
+        if instr.addOffset {
+            startAddress = instr.preIndexed ? baseValue &+ 4 : baseValue
+        } else {
+            startAddress = instr.preIndexed ? baseValue &- transferSize : baseValue &- transferSize &+ 4
+        }
+
+        var address = startAddress
+        do {
+            for index in 0..<16 {
+                guard (instr.registerList >> index) & 1 == 1 else { continue }
+                let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
+                if instr.isLoad {
+                    let value = try memory.readWord32(at: physicalAddress)
+                    if index == Registers.pcIndex {
+                        guard !value.bit(0) else {
+                            lastError = .unimplementedHardwareFeature(
+                                description: "guest requested an LDM interworking branch to Thumb state at 0x\(value.hexString8) — no Thumb decode is implemented",
+                                address: instructionAddress
+                            )
+                            return
+                        }
+                        registers.pc = value & ~UInt32(0b11)
+                    } else {
+                        registers[index] = value
+                    }
+                } else {
+                    try memory.writeWord32(operandValue(for: index), at: physicalAddress)
+                }
+                address = address &+ 4
+            }
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: address)
+            return
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(address), address: address)
+            return
+        }
+
+        if instr.writeback {
+            registers[instr.rn] = instr.addOffset ? baseValue &+ transferSize : baseValue &- transferSize
+        }
+    }
+
     private func executeLoadStore(_ instr: LoadStoreInstruction) {
         let base = operandValue(for: instr.rn)
         let offsetValue: UInt32
@@ -369,10 +492,11 @@ final class ARMv7CPU: CPU {
         let transferAddress = instr.preIndexed ? offsetAddress : base
 
         do {
+            let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
                 let value = instr.isByte
-                    ? UInt32(try memory.readByte(at: transferAddress))
-                    : try memory.readWord32(at: transferAddress)
+                    ? UInt32(try memory.readByte(at: physicalAddress))
+                    : try memory.readWord32(at: physicalAddress)
                 if instr.rd == Registers.pcIndex {
                     registers.pc = value & ~UInt32(0b11)
                 } else {
@@ -381,9 +505,9 @@ final class ARMv7CPU: CPU {
             } else {
                 let value = operandValue(for: instr.rd)
                 if instr.isByte {
-                    try memory.writeByte(UInt8(truncatingIfNeeded: value), at: transferAddress)
+                    try memory.writeByte(UInt8(truncatingIfNeeded: value), at: physicalAddress)
                 } else {
-                    try memory.writeWord32(value, at: transferAddress)
+                    try memory.writeWord32(value, at: physicalAddress)
                 }
             }
         } catch let memoryError as MemoryAccessError {
@@ -398,6 +522,53 @@ final class ARMv7CPU: CPU {
         // regardless of the W bit (which instead selects privileged-vs-
         // user access there — not modeled). Pre-indexed only writes back
         // when W is set.
+        if instr.preIndexed {
+            if instr.writeback {
+                registers[instr.rn] = offsetAddress
+            }
+        } else {
+            registers[instr.rn] = offsetAddress
+        }
+    }
+
+    private func executeHalfwordDataTransfer(_ instr: HalfwordDataTransferInstruction) {
+        let base = operandValue(for: instr.rn)
+        let offsetValue: UInt32
+        switch instr.offset {
+        case .immediate(let value):
+            offsetValue = value
+        case .register(let rm):
+            offsetValue = operandValue(for: rm)
+        }
+        let offsetAddress = instr.addOffset ? base &+ offsetValue : base &- offsetValue
+        let transferAddress = instr.preIndexed ? offsetAddress : base
+
+        do {
+            let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
+            if instr.isLoad {
+                let value: UInt32
+                switch instr.kind {
+                case .unsignedHalfword:
+                    value = UInt32(try memory.readWord16(at: physicalAddress))
+                case .signedByte:
+                    let raw = try memory.readByte(at: physicalAddress)
+                    value = UInt32(bitPattern: Int32(Int8(bitPattern: raw)))
+                case .signedHalfword:
+                    let raw = try memory.readWord16(at: physicalAddress)
+                    value = UInt32(bitPattern: Int32(Int16(bitPattern: raw)))
+                }
+                registers[instr.rd] = value
+            } else {
+                try memory.writeWord16(UInt16(truncatingIfNeeded: operandValue(for: instr.rd)), at: physicalAddress)
+            }
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: transferAddress)
+            return
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress)
+            return
+        }
+
         if instr.preIndexed {
             if instr.writeback {
                 registers[instr.rn] = offsetAddress

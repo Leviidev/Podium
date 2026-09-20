@@ -67,6 +67,28 @@ struct BranchInstruction {
     let signedOffset: Int32
 }
 
+/// `BLX <label>` (immediate form — always lives in the unconditional-
+/// instruction-extension space, so there's no real condition to carry,
+/// unlike `BranchInstruction`): branches with link, *always* switching
+/// to Thumb state. Unlike `BX`, there's no bit to check and no ARM-mode
+/// continuation to fall back to — every one of these halts (see
+/// `ARMv7CPU.executeBranchLinkExchangeImmediate`).
+struct BranchLinkExchangeImmediateInstruction: Equatable {
+    /// Signed byte offset from the instruction address + 8, same
+    /// convention as `BranchInstruction.signedOffset`.
+    let signedOffset: Int32
+}
+
+/// `BX Rm`: branches to the address in `Rm`, and — on real hardware —
+/// switches to Thumb state if `Rm`'s bit 0 is set (that's the whole
+/// point of the name: Branch and *Exchange* instruction sets). Podium
+/// doesn't decode Thumb, so that bit is checked, not silently masked
+/// off: see `ARMv7CPU.executeBranchExchange`.
+struct BranchExchangeInstruction: Equatable {
+    let condition: ARMCondition
+    let rm: Int
+}
+
 /// A load/store's address offset — either a plain immediate, or a
 /// (possibly shifted) register, reusing the exact same shift encoding
 /// data-processing's register operand2 uses (bits[11:4] mean the same
@@ -86,6 +108,61 @@ struct LoadStoreInstruction {
     let rn: Int
     let rd: Int
     let offset: LoadStoreOffset
+}
+
+/// `LDM`/`STM` (block data transfer): moves a contiguous run of words
+/// between memory and every register named in `registerList`, in
+/// ascending register-number order regardless of `addOffset`/
+/// `preIndexed` (which only choose where in memory that ascending run
+/// starts — see `ARMv7CPU.executeBlockDataTransfer`). The `S`-bit form
+/// (user-bank register transfer, or CPSR-from-SPSR exception return when
+/// `PC` is in the list) isn't decoded — no processor-mode banking or
+/// SPSR exists for it to mean anything (see `CPSR`'s doc comment) — so
+/// it's refused rather than silently treated as the ordinary form.
+struct BlockDataTransferInstruction: Equatable {
+    let condition: ARMCondition
+    let isLoad: Bool
+    let preIndexed: Bool
+    let addOffset: Bool
+    let writeback: Bool
+    let rn: Int
+    /// Bit *i* set means register *i* is included in the transfer.
+    let registerList: UInt16
+}
+
+/// The three "extra load/store" transfer widths/signednesses — `STRH`
+/// only ever uses `.unsignedHalfword` (there's no such thing as a signed
+/// *store* — sign only matters when a narrower value is widened back
+/// into a 32-bit register on load).
+enum HalfwordTransferKind: Equatable {
+    case unsignedHalfword
+    case signedByte
+    case signedHalfword
+}
+
+/// The "extra load/store" instructions' addressing offset — always a
+/// plain (unshifted) register or an 8-bit immediate, unlike ordinary
+/// load/store's register offset, which allows a shift.
+enum HalfwordTransferOffset: Equatable {
+    case immediate(UInt32)
+    case register(Int)
+}
+
+/// `LDRH`/`STRH`/`LDRSB`/`LDRSH`: ARM's "extra load/store" instructions,
+/// a structurally distinct encoding from ordinary single-register
+/// load/store (see `ARMDecoder`'s doc comment on the bit4/bit7 check
+/// that identifies this space) despite sharing the same top-level
+/// instruction-class bits.
+struct HalfwordDataTransferInstruction: Equatable {
+    let condition: ARMCondition
+    let isLoad: Bool
+    let kind: HalfwordTransferKind
+    let preIndexed: Bool
+    let addOffset: Bool
+    let writeback: Bool
+    let rn: Int
+    let rd: Int
+    let offset: HalfwordTransferOffset
 }
 
 /// `MRS Rd, CPSR`: reads the whole CPSR into a register. SPSR access
@@ -162,6 +239,10 @@ struct ChangeProcessorStateInstruction: Equatable {
 enum ARMInstruction: Equatable {
     case dataProcessing(DataProcessingInstruction)
     case branch(BranchInstruction)
+    case branchExchange(BranchExchangeInstruction)
+    case branchLinkExchangeImmediate(BranchLinkExchangeImmediateInstruction)
+    case blockDataTransfer(BlockDataTransferInstruction)
+    case halfwordDataTransfer(HalfwordDataTransferInstruction)
     case loadStore(LoadStoreInstruction)
     case movWide(MovWideInstruction)
     case moveFromStatusRegister(MRSInstruction)
@@ -174,13 +255,15 @@ enum ARMInstruction: Equatable {
     /// CPU, correctly implementing a barrier *is* treating it as a no-op,
     /// not a missing feature.
     case memoryBarrier
-    /// A recognized-but-not-yet-implemented instruction family: multiply,
-    /// block data transfer (LDM/STM), register-shifted-by-register
-    /// operand2, SPSR access (the MRS/MSR encodings with R==1 — there's
-    /// no exception entry/exit yet for a saved SPSR to matter to), most
-    /// of the coprocessor space (anything but MCR/MRC), SWI, and most of
-    /// the unconditional-instruction-extension space (anything but CPS
-    /// and the DSB/DMB/ISB barriers).
+    /// A recognized-but-not-yet-implemented instruction family: multiply
+    /// and the "extra load/store" SWP/reserved encodings (SH==00), the
+    /// `S`-bit form of block data transfer (see
+    /// `BlockDataTransferInstruction`'s doc comment), register-shifted-
+    /// by-register operand2, SPSR access (the MRS/MSR encodings with
+    /// R==1 — there's no exception entry/exit yet for a saved SPSR to
+    /// matter to), most of the coprocessor space (anything but MCR/MRC),
+    /// SWI, and most of the unconditional-instruction-extension space
+    /// (anything but CPS and the DSB/DMB/ISB barriers).
     case unsupported(rawWord: UInt32)
     /// A genuinely undefined/reserved encoding.
     case undefined(rawWord: UInt32)

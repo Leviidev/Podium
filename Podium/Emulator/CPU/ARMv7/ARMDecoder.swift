@@ -7,16 +7,19 @@ import Foundation
 /// by a JIT front end without dragging CPU state along.
 ///
 /// Covers data-processing (both operand2 forms), `MOVW`/`MOVT`, branch
-/// (B/BL), single-register load/store (immediate *and* register
-/// offset), `MRS`/`MSR` (CPSR only), `MCR`/`MRC`, `CPS`, and the
-/// `DSB`/`DMB`/`ISB` barriers. Everything else — multiply, block
-/// transfer (LDM/STM), register-shifted-by-register operand2, SPSR
-/// access, most of the coprocessor and unconditional-instruction-
-/// extension spaces, SWI, Thumb — decodes to `.unsupported` rather than
-/// being misinterpreted. Every case added here so far was verified
-/// against real, disassembled instruction words from the actual
-/// iPod4,1 6.1.6 kernel, not written from
-/// specification alone.
+/// (B/BL), `BX`, `BLX` (immediate — decoded so it can halt with a
+/// specific "this needs Thumb" message, not executed), single-register
+/// load/store (immediate *and* register offset), the halfword/signed-
+/// byte "extra load/store" instructions (`LDRH`/`STRH`/`LDRSB`/`LDRSH`),
+/// block data transfer (`LDM`/`STM`, ordinary form only), `MRS`/`MSR`
+/// (CPSR only), `MCR`/`MRC`, `CPS`, and the `DSB`/`DMB`/`ISB` barriers.
+/// Everything else — multiply, the `S`-bit block-transfer form,
+/// register-shifted-by-register operand2, SPSR access, most of the
+/// coprocessor and unconditional-instruction-extension spaces, SWI,
+/// Thumb itself — decodes to `.unsupported` rather than being
+/// misinterpreted. Every case added here so far was verified against
+/// real, disassembled instruction words from the actual iPod4,1 6.1.6
+/// kernel, not written from specification alone.
 enum ARMDecoder {
     static func decode(_ word: UInt32) -> ARMInstruction {
         let condBits = word.bitField(31, 28)
@@ -46,6 +49,15 @@ enum ARMDecoder {
     }
 
     private static func decodeDataProcessingBlock(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
+        // BX Rm: bits[27:4] are a fixed pattern (0x12FFF1) that would
+        // otherwise misdecode as a malformed MSR (op TEQ, bit21 set) —
+        // its own guard already rejects that shape as `.unsupported`
+        // rather than misinterpreting it, but checking for the real,
+        // fixed BX encoding explicitly here decodes it correctly instead.
+        if word.bitField(27, 4) == 0x12_FFF1 {
+            return .branchExchange(BranchExchangeInstruction(condition: condition, rm: Int(word.bitField(3, 0))))
+        }
+
         // MOVW/MOVT (ARMv6T2+) share the data-processing block but are a
         // structurally different instruction — a 16-bit immediate with
         // no rotation, no Rn, no shifter carry-out — so they're checked
@@ -65,9 +77,45 @@ enum ARMDecoder {
         let immediateOperand = word.bit(25)
 
         if !immediateOperand && word.bit(4) && word.bit(7) {
-            // bits[7]==1 && bits[4]==1 with I==0 signals the multiply /
-            // extra-load-store space, not a shifted-register operand2.
-            return .unsupported(rawWord: word)
+            // bits[7]==1 && bits[4]==1 with I(bit25)==0 signals the
+            // multiply / extra-load-store space, not a shifted-register
+            // operand2. bits[6:5] (SH) further distinguishes: 00 is the
+            // multiply/SWP space (still unsupported), and 01/10/11 are
+            // the halfword/signed-byte "extra load/store" instructions —
+            // confirmed against a real word from the actual kernel
+            // ("strh r1, [r0, #2]" at 0x8007d3e4).
+            let sh = word.bitField(6, 5)
+            guard sh != 0 else {
+                return .unsupported(rawWord: word)
+            }
+            let isLoad = word.bit(20)
+            let kind: HalfwordTransferKind = sh == 0b01 ? .unsignedHalfword : (sh == 0b10 ? .signedByte : .signedHalfword)
+            guard isLoad || kind == .unsignedHalfword else {
+                // STRSB/STRSH don't exist — SH==10/11 with L==0 is a
+                // reserved/undefined encoding, not silently treated as
+                // an ordinary halfword store.
+                return .unsupported(rawWord: word)
+            }
+
+            let offset: HalfwordTransferOffset
+            if word.bit(22) {
+                offset = .immediate((word.bitField(11, 8) << 4) | word.bitField(3, 0))
+            } else {
+                guard word.bitField(11, 8) == 0 else { return .unsupported(rawWord: word) }
+                offset = .register(Int(word.bitField(3, 0)))
+            }
+
+            return .halfwordDataTransfer(HalfwordDataTransferInstruction(
+                condition: condition,
+                isLoad: isLoad,
+                kind: kind,
+                preIndexed: word.bit(24),
+                addOffset: word.bit(23),
+                writeback: word.bit(21),
+                rn: Int(word.bitField(19, 16)),
+                rd: Int(word.bitField(15, 12)),
+                offset: offset
+            ))
         }
 
         guard let op = DataProcessingOp(rawValue: UInt8(word.bitField(24, 21))) else {
@@ -182,7 +230,22 @@ enum ARMDecoder {
 
     private static func decodeBranchOrBlockTransfer(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
         guard word.bit(25) else {
-            return .unsupported(rawWord: word) // Block data transfer (LDM/STM).
+            // Block data transfer (LDM/STM). The `S` bit (bit22) selects
+            // user-bank/exception-return semantics this CPU doesn't model
+            // (see `BlockDataTransferInstruction`'s doc comment) — refused
+            // rather than silently treated as the ordinary form.
+            guard !word.bit(22) else {
+                return .unsupported(rawWord: word)
+            }
+            return .blockDataTransfer(BlockDataTransferInstruction(
+                condition: condition,
+                isLoad: word.bit(20),
+                preIndexed: word.bit(24),
+                addOffset: word.bit(23),
+                writeback: word.bit(21),
+                rn: Int(word.bitField(19, 16)),
+                registerList: UInt16(word.bitField(15, 0))
+            ))
         }
 
         let imm24 = word.bitField(23, 0)
@@ -215,10 +278,23 @@ enum ARMDecoder {
     }
 
     /// The `cond == 1111` "unconditional instruction extension" space.
-    /// Only `CPS` and the `DSB`/`DMB`/`ISB` barriers are recognized;
-    /// everything else there (PLD/PLI, SETEND, BLX-immediate, ...)
-    /// decodes to `.unsupported`.
+    /// `CPS`, the `DSB`/`DMB`/`ISB` barriers, and `BLX` (immediate) are
+    /// recognized; everything else there (PLD/PLI, SETEND, ...) decodes
+    /// to `.unsupported`.
     private static func decodeUnconditionalSpace(_ word: UInt32) -> ARMInstruction {
+        // BLX (immediate): bits[27:25] == 0b101 (fixed) — always an
+        // unconditional switch to Thumb state, confirmed against a real
+        // word from the actual kernel at 0x802b985c ("blx 0x802b8268",
+        // a target that disassembles as garbage under ARM decoding,
+        // confirming it's genuine Thumb code this CPU can't decode).
+        if word.bitField(27, 25) == 0b101 {
+            let h = word.bit(24)
+            let imm24 = word.bitField(23, 0)
+            let signExtended = Int32(bitPattern: imm24.bit(23) ? (imm24 | 0xFF00_0000) : imm24)
+            let signedOffset = (signExtended << 2) | Int32(h ? 2 : 0)
+            return .branchLinkExchangeImmediate(BranchLinkExchangeImmediateInstruction(signedOffset: signedOffset))
+        }
+
         // CPS: bits[27:20] == 0b0001_0000 (fixed).
         if word.bitField(27, 20) == 0b0001_0000 {
             let imod = word.bitField(19, 18)
