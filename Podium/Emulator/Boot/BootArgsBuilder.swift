@@ -22,7 +22,18 @@ enum BootArgsBuilder {
     static let structSize = 320
 
     private static let revision: UInt16 = 1 // kBootArgsRevision
-    private static let version: UInt16 = 2 // kBootArgsVersion2 (adds bootFlags)
+    /// The real iPod4,1 6.1.6 kernel enforces this exactly — confirmed
+    /// directly by tracing a real panic this CPU hit ("pe_identify_machine:
+    /// Epoch Mismatch") back to its cause: `ldrh r0, [r0, #2]; cmp r0, #3`
+    /// reading `boot_args->Version` from the very struct this builder
+    /// writes (verified byte-for-byte against a live run — every other
+    /// field this function checked, `virtBase`/`physBase`/`memSize`/
+    /// `topOfKernelData`/`deviceTreeP`/`deviceTreeLength`, matched exactly
+    /// what was written, at their expected offsets) and panicking because
+    /// this was previously `2`. `kBootArgsVersion2` is real and used by
+    /// plenty of other iOS builds, but this specific kernel's own entry
+    /// path demands `3`, not a value this codebase gets to pick freely.
+    private static let version: UInt16 = 3
     private static let bootLineLength = 256 // BOOT_LINE_LENGTH
 
     static func build(

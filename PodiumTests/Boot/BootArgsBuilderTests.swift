@@ -31,7 +31,7 @@ final class BootArgsBuilderTests: XCTestCase {
         }
 
         XCTAssertEqual(u16(0), 1, "Revision")
-        XCTAssertEqual(u16(2), 2, "Version")
+        XCTAssertEqual(u16(2), 3, "Version — the real iPod4,1 6.1.6 kernel panics with \"Epoch Mismatch\" unless this is exactly 3")
         XCTAssertEqual(u32(4), 0x8000_0000, "virtBase")
         XCTAssertEqual(u32(8), 0x8000_0000, "physBase — what the real kernel reads first, via ldr r8, [r0, #8]")
         XCTAssertEqual(u32(12), 0x1000_0000, "memSize")
