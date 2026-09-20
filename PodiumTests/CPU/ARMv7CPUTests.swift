@@ -529,6 +529,22 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 0x8000_0001)
     }
 
+    func testUqsub8SaturatesPerByteRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE663_2FF1, // uqsub8 r2, r3, r1 -- real word from the actual kernel
+        ])
+        // Rn byte lanes (0..3, LSB first): 0x10, 0x05, 0xFF, 0x00.
+        cpu.registers[3] = 0x00FF_0510
+        // Rm byte lanes: 0x01, 0x10, 0x01, 0x01.
+        cpu.registers[1] = 0x0101_1001
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // byte0: 0x10-0x01=0x0F; byte1: 0x05-0x10 saturates to 0x00;
+        // byte2: 0xFF-0x01=0xFE; byte3: 0x00-0x01 saturates to 0x00.
+        XCTAssertEqual(cpu.registers[2], 0x00FE_000F)
+    }
+
     func testConditionalInstructionSkippedWhenConditionFails() {
         let cpu = makeCPU(program: [
             0xE3A0_0000, // MOV r0, #0  (also clears Z, since S==0 here it does NOT touch flags —

@@ -115,6 +115,17 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(rs, 2)
     }
 
+    func testDecodesUqsub8FromRealKernel() {
+        // uqsub8 r2, r3, r1 — from the real kernel at 0x80089bc4,
+        // confirmed via Capstone (independent of this decoder).
+        guard case .uqsub8(let instr) = ARMDecoder.decode(0xE663_2FF1) else {
+            return XCTFail("Expected uqsub8")
+        }
+        XCTAssertEqual(instr.rd, 2)
+        XCTAssertEqual(instr.rn, 3)
+        XCTAssertEqual(instr.rm, 1)
+    }
+
     func testDecodesLoadWordImmediateOffset() {
         // LDR r0, [r1, #4]
         guard case .loadStore(let instr) = ARMDecoder.decode(0xE591_0004) else {

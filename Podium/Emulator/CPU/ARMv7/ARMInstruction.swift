@@ -238,6 +238,24 @@ struct ChangeProcessorStateInstruction: Equatable {
     let affectsFIQ: Bool
 }
 
+/// `UQSUB8 Rd, Rn, Rm`: four parallel unsigned 8-bit saturating
+/// subtractions (`Rd.byte[i] = max(0, Rn.byte[i] - Rm.byte[i])`), one of
+/// ARMv6's "media instructions" (parallel addition/subtraction) —
+/// verified via Capstone against a real word from the actual kernel.
+/// Only this one instruction from that whole extension space is
+/// decoded; the rest (dozens of signed/unsigned ×
+/// simple/saturating/halving × ADD16/ASX/SAX/SUB16/ADD8/SUB8
+/// combinations, plus SEL/USAD8/PKH/REV/SSAT/USAT/SXTB and friends,
+/// which all share this same bit4==1 space) stay `.unsupported` until a
+/// real word confirms one is needed. Doesn't affect any flags (unlike
+/// the non-saturating `SUB8`, this doesn't set the GE bits either).
+struct UQSub8Instruction: Equatable {
+    let condition: ARMCondition
+    let rd: Int
+    let rn: Int
+    let rm: Int
+}
+
 enum ARMInstruction: Equatable {
     case dataProcessing(DataProcessingInstruction)
     case branch(BranchInstruction)
@@ -251,6 +269,7 @@ enum ARMInstruction: Equatable {
     case moveToStatusRegister(MSRInstruction)
     case coprocessorRegisterTransfer(CoprocessorRegisterTransferInstruction)
     case changeProcessorState(ChangeProcessorStateInstruction)
+    case uqsub8(UQSub8Instruction)
     /// `DSB`/`DMB`/`ISB` (memory/instruction ordering barriers) and
     /// `PLD` (immediate, a cache-prefetch hint). Podium's interpreter
     /// executes everything strictly in program order with no caching,

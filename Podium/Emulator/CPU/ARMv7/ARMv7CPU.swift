@@ -215,6 +215,10 @@ final class ARMv7CPU: CPU {
         case .changeProcessorState(let instr):
             executeChangeProcessorState(instr)
 
+        case .uqsub8(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeUqsub8(instr)
+
         case .memoryBarrier:
             // A real no-op: see ARMInstruction.memoryBarrier's doc comment.
             break
@@ -325,6 +329,20 @@ final class ARMv7CPU: CPU {
         // affectsAbort (the 'A' bit) isn't modeled: CPSR doesn't expose
         // an abort mask bit yet, and nothing raises an abort exception
         // for it to gate.
+    }
+
+    private func executeUqsub8(_ instr: UQSub8Instruction) {
+        let rn = registers[instr.rn]
+        let rm = registers[instr.rm]
+        var result: UInt32 = 0
+        for byteIndex in 0..<4 {
+            let shift = byteIndex * 8
+            let a = Int32((rn >> shift) & 0xFF)
+            let b = Int32((rm >> shift) & 0xFF)
+            let clamped = UInt32(max(0, a - b))
+            result |= clamped << shift
+        }
+        registers[instr.rd] = result
     }
 
     func operandValue(for register: Int) -> UInt32 {

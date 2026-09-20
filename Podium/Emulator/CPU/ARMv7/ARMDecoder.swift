@@ -15,12 +15,12 @@ import Foundation
 /// (immediate *and* register offset), the halfword/signed-byte "extra
 /// load/store" instructions (`LDRH`/`STRH`/`LDRSB`/`LDRSH`), block data
 /// transfer (`LDM`/`STM`, ordinary form only), `MRS`/`MSR` (CPSR only),
-/// `MCR`/`MRC`, `CPS`, `PLD` (immediate), and the `DSB`/`DMB`/`ISB`
+/// `MCR`/`MRC`, `CPS`, `PLD` (immediate), `UQSUB8` (the one instruction
+/// decoded from ARMv6's much larger "media instructions" space — see
+/// `decodeMediaInstructions`'s doc comment), and the `DSB`/`DMB`/`ISB`
 /// barriers. Everything else — multiply, the `S`-bit block-transfer
-/// form, register-shifted-by-register *addressing* (load/store's own
-/// register-offset form still only decodes an immediate shift amount,
-/// unlike data-processing's operand2), SPSR access, most of the
-/// coprocessor and unconditional-instruction-extension spaces, SWI —
+/// form, the rest of the media-instructions space, SPSR access, most of
+/// the coprocessor and unconditional-instruction-extension spaces, SWI —
 /// decodes to `.unsupported` rather than being misinterpreted. Every
 /// case added here so far was verified against real, disassembled
 /// instruction words from the actual iPod4,1 6.1.6 kernel, not written
@@ -209,12 +209,17 @@ enum ARMDecoder {
         let offset: LoadStoreOffset
         if word.bit(25) {
             // Register offset — the *opposite* convention from data-
-            // processing's I bit, but the same bits[11:4] shift encoding.
-            // bit4==1 here is the same "register-specified shift amount"
-            // form data-processing doesn't decode either, for the same
-            // reason: it isn't safe to reinterpret Rs as a shift-immediate.
+            // processing's I bit, but the same bits[11:4] shift encoding
+            // *when bit4==0*. bit4==1 here doesn't mean a register-
+            // specified shift amount at all (load/store's register
+            // offset has no such form) — it means this word isn't a
+            // load/store instruction, it's ARMv6's separate "media
+            // instructions" extension space (confirmed against a real
+            // `uqsub8` word from the actual kernel via Capstone, since
+            // this space's encoding table isn't one this codebase had
+            // reasoned through carefully before).
             if word.bit(4) {
-                return .unsupported(rawWord: word)
+                return decodeMediaInstructions(word, condition: condition)
             }
             guard let shiftType = ShiftType(rawValue: UInt8(word.bitField(6, 5))) else {
                 return .unsupported(rawWord: word)
@@ -266,6 +271,20 @@ enum ARMDecoder {
         let signedOffset = signExtended << 2
 
         return .branch(BranchInstruction(condition: condition, link: word.bit(24), signedOffset: signedOffset))
+    }
+
+    /// ARMv6's "media instructions" space (bits[27:25]==011, bit4==1).
+    /// Only `UQSUB8` is decoded — see its doc comment — via bits[27:20]
+    /// == 0b01100110 (parallel add/sub, unsigned, saturating) and
+    /// bits[7:5] == 0b111 (the SUB8 op2 within that); everything else in
+    /// this large space is `.unsupported`.
+    private static func decodeMediaInstructions(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
+        guard word.bitField(27, 20) == 0b0110_0110, word.bitField(7, 5) == 0b111, word.bitField(11, 8) == 0b1111 else {
+            return .unsupported(rawWord: word)
+        }
+        return .uqsub8(UQSub8Instruction(
+            condition: condition, rd: Int(word.bitField(15, 12)), rn: Int(word.bitField(19, 16)), rm: Int(word.bitField(3, 0))
+        ))
     }
 
     /// `MCR`/`MRC` (coprocessor register transfer) — the one coprocessor
