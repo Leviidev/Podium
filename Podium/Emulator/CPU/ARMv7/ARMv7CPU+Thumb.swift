@@ -116,6 +116,8 @@ extension ARMv7CPU {
 
     private func executeThumb(_ instruction: ThumbInstruction, instructionAddress: UInt32) {
         switch instruction {
+        case .coprocessorRegisterTransfer(let instr):
+            executeCoprocessorRegisterTransfer(instr, instructionAddress: instructionAddress)
         case .shiftImmediate(let instr):
             executeThumbShiftImmediate(instr)
         case .immediate(let instr):

@@ -194,6 +194,17 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[1], 0xDD)
     }
 
+    func testMrcRoundTripsThroughCP15RealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xee1d, 0x0f90, // mrc p15, #0, r0, c13, c0, #4, real word from the actual kernel
+        ])
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0) // never-written CP15 register reads as 0
+        XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 13, crm: 0, opc2: 4), 0)
+    }
+
     func testBeqWBranchesWhenZeroFlagSet() {
         let cpu = makeThumbCPU(program: [
             0x2000, // movs r0, #0   (sets Z)

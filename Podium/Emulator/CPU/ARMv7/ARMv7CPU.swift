@@ -296,7 +296,12 @@ final class ARMv7CPU: CPU {
         return try ARMv7MMU.translate(virtualAddress: virtualAddress, access: access, cp15: cp15, memory: memory)
     }
 
-    private func executeCoprocessorRegisterTransfer(_ instr: CoprocessorRegisterTransferInstruction, instructionAddress: UInt32) {
+    // Not `private`: Thumb-2's coprocessor instructions reuse this exact
+    // same field layout and semantics (see `ARMv7CPU+Thumb.swift`'s
+    // `.coprocessorRegisterTransfer` case) — condition checking already
+    // happened in the caller before this runs, in both states, so
+    // there's real logic worth sharing here rather than duplicating.
+    func executeCoprocessorRegisterTransfer(_ instr: CoprocessorRegisterTransferInstruction, instructionAddress: UInt32) {
         if instr.isLoad {
             let value = cp15.read(coprocessor: instr.coprocessor, opc1: instr.opc1, crn: instr.crn, crm: instr.crm, opc2: instr.opc2)
             if instr.rt == Registers.pcIndex {

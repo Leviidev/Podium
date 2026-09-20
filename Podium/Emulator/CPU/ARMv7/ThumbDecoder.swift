@@ -19,12 +19,14 @@ import Foundation
 /// immediate family, `BL`, `BLX` (immediate), `B.W` (both the
 /// unconditional T4 form and the conditional T3 form, which carries its
 /// own condition field the same way 16-bit `Bcond` does), `LDR`/`STR`/
-/// `LDRB`/`STRB` (immediate, T3 and T4), and `LDM`/`STM` (T2, both IA
-/// and DB). Everything else — `ADD`/`SUB` (format 2, register or 3-bit
-/// immediate), signed-byte/halfword loads (format 8), PC-relative `LDR`
-/// (format 6), register-offset load/store (format 7), `REV`/`REV16`/
-/// `REVSH`, multiply/multiply-accumulate beyond 16-bit `MUL`, table
-/// branches, coprocessor, SIMD/VFP — decodes to `.unsupported`.
+/// `LDRB`/`STRB` (immediate, T3 and T4), `LDM`/`STM` (T2, both IA and
+/// DB), and `MCR`/`MRC` (reusing ARM state's exact field layout — see
+/// `decode32Coprocessor`'s doc comment). Everything else — `ADD`/`SUB`
+/// (format 2, register or 3-bit immediate), signed-byte/halfword loads
+/// (format 8), PC-relative `LDR` (format 6), register-offset load/store
+/// (format 7), `REV`/`REV16`/`REVSH`, multiply/multiply-accumulate
+/// beyond 16-bit `MUL`, table branches, the rest of the coprocessor
+/// space (`CDP`/`LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
     /// Whether `firstHalfword` opens a 32-bit Thumb-2 instruction (in
     /// which case the caller must fetch a second halfword before
@@ -196,6 +198,14 @@ enum ThumbDecoder {
     private static func decode32(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
         switch hw0.bitField16(15, 11) {
         case 0b11101:
+            // This class covers both load/store multiple/dual/exclusive
+            // (bits[11:8] fixed at 0b0100 for the LDM/STM shape this
+            // codebase already decodes) and coprocessor instructions
+            // (bits[11:8] fixed at 0b1110 for MCR/MRC) — try coprocessor
+            // first since its marker is unambiguous.
+            if hw0.bitField16(11, 8) == 0b1110, hw1.bit16(4) {
+                return decode32Coprocessor(hw0, hw1)
+            }
             return decode32LoadStoreMultiple(hw0, hw1)
         case 0b11110:
             return decode32DataProcessingOrBranch(hw0, hw1)
@@ -204,6 +214,26 @@ enum ThumbDecoder {
         default:
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
+    }
+
+    /// `MCR`/`MRC`: verified against a real `mrc p15, #0, r0, c13, c0, #4`
+    /// word from the actual kernel to share ARM state's exact field
+    /// layout (see `ThumbInstruction.coprocessorRegisterTransfer`'s doc
+    /// comment) — the fixed `1110` at bits[31:28] and `1110` at
+    /// bits[27:24] (this function's own bits[11:8] check, having
+    /// already matched at the call site) plus bit4 of the low halfword
+    /// distinguish it from `CDP`/`LDC`/`STC`, which aren't decoded.
+    private static func decode32Coprocessor(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
+        return .coprocessorRegisterTransfer(CoprocessorRegisterTransferInstruction(
+            condition: .always,
+            isLoad: hw0.bit16(4),
+            coprocessor: Int(hw1.bitField16(11, 8)),
+            opc1: Int(hw0.bitField16(7, 5)),
+            rt: Int(hw1.bitField16(15, 12)),
+            crn: Int(hw0.bitField16(3, 0)),
+            crm: Int(hw1.bitField16(3, 0)),
+            opc2: Int(hw1.bitField16(7, 5))
+        ))
     }
 
     /// `LDM`/`STM` (T2): verified against real `pop.w` (load, IA),

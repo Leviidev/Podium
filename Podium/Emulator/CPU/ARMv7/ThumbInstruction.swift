@@ -249,6 +249,16 @@ struct ThumbBlockDataTransferInstruction: Equatable {
 }
 
 enum ThumbInstruction: Equatable {
+    /// `MCR`/`MRC`: Thumb-2's coprocessor instructions reuse ARM state's
+    /// exact same (opc1, L, CRn, Rt, coproc, opc2, CRm) field layout —
+    /// confirmed against a real `mrc p15, #0, r0, c13, c0, #4` word from
+    /// the actual kernel — so this reuses `CoprocessorRegisterTransferInstruction`
+    /// directly rather than a near-identical duplicate. Its `condition`
+    /// field is unused here (always `.always`): Thumb gates instructions
+    /// via `ITSTATE`, already checked by the time this executes, not a
+    /// per-instruction condition field the way ARM state's real
+    /// conditional execution works.
+    case coprocessorRegisterTransfer(CoprocessorRegisterTransferInstruction)
     case shiftImmediate(ThumbShiftImmediateInstruction)
     case immediate(ThumbImmediateInstruction)
     case alu(ThumbAluInstruction)

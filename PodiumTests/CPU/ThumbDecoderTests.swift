@@ -264,6 +264,21 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.registerList, 0x0009) // r0, r3
     }
 
+    func testDecodesMrcFromRealKernel() {
+        // mrc p15, #0, r0, c13, c0, #4 — from the real kernel at
+        // 0x8008e11c, reusing ARM state's exact field layout.
+        guard case .coprocessorRegisterTransfer(let instr) = ThumbDecoder.decode(0xee1d, 0x0f90) else {
+            return XCTFail("Expected coprocessorRegisterTransfer")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertEqual(instr.coprocessor, 15)
+        XCTAssertEqual(instr.opc1, 0)
+        XCTAssertEqual(instr.rt, 0)
+        XCTAssertEqual(instr.crn, 13)
+        XCTAssertEqual(instr.crm, 0)
+        XCTAssertEqual(instr.opc2, 4)
+    }
+
     func testDecodesBeqWConditionalFromRealKernel() {
         // beq.w #0x80020924 — from the real kernel at 0x8001ff66.
         guard case .branchWide(let instr) = ThumbDecoder.decode(0xf000, 0x84dd) else {
