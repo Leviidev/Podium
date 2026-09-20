@@ -590,6 +590,20 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 0xC0FF_EE00)
     }
 
+    func testStrexStoresAndSignalsSuccessRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE18C_3F90, // strex r3, r0, [ip] -- real word from the actual kernel
+        ])
+        cpu.registers[12] = 100
+        cpu.registers[0] = 0xDEAD_BEEF
+        cpu.registers[3] = 0xFFFF_FFFF // Poison, to prove it gets overwritten with 0.
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[3], 0) // Always succeeds — see StoreExclusiveInstruction's doc comment.
+        XCTAssertEqual(try! (cpu.memory as! FlatPhysicalMemory).readWord32(at: 100), 0xDEAD_BEEF)
+    }
+
     func testConditionalInstructionSkippedWhenConditionFails() {
         let cpu = makeCPU(program: [
             0xE3A0_0000, // MOV r0, #0  (also clears Z, since S==0 here it does NOT touch flags —

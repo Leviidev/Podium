@@ -270,8 +270,10 @@ struct ClzInstruction: Equatable {
 }
 
 /// `LDREX Rt, [Rn]`: an ordinary word load architecturally paired with
-/// tagging the address for exclusive access (checked by a later
-/// `STREX`, not yet decoded — no real word has confirmed it). Lives in
+/// tagging the address for exclusive access, checked by a later
+/// `STREX` (see `StoreExclusiveInstruction`'s doc comment for why that
+/// check is unconditional success here rather than a modeled tag).
+/// Lives in
 /// the "synchronization primitives" space, sharing the multiply/extra-
 /// load-store gate's `!I && bit7 && bit4` shape with `SH == 0` (the
 /// other three `SH` values are the halfword/signed-byte transfers
@@ -280,6 +282,21 @@ struct ClzInstruction: Equatable {
 /// from the actual kernel.
 struct LoadExclusiveInstruction: Equatable {
     let condition: ARMCondition
+    let rt: Int
+    let rn: Int
+}
+
+/// `STREX Rd, Rt, [Rn]`: stores `Rt` to `[Rn]` and sets `Rd` to the
+/// exclusive-access status (`0` success, `1` fail). This emulator runs
+/// a single interpreter thread with no concurrent agent that could
+/// ever invalidate the exclusive tag `LDREX` would set between the two
+/// instructions, so unconditional success is the architecturally
+/// correct outcome here, not a shortcut — there is nothing to fail
+/// against. Verified against a real `strex r3, r0, [ip]` word from the
+/// actual kernel, sharing `LoadExclusiveInstruction`'s decode gate.
+struct StoreExclusiveInstruction: Equatable {
+    let condition: ARMCondition
+    let rd: Int
     let rt: Int
     let rn: Int
 }
@@ -313,6 +330,7 @@ enum ARMInstruction: Equatable {
     case rev(RevInstruction)
     case clz(ClzInstruction)
     case loadExclusive(LoadExclusiveInstruction)
+    case storeExclusive(StoreExclusiveInstruction)
     /// `DSB`/`DMB`/`ISB` (memory/instruction ordering barriers) and
     /// `PLD` (immediate, a cache-prefetch hint). Podium's interpreter
     /// executes everything strictly in program order with no caching,

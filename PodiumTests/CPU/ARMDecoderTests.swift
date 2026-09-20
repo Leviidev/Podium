@@ -155,6 +155,16 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rn, 12)
     }
 
+    func testDecodesStrexFromRealKernel() {
+        // strex r3, r0, [ip] — from the real kernel at 0x80080fac.
+        guard case .storeExclusive(let instr) = ARMDecoder.decode(0xE18C_3F90) else {
+            return XCTFail("Expected storeExclusive")
+        }
+        XCTAssertEqual(instr.rd, 3)
+        XCTAssertEqual(instr.rt, 0)
+        XCTAssertEqual(instr.rn, 12)
+    }
+
     func testDecodesLoadWordImmediateOffset() {
         // LDR r0, [r1, #4]
         guard case .loadStore(let instr) = ARMDecoder.decode(0xE591_0004) else {

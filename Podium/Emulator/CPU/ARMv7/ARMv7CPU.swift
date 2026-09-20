@@ -231,6 +231,10 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeLoadExclusive(instr)
 
+        case .storeExclusive(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeStoreExclusive(instr)
+
         case .memoryBarrier:
             // A real no-op: see ARMInstruction.memoryBarrier's doc comment.
             break
@@ -378,6 +382,22 @@ final class ARMv7CPU: CPU {
         do {
             let physicalAddress = try translatedAddress(address, access: .read)
             registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: address)
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(address), address: address)
+        }
+    }
+
+    /// See `StoreExclusiveInstruction`'s doc comment for why
+    /// unconditional success is correct, not a simplification, in this
+    /// single-threaded emulator.
+    private func executeStoreExclusive(_ instr: StoreExclusiveInstruction) {
+        let address = operandValue(for: instr.rn)
+        do {
+            let physicalAddress = try translatedAddress(address, access: .write)
+            try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+            registers[instr.rd] = 0
         } catch let memoryError as MemoryAccessError {
             lastError = .memoryFault(memoryError, address: address)
         } catch {
