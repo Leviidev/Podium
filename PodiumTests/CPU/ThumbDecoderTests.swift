@@ -566,6 +566,16 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.ra, 2)
     }
 
+    func testDecodesMulWideFromRealKernel() {
+        // mul r1, r0, r2 — from the real kernel at 0x802b783e.
+        guard case .mul(let instr) = ThumbDecoder.decode(0xfb00, 0xf102) else {
+            return XCTFail("Expected mul")
+        }
+        XCTAssertEqual(instr.rd, 1)
+        XCTAssertEqual(instr.rn, 0)
+        XCTAssertEqual(instr.rm, 2)
+    }
+
     func testDecodesStrdFromRealKernel() {
         // strd r0, r1, [r8] — from the real kernel at 0x8008b92c.
         guard case .loadStoreDual(let instr) = ThumbDecoder.decode(0xe9c8, 0x0100) else {

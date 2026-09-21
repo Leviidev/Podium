@@ -469,15 +469,23 @@ struct ThumbUmullInstruction: Equatable {
     let rm: Int
 }
 
+/// `MUL Rd, Rn, Rm` (Thumb-2 wide form): `Rd = Rn * Rm`, never flag-
+/// setting. The `Ra == 1111` alias of `MLA`'s own encoding — see
+/// `ThumbMlaInstruction`'s doc comment — now decoded since a real word
+/// confirmed it.
+struct ThumbMulInstruction: Equatable {
+    let rd: Int
+    let rn: Int
+    let rm: Int
+}
+
 /// `MLA Rd, Rn, Rm, Ra`: `Rd = Rn * Rm + Ra`, never flag-setting.
 /// Shares `ThumbUmullInstruction`'s `0xFB` outer prefix but a
 /// different sub-table (hw0 bits[7:4] == `0000`, vs `UMULL`'s `1010`)
 /// and field layout (hw1 bits[15:12] == `Ra`, bits[11:8] == `Rd`, the
 /// reverse order from `UMULL`'s `RdLo`/`RdHi`). `Ra == 1111` is the
-/// no-accumulate `MUL` alias, not decoded here (no real word has
-/// confirmed it, so it isn't silently treated as `MLA` with `Ra` tied
-/// to the program counter). Verified against a real
-/// `mla r4, r1, r3, r2` word from the actual kernel.
+/// no-accumulate `MUL` alias (`ThumbMulInstruction`). Verified against
+/// a real `mla r4, r1, r3, r2` word from the actual kernel.
 struct ThumbMlaInstruction: Equatable {
     let rd: Int
     let rn: Int
@@ -560,6 +568,7 @@ enum ThumbInstruction: Equatable {
     case loadStoreDual(ThumbLoadStoreDualInstruction)
     case umull(ThumbUmullInstruction)
     case mla(ThumbMlaInstruction)
+    case mul(ThumbMulInstruction)
     /// A recognized-but-not-yet-implemented Thumb instruction family —
     /// see `ThumbDecoder`'s doc comment for what's covered so far.
     case unsupported(rawHalfword: UInt16, secondHalfword: UInt16?)

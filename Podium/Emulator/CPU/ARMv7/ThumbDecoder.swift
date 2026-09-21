@@ -33,7 +33,8 @@ import Foundation
 /// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDRSB`
 /// (immediate, T3 and T4), `LDM`/
 /// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), `LDRD`/
-/// `STRD` (immediate), `UMULL`, `MLA`, `UXTB.W` (the `0xFA`-prefixed
+/// `STRD` (immediate), `UMULL`, `MLA`, `MUL`'s Thumb-2 wide form (the
+/// `Ra==1111` alias of `MLA`'s own encoding), `UXTB.W` (the `0xFA`-prefixed
 /// wide form of the 16-bit `UXTB` above, no-accumulate shape only —
 /// see `decode32ExtendOrShift`'s doc comment), `LSL`/`LSR`/`ASR`/`ROR`
 /// (Thumb-2 register-controlled-shift form, sharing that same `0xFA`
@@ -43,8 +44,8 @@ import Foundation
 /// `MCR`/`MRC` (reusing ARM state's exact field layout — see
 /// `decode32Coprocessor`'s doc comment).
 /// Everything else — PC-relative `LDR` (format 6),
-/// `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2 wide form and `MLS` (`MLA`'s
-/// siblings), `SMULL`/`UMLAL`/`SMLAL`/`SDIV`/`UDIV` (`UMULL`'s
+/// `REV`/`REV16`/`REVSH`, `MLS` (`MLA`'s
+/// sibling), `SMULL`/`UMLAL`/`SMLAL`/`SDIV`/`UDIV` (`UMULL`'s
 /// siblings), `LDREX`/`STREX` (Thumb-2 forms — `LDRD`/`STRD`'s
 /// siblings in that same space), the rest of the "plain binary
 /// immediate" op table (`SUBW`, its own `Rn==1111` `ADR` alias, `SSAT`/
@@ -588,8 +589,12 @@ enum ThumbDecoder {
                 rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
             ))
         case 0b0000:
-            guard hw1.bitField16(15, 12) != 0b1111 else {
-                return .unsupported(rawHalfword: hw0, secondHalfword: hw1) // MUL alias, not decoded.
+            if hw1.bitField16(15, 12) == 0b1111 {
+                // MUL alias (Ra == 1111): verified against a real
+                // `mul r1, r0, r2` word from the actual kernel.
+                return .mul(ThumbMulInstruction(
+                    rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
+                ))
             }
             return .mla(ThumbMlaInstruction(
                 rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)),
