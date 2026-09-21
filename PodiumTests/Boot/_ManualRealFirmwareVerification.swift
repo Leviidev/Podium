@@ -72,6 +72,13 @@ final class ManualRealFirmwareVerification: XCTestCase {
             let hw1 = try bus.readWord16(at: haltAddress &+ 2)
             print("RAW HALFWORDS at 0x\(haltAddress.hexString8): hw0=0x\(String(format: "%04X", hw0)) hw1=0x\(String(format: "%04X", hw1))")
         }
+        // ml_at_interrupt_context (real kernel disassembly, 0x8008877c):
+        // r0 = *(TPIDRPRW); r2 = *(r0 + 0x4d0); r2 = *(r2 + 8);
+        // return sp < r2 && sp > r2 - 0x4000.
+        let tpidrprw = cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 13, crm: 0, opc2: 4)
+        let ptr = try bus.readWord32(at: tpidrprw &+ 0x4D0)
+        let bound = try bus.readWord32(at: ptr &+ 8)
+        print("TPIDRPRW=0x\(tpidrprw.hexString8) [+0x4D0]=0x\(ptr.hexString8) [+8 of that]=0x\(bound.hexString8) sp=0x\(cpu.registers.sp.hexString8)")
         XCTAssertTrue(true)
     }
 }
