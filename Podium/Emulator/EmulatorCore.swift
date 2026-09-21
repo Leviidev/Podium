@@ -175,7 +175,19 @@ final class EmulatorCore {
 
         let deviceTreeAddress = (bootArgsAddress + UInt32(BootArgsBuilder.structSize) + 0xFFF) & ~UInt32(0xFFF)
         let deviceTreeLength = UInt32(deviceTree?.count ?? 0)
-        let topOfKernelData = (deviceTreeAddress + deviceTreeLength + 0x3FFF) & ~UInt32(0x3FFF)
+
+        // The `pram` node's `reg` property (see `DeviceTreePatcher
+        // .patchPramRegion`'s doc comment) needs to point at real,
+        // backed physical memory for the real kernel's panic-log
+        // mapping to succeed — reserved on its own page right after
+        // the device tree, same as every other component here.
+        let pramAddress = (deviceTreeAddress + deviceTreeLength + 0xFFF) & ~UInt32(0xFFF)
+        let pramSize: UInt32 = 0x1000
+        if deviceTree != nil {
+            DeviceTreePatcher.patchPramRegion(&deviceTree!, physicalAddress: pramAddress, size: pramSize)
+        }
+
+        let topOfKernelData = (pramAddress + pramSize + 0x3FFF) & ~UInt32(0x3FFF)
         let bootArgs = BootArgsBuilder.build(
             virtBase: Self.physicalMemoryBaseAddress,
             physBase: Self.physicalMemoryBaseAddress,

@@ -100,6 +100,35 @@ enum DeviceTreePatcher {
         }
     }
 
+    /// Points the `pram` node's `reg` property (shipped as `{0, 0}` in
+    /// the unpopulated IPSW template — the same placeholder pattern as
+    /// the clock properties above, just for a RAM-backed scratch
+    /// region rather than a clock value) at a real, backed physical
+    /// range within Podium's own guest RAM, so the real kernel's
+    /// `check_for_panic_log()` (confirmed against the actual XNU
+    /// source, `pexpert/arm/pe_init.c`) can successfully `ml_io_map`
+    /// it instead of hitting an unbacked page. Real hardware has iBoot
+    /// reserve and populate this region for a persistent panic-log
+    /// ring buffer; Podium has no iBoot, so this plays that same,
+    /// narrowly-scoped role — reserving real memory, not fabricating
+    /// its contents. The kernel's own code tolerates any content: it
+    /// checks the region's first word against two known magic values
+    /// (`'BTRC'`/`'SHMC'`) and, if neither matches, just logs a
+    /// message and `bzero`s the region before continuing — so this
+    /// deliberately writes nothing beyond the property patch itself;
+    /// Podium's already-zero-initialized RAM is exactly the "no
+    /// previous panic" case the real kernel already handles. `reg` is
+    /// already exactly 8 bytes in the shipped tree (an `{address,
+    /// size}` pair), so this is a plain in-place overwrite — no
+    /// length/offset shifting like the 4-to-8-byte clock expansion
+    /// needs.
+    static func patchPramRegion(_ deviceTree: inout Data, physicalAddress: UInt32, size: UInt32) {
+        let locations = findProperties(in: deviceTree, path: ["pram"], propertyNames: ["reg"])
+        guard let location = locations.first, location.currentLength == 8 else { return }
+        deviceTree.writeUInt32LE(physicalAddress, at: location.valueOffset)
+        deviceTree.writeUInt32LE(size, at: location.valueOffset + 4)
+    }
+
     /// Read-only walk collecting every requested property's location
     /// within the target node — nothing here mutates `data`, so the
     /// offsets it returns are all still valid relative to each other

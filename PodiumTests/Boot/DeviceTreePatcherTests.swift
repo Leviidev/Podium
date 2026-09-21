@@ -106,4 +106,54 @@ final class DeviceTreePatcherTests: XCTestCase {
         DeviceTreePatcher.patchClockPlaceholders(&tree)
         XCTAssertEqual(tree.count, onceSize)
     }
+
+    /// Builds a minimal synthetic tree with a top-level `pram` node
+    /// holding an 8-byte, zeroed `reg` property — matching the real
+    /// reference tree's shipped-as-placeholder shape.
+    private func makeSyntheticDeviceTreeWithPram() -> Data {
+        func property(_ name: String, value: Data) -> Data {
+            var data = Data(count: 32)
+            data.replaceSubrange(0..<name.utf8.count, with: Array(name.utf8))
+            var lengthBytes = Data(count: 4)
+            lengthBytes.writeUInt32LE(UInt32(value.count), at: 0)
+            data.append(lengthBytes)
+            data.append(value)
+            let padding = (4 - (value.count % 4)) % 4
+            data.append(Data(repeating: 0, count: padding))
+            return data
+        }
+        func node(propertiesData: [Data], childCount: Int, children: Data) -> Data {
+            var header = Data(count: 8)
+            header.writeUInt32LE(UInt32(propertiesData.count), at: 0)
+            header.writeUInt32LE(UInt32(childCount), at: 4)
+            for p in propertiesData { header.append(p) }
+            header.append(children)
+            return header
+        }
+
+        let pramProperties = [
+            property("name", value: Data("pram".utf8) + Data([0])),
+            property("reg", value: Data(count: 8)),
+        ]
+        let pram = node(propertiesData: pramProperties, childCount: 0, children: Data())
+        return node(propertiesData: [], childCount: 1, children: pram)
+    }
+
+    func testPatchPramRegionOverwritesRegValueInPlace() {
+        var tree = makeSyntheticDeviceTreeWithPram()
+        let originalSize = tree.count
+        DeviceTreePatcher.patchPramRegion(&tree, physicalAddress: 0x8100_0000, size: 0x1000)
+
+        // In-place overwrite: no length/offset change at all.
+        XCTAssertEqual(tree.count, originalSize)
+
+        var nameField = Data(count: 32)
+        nameField.replaceSubrange(0..<"reg".utf8.count, with: Array("reg".utf8))
+        guard let range = tree.range(of: nameField) else {
+            return XCTFail("Could not locate reg property in the patched tree")
+        }
+        let valueOffset = range.lowerBound - tree.startIndex + 32 + 4
+        XCTAssertEqual(tree.readUInt32LE(at: valueOffset), 0x8100_0000)
+        XCTAssertEqual(tree.readUInt32LE(at: valueOffset + 4), 0x1000)
+    }
 }
