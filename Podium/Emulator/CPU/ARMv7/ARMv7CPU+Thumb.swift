@@ -45,6 +45,7 @@ extension ARMv7CPU {
 
     func stepThumb() {
         let instructionAddress = registers.pc
+        currentInstructionAddress = instructionAddress
         let hw0: UInt16
         do {
             let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
@@ -432,9 +433,9 @@ extension ARMv7CPU {
                 }
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: address)
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
         } catch {
-            lastError = .memoryFault(.unmappedAddress(address), address: address)
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
         }
     }
 
@@ -458,9 +459,9 @@ extension ARMv7CPU {
                 registers[instr.rd] = UInt32(bitPattern: Int32(Int16(bitPattern: try memory.readWord16(at: physicalAddress))))
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: address)
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
         } catch {
-            lastError = .memoryFault(.unmappedAddress(address), address: address)
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
         }
     }
 
@@ -516,10 +517,10 @@ extension ARMv7CPU {
                 address = address &+ 4
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: address)
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
             return
         } catch {
-            lastError = .memoryFault(.unmappedAddress(address), address: address)
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
             return
         }
 
@@ -548,10 +549,10 @@ extension ARMv7CPU {
                 ? UInt32(try memory.readWord16(at: physicalAddress))
                 : UInt32(try memory.readByte(at: physicalAddress))
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: indexAddress)
+            if !raiseDataAbort(memoryError, faultAddress: indexAddress) { lastError = .memoryFault(memoryError, address: indexAddress) }
             return
         } catch {
-            lastError = .memoryFault(.unmappedAddress(indexAddress), address: indexAddress)
+            if !raiseDataAbort(.unmappedAddress(indexAddress), faultAddress: indexAddress) { lastError = .memoryFault(.unmappedAddress(indexAddress), address: indexAddress) }
             return
         }
 
@@ -577,10 +578,10 @@ extension ARMv7CPU {
                 try memory.writeWord32(registers[instr.rt2], at: secondPhysicalAddress)
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: transferAddress)
+            if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }
             return
         } catch {
-            lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress)
+            if !raiseDataAbort(.unmappedAddress(transferAddress), faultAddress: transferAddress) { lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress) }
             return
         }
 
@@ -807,10 +808,10 @@ extension ARMv7CPU {
                 try memory.writeWord32(registers[instr.rt], at: physicalAddress)
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: transferAddress)
+            if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }
             return
         } catch {
-            lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress)
+            if !raiseDataAbort(.unmappedAddress(transferAddress), faultAddress: transferAddress) { lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress) }
             return
         }
 
@@ -851,9 +852,9 @@ extension ARMv7CPU {
                 try memory.writeWord32(registers[instr.rt], at: physicalAddress)
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: address)
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
         } catch {
-            lastError = .memoryFault(.unmappedAddress(address), address: address)
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
         }
     }
 }

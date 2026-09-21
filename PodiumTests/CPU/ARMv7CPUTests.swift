@@ -329,6 +329,48 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertTrue(cpu.cpsr.overflow)
     }
 
+    func testMrsSpsrReadsCurrentModesBankedSpsr() {
+        // mrs sp, spsr -- real word from the actual kernel's Data Abort
+        // handler prologue.
+        let cpu = makeCPU(program: [0xE14F_D000])
+        cpu.switchProcessorMode(from: ARMv7CPU.userModeBits, to: ARMv7CPU.abortModeBits)
+        cpu.cpsr.rawValue = (cpu.cpsr.rawValue & ~ARMv7CPU.modeBitsMask) | ARMv7CPU.abortModeBits
+        cpu.setSavedProgramStatus(0xDEAD_BEEF, forModeBits: ARMv7CPU.abortModeBits)
+
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[Registers.spIndex], 0xDEAD_BEEF)
+    }
+
+    func testMrsSpsrReadsBackZeroInUserModeWhereNoSpsrExists() {
+        // Real hardware calls this UNPREDICTABLE (no SPSR in User mode);
+        // Podium reads back 0 rather than fabricating a value.
+        let cpu = makeCPU(program: [0xE14F_D000]) // mrs sp, spsr
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[Registers.spIndex], 0)
+    }
+
+    func testMsrSpsrWritesOnlySelectedByteOfBankedSpsrLeavingCpsrUntouched() {
+        let cpu = makeCPU(program: [
+            0xE3E0_B000, // MVN r11, #0  -- r11 = 0xFFFFFFFF
+            0xE162_F00B, // msr SPSR_x, r11 (bit22/R set on the real msr CPSR_x, r11 word)
+        ])
+        cpu.switchProcessorMode(from: ARMv7CPU.userModeBits, to: ARMv7CPU.abortModeBits)
+        cpu.cpsr.rawValue = (cpu.cpsr.rawValue & ~ARMv7CPU.modeBitsMask) | ARMv7CPU.abortModeBits
+        cpu.setSavedProgramStatus(0, forModeBits: ARMv7CPU.abortModeBits)
+        let cpsrBefore = cpu.cpsr.rawValue
+
+        cpu.step(); cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.cpsr.rawValue, cpsrBefore) // CPSR itself untouched
+        // Only bits [15:8] (the 'x' field) should have changed in SPSR_abt.
+        XCTAssertEqual(cpu.savedProgramStatus(forModeBits: ARMv7CPU.abortModeBits), 0x0000_FF00)
+    }
+
     func testBxBranchesToRegisterValue() {
         let cpu = makeCPU(program: [
             0xE3A0_E00C, // MOV lr, #12      (word-aligned target)

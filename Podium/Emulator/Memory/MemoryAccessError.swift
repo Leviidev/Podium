@@ -13,7 +13,15 @@ enum MemoryAccessError: Error, Equatable {
     /// virtual address — a first/second-level descriptor marked the
     /// region not-present, a DACR domain forbade access, or an AP/XN
     /// check forbade this specific read/write/execute. Modeled generically
-    /// rather than split into prefetch-abort/data-abort, since Podium
-    /// doesn't implement exception entry for the guest to distinguish them.
+    /// rather than split into a separate case per real ARM fault kind;
+    /// `ARMv7CPU.raiseDataAbort`'s `reason`-string classification (into the
+    /// real DFSR encoding) is what actually distinguishes them for the
+    /// guest. Raised during a data access, this now dispatches a real
+    /// ARMv7 Data Abort exception into the guest's own vector table
+    /// (`ARMv7CPU.raiseDataAbort`) instead of halting Podium outright —
+    /// real hardware would do exactly that, and the guest's own abort
+    /// handler is what decides whether it's recoverable. Raised during an
+    /// instruction *fetch*, it's still a plain halt: that would be a
+    /// Prefetch Abort, a different vector Podium doesn't dispatch yet.
     case translationFault(virtualAddress: UInt32, reason: String)
 }

@@ -192,11 +192,13 @@ struct LoadStoreDualInstruction: Equatable {
     let offset: HalfwordTransferOffset
 }
 
-/// `MRS Rd, CPSR`: reads the whole CPSR into a register. SPSR access
-/// (the same instruction shape with R==1) isn't decoded — there's no
-/// exception entry/exit yet for a saved SPSR to matter to.
+/// `MRS Rd, CPSR`/`MRS Rd, SPSR` (`isSPSR`, the R bit): reads the whole
+/// CPSR, or the current mode's banked SPSR, into a register. Real
+/// hardware calls SPSR access UNPREDICTABLE in User/System mode (no
+/// SPSR exists there) — see `ARMv7CPU.executeMoveFromStatusRegister`.
 struct MRSInstruction: Equatable {
     let condition: ARMCondition
+    let isSPSR: Bool
     let rd: Int
 }
 
@@ -208,13 +210,16 @@ enum MSRSource: Equatable {
     case immediate(UInt32)
 }
 
-/// `MSR CPSR_<fields>, Rm`/`#imm`: writes selected *bytes* of the CPSR.
-/// `fieldMask` bit0=c(control, bits[7:0]), bit1=x(extension, [15:8]),
-/// bit2=s(status, [23:16]), bit3=f(flags, [31:24]) — the same order and
-/// meaning as the real mask field, so it can be used directly to build a
-/// byte-granular write mask at execute time.
+/// `MSR CPSR_<fields>, Rm`/`#imm` or `MSR SPSR_<fields>, ...` (`isSPSR`,
+/// the R bit): writes selected *bytes* of the CPSR, or of the current
+/// mode's banked SPSR. `fieldMask` bit0=c(control, bits[7:0]),
+/// bit1=x(extension, [15:8]), bit2=s(status, [23:16]), bit3=f(flags,
+/// [31:24]) — the same order and meaning as the real mask field, so it
+/// can be used directly to build a byte-granular write mask at execute
+/// time.
 struct MSRInstruction: Equatable {
     let condition: ARMCondition
+    let isSPSR: Bool
     let fieldMask: UInt8
     let source: MSRSource
 }
@@ -424,11 +429,9 @@ enum ARMInstruction: Equatable {
     /// and the "extra load/store" SWP/reserved encodings (SH==00), the
     /// `S`-bit form of block data transfer (see
     /// `BlockDataTransferInstruction`'s doc comment), register-shifted-
-    /// by-register operand2, SPSR access (the MRS/MSR encodings with
-    /// R==1 — there's no exception entry/exit yet for a saved SPSR to
-    /// matter to), most of the coprocessor space (anything but MCR/MRC),
-    /// SWI, and most of the unconditional-instruction-extension space
-    /// (anything but CPS and the DSB/DMB/ISB barriers).
+    /// by-register operand2, most of the coprocessor space (anything but
+    /// MCR/MRC), SWI, and most of the unconditional-instruction-extension
+    /// space (anything but CPS and the DSB/DMB/ISB barriers).
     case unsupported(rawWord: UInt32)
     /// A genuinely undefined/reserved encoding.
     case undefined(rawWord: UInt32)

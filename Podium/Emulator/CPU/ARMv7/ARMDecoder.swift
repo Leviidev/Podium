@@ -195,10 +195,10 @@ enum ARMDecoder {
             // bit22 (R) selects CPSR/SPSR; bit21 selects MRS/MSR within
             // that — both confirmed against real instruction words from
             // the actual iPod4,1 6.1.6 kernel ("mrs r11, apsr" and
-            // "msr CPSR_x, r11").
-            guard !word.bit(22) else {
-                return .unsupported(rawWord: word) // SPSR access — not modeled.
-            }
+            // "msr CPSR_x, r11"), and the SPSR (R==1) form against a real
+            // word from that same kernel's Data Abort handler prologue
+            // ("mrs sp, spsr").
+            let isSPSR = word.bit(22)
 
             if word.bit(21) {
                 let fieldMask = UInt8(word.bitField(19, 16))
@@ -211,12 +211,12 @@ enum ARMDecoder {
                     guard word.bitField(11, 4) == 0 else { return .unsupported(rawWord: word) }
                     source = .register(Int(word.bitField(3, 0)))
                 }
-                return .moveToStatusRegister(MSRInstruction(condition: condition, fieldMask: fieldMask, source: source))
+                return .moveToStatusRegister(MSRInstruction(condition: condition, isSPSR: isSPSR, fieldMask: fieldMask, source: source))
             } else {
                 guard !immediateOperand, word.bitField(19, 16) == 0b1111, word.bitField(11, 0) == 0 else {
                     return .unsupported(rawWord: word)
                 }
-                return .moveFromStatusRegister(MRSInstruction(condition: condition, rd: rd))
+                return .moveFromStatusRegister(MRSInstruction(condition: condition, isSPSR: isSPSR, rd: rd))
             }
         }
 

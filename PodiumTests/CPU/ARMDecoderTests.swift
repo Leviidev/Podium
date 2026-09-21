@@ -524,15 +524,24 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.signedOffset, -0x15FC)
     }
 
-    func testMrsWithSpsrBitSetIsUnsupported() {
-        // Same shape as the real mrs above but with bit22 (R) set,
-        // selecting SPSR — not modeled since there's no exception
-        // entry/exit yet for a saved SPSR to matter to.
-        let word: UInt32 = 0xE10F_B000 | (1 << 22)
-        if case .unsupported = ARMDecoder.decode(word) {
-            // expected
-        } else {
-            XCTFail("Expected .unsupported for SPSR access")
+    func testDecodesMrsSpsrFromRealKernel() {
+        // mrs sp, spsr — from the real kernel's Data Abort handler
+        // prologue at 0x80084740, the instruction that halted execution
+        // before SPSR access (R==1) was decoded.
+        guard case .moveFromStatusRegister(let instr) = ARMDecoder.decode(0xE14F_D000) else {
+            return XCTFail("Expected moveFromStatusRegister")
         }
+        XCTAssertTrue(instr.isSPSR)
+        XCTAssertEqual(instr.rd, Registers.spIndex)
+    }
+
+    func testMsrWithSpsrBitSetDecodesAsSpsrAccess() {
+        // Same shape as the real msr above but with bit22 (R) set,
+        // selecting SPSR.
+        let word: UInt32 = 0xE122_F00B | (1 << 22)
+        guard case .moveToStatusRegister(let instr) = ARMDecoder.decode(word) else {
+            return XCTFail("Expected moveToStatusRegister")
+        }
+        XCTAssertTrue(instr.isSPSR)
     }
 }

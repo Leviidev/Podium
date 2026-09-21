@@ -24,9 +24,16 @@ enum CPUError: Error, Equatable {
 /// for `stepThumb()`/`ThumbDecoder`/`ThumbInstruction` — reached via a
 /// genuine interworking `BX`/`BLX`, not a separate, disconnected mode.
 ///
-/// What this does *not* do yet, honestly: exceptions and interrupts (the
-/// `I`/`F` CPSR mask bits `CPS` sets are tracked, but nothing actually
-/// raises an interrupt for them to gate). Address translation, once the
+/// What this does *not* do yet, honestly: IRQ/FIQ interrupts (the `I`/`F`
+/// CPSR mask bits `CPS` sets are tracked, but nothing actually raises one
+/// for them to gate) and Prefetch Abort/Undefined-Instruction exception
+/// entry (an instruction-fetch fault or an unsupported/undefined
+/// instruction still halts `lastError`-style). Data Abort *is* real now —
+/// see `raiseDataAbort` — dispatching into the guest's own vector table
+/// with real SP/LR/SPSR banking (`switchProcessorMode`) exactly like real
+/// hardware, including a real "S==1, Rd==PC" exception return
+/// (`executeDataProcessing`) restoring CPSR from SPSR to unwind back out.
+/// Address translation, once the
 /// guest sets SCTLR.M, *is* real — see `ARMv7MMU` — walking the guest's
 /// own translation tables for every instruction fetch and data access
 /// rather than leaving memory untranslated; CP15 registers other than
@@ -62,6 +69,66 @@ final class ARMv7CPU: CPU {
 
     let memory: MemoryBus
     private var isRunning = false
+
+    /// The address of the instruction currently executing — real
+    /// hardware's pipeline always knows this; here it's captured once per
+    /// `step()`/`stepThumb()` so exception entry (`raiseDataAbort`) can
+    /// compute the real `LR_abt = instructionAddress + 8` (ARM DDI 0406C
+    /// Table B1-7 — fixed at +8 for Data Abort regardless of ARM/Thumb
+    /// state) without threading it through every individual `executeXxx`
+    /// call site. Not `private(set)`: `stepThumb()` in
+    /// `ARMv7CPU+Thumb.swift` sets this too (Swift's `private` is
+    /// file-scoped, not type-scoped).
+    var currentInstructionAddress: UInt32 = 0
+
+    static let modeBitsMask: UInt32 = 0x1F
+    static let userModeBits: UInt32 = 0b10000
+    static let systemModeBits: UInt32 = 0b11111
+    static let abortModeBits: UInt32 = 0b10111
+
+    /// SP/LR banked per processor mode (ARM DDI 0406C B1.3.3) — User and
+    /// System share one bank (key `userModeBits`), the other five modes
+    /// each have their own. Populated lazily: a mode's bank simply reads
+    /// back 0 until either the guest's own boot code switches into it (via
+    /// `MSR CPSR_c`) to set up its stack, or exception entry visits it.
+    private var bankedSP: [UInt32: UInt32] = [:]
+    private var bankedLR: [UInt32: UInt32] = [:]
+
+    /// SPSR per mode (ARM DDI 0406C B1.3.3) — only FIQ/IRQ/SVC/Abort/Undef
+    /// have one; User/System don't and are never keyed here. Written by
+    /// exception entry, read back by the "S==1, Rd==PC" exception-return
+    /// idiom (`executeDataProcessing`).
+    private var spsrForMode: [UInt32: UInt32] = [:]
+
+    private static func bankKey(forModeBits modeBits: UInt32) -> UInt32 {
+        switch modeBits {
+        case userModeBits, systemModeBits: return userModeBits
+        default: return modeBits
+        }
+    }
+
+    /// Swaps the live `registers.sp`/`registers.lr` between the outgoing
+    /// and incoming mode's bank — the real effect of a CPSR mode change,
+    /// whether triggered by `MSR CPSR_c` (`executeMoveToStatusRegister`),
+    /// exception entry (`raiseDataAbort`), or exception return
+    /// (`executeDataProcessing`'s "S==1, Rd==PC" case).
+    func switchProcessorMode(from oldModeBits: UInt32, to newModeBits: UInt32) {
+        let oldKey = Self.bankKey(forModeBits: oldModeBits)
+        let newKey = Self.bankKey(forModeBits: newModeBits)
+        guard oldKey != newKey else { return }
+        bankedSP[oldKey] = registers.sp
+        bankedLR[oldKey] = registers.lr
+        registers.sp = bankedSP[newKey] ?? 0
+        registers.lr = bankedLR[newKey] ?? 0
+    }
+
+    func savedProgramStatus(forModeBits modeBits: UInt32) -> UInt32? {
+        spsrForMode[modeBits]
+    }
+
+    func setSavedProgramStatus(_ value: UInt32, forModeBits modeBits: UInt32) {
+        spsrForMode[modeBits] = value
+    }
 
     /// Thumb's `ITSTATE`: bits[7:4] hold the condition for the
     /// instruction about to execute, bits[3:0] the remaining mask —
@@ -106,6 +173,7 @@ final class ARMv7CPU: CPU {
         }
 
         let instructionAddress = registers.pc
+        currentInstructionAddress = instructionAddress
         let word: UInt32
         do {
             let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
@@ -271,8 +339,17 @@ final class ARMv7CPU: CPU {
         }
     }
 
+    /// `MRS Rd, SPSR` reads the *current mode's* banked SPSR — real
+    /// hardware calls this UNPREDICTABLE in User/System mode (neither has
+    /// one); Podium reads back 0 there, the same "unpopulated bank" stance
+    /// `switchProcessorMode`'s SP/LR banks already take, rather than
+    /// fabricating a value real hardware wouldn't define.
     private func executeMoveFromStatusRegister(_ instr: MRSInstruction) {
-        registers[instr.rd] = cpsr.rawValue
+        if instr.isSPSR {
+            registers[instr.rd] = savedProgramStatus(forModeBits: cpsr.rawValue & Self.modeBitsMask) ?? 0
+        } else {
+            registers[instr.rd] = cpsr.rawValue
+        }
     }
 
     /// `fieldMask` bytes that are clear leave the corresponding CPSR byte
@@ -291,7 +368,25 @@ final class ARMv7CPU: CPU {
             writeMask |= Self.msrByteMasks[bit]
         }
 
+        // `MSR SPSR_<fields>` writes the *current mode's* banked SPSR —
+        // never the live CPSR, and never changes processor mode itself
+        // (only a real mode change, via CPSR's own control byte below or
+        // exception entry/return, banks a different SPSR in).
+        if instr.isSPSR {
+            let modeBits = cpsr.rawValue & Self.modeBitsMask
+            let old = savedProgramStatus(forModeBits: modeBits) ?? 0
+            setSavedProgramStatus((old & ~writeMask) | (value & writeMask), forModeBits: modeBits)
+            return
+        }
+
+        let oldModeBits = cpsr.rawValue & Self.modeBitsMask
         cpsr.rawValue = (cpsr.rawValue & ~writeMask) | (value & writeMask)
+        // The control byte (bits[7:0]) carries the mode field — only an
+        // `MSR` that actually writes it (real boot code does this once per
+        // mode very early, to give each a real stack) can change mode.
+        if writeMask & 0x0000_00FF != 0 {
+            switchProcessorMode(from: oldModeBits, to: cpsr.rawValue & Self.modeBitsMask)
+        }
     }
 
     /// CP15 (coprocessor, opc1, CRn, CRm, opc2) for the register real
@@ -318,6 +413,76 @@ final class ARMv7CPU: CPU {
     func translatedAddress(_ virtualAddress: UInt32, access: ARMv7MMU.Access) throws -> UInt32 {
         guard mmuEnabled else { return virtualAddress }
         return try ARMv7MMU.translate(virtualAddress: virtualAddress, access: access, cp15: cp15, memory: memory)
+    }
+
+    /// SCTLR.V (bit 13): selects the real ARM low-vectors (0x00000000) or
+    /// high-vectors (0xFFFF0000) exception vector table base — whichever
+    /// the guest itself configured, not assumed. Read the same way
+    /// `mmuEnabled` reads SCTLR.M.
+    private static let sctlrHighVectorsBit: UInt32 = 1 << 13
+    var exceptionVectorBaseAddress: UInt32 {
+        let sctlr = cp15.read(coprocessor: Self.sctlrCoprocessor, opc1: Self.sctlrOpc1, crn: Self.sctlrCRn, crm: Self.sctlrCRm, opc2: Self.sctlrOpc2)
+        return sctlr & Self.sctlrHighVectorsBit != 0 ? 0xFFFF_0000 : 0x0000_0000
+    }
+
+    /// A real ARMv7 Data Abort exception entry (ARM DDI 0406C B1.6.10,
+    /// Table B1-7): banks SP/LR into Abort mode, saves the interrupted
+    /// CPSR to SPSR_abt, sets `LR_abt = instructionAddress + 8` (the fixed
+    /// Data Abort offset — unlike Prefetch Abort/IRQ, it doesn't vary by
+    /// ARM/Thumb state), switches to ARM state with IRQs masked, and
+    /// jumps to the Data-Abort vector. Real hardware would enter this
+    /// exception for a page fault like this — the guest's own abort
+    /// handler is what decides whether it's recoverable (e.g. faulting in
+    /// a lazily-backed page) or a genuine panic, exactly as it would on
+    /// real hardware. Only `.translationFault` (Podium's stand-in for
+    /// every real MMU-detected reason a data access can abort — see that
+    /// case's doc comment) is treated this way; the other
+    /// `MemoryAccessError` cases represent gaps in Podium's own memory
+    /// modeling, not something real hardware would raise this exception
+    /// for, so those still halt honestly via `lastError`. Returns whether
+    /// dispatch happened — false leaves the caller's own `lastError` halt
+    /// in place, which happens if the MMU isn't even on yet (no real
+    /// vector table can exist to jump to before the guest has set one up).
+    func raiseDataAbort(_ error: MemoryAccessError, faultAddress: UInt32) -> Bool {
+        guard case .translationFault(let virtualAddress, let reason) = error else { return false }
+        guard mmuEnabled else { return false }
+
+        let savedCPSR = cpsr.rawValue
+        let oldModeBits = savedCPSR & Self.modeBitsMask
+
+        switchProcessorMode(from: oldModeBits, to: Self.abortModeBits)
+        setSavedProgramStatus(savedCPSR, forModeBits: Self.abortModeBits)
+
+        registers.lr = currentInstructionAddress &+ 8
+        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask) | Self.abortModeBits
+        cpsr.thumbState = false
+        cpsr.irqDisabled = true
+
+        // DFAR/DFSR (CP15 c6/c5) — the guest's own abort handler reads
+        // these to decide what faulted and why, exactly as it would read
+        // real hardware's fault registers.
+        cp15.write(coprocessor: 15, opc1: 0, crn: 6, crm: 0, opc2: 0, value: virtualAddress)
+        cp15.write(coprocessor: 15, opc1: 0, crn: 5, crm: 0, opc2: 0, value: Self.dataFaultStatus(for: reason))
+
+        registers.pc = exceptionVectorBaseAddress &+ 0x10
+        return true
+    }
+
+    /// Translates Podium's own honest, human-readable fault classification
+    /// (see `ARMv7MMU.translate`'s `reason` strings) into the real DFSR
+    /// status-field encodings the guest's abort handler actually checks
+    /// (ARM DDI 0406C Table B3-23, short-descriptor format) — domain
+    /// defaults to 0 since Podium doesn't currently surface which domain
+    /// faulted.
+    private static func dataFaultStatus(for reason: String) -> UInt32 {
+        let isPage = reason.contains("page") || reason.contains("second-level")
+        if reason.contains("permission") {
+            return isPage ? 0b01111 : 0b01101
+        }
+        if reason.contains("domain") {
+            return isPage ? 0b01011 : 0b01001
+        }
+        return isPage ? 0b00111 : 0b00101
     }
 
     // Not `private`: Thumb-2's coprocessor instructions reuse this exact
@@ -420,9 +585,9 @@ final class ARMv7CPU: CPU {
             let physicalAddress = try translatedAddress(address, access: .read)
             registers[instr.rt] = try memory.readWord32(at: physicalAddress)
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: address)
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
         } catch {
-            lastError = .memoryFault(.unmappedAddress(address), address: address)
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
         }
     }
 
@@ -436,9 +601,9 @@ final class ARMv7CPU: CPU {
             try memory.writeWord32(registers[instr.rt], at: physicalAddress)
             registers[instr.rd] = 0
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: address)
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
         } catch {
-            lastError = .memoryFault(.unmappedAddress(address), address: address)
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
         }
     }
 
@@ -491,12 +656,16 @@ final class ARMv7CPU: CPU {
             registers[instr.rd] = result
         }
 
-        if instr.setFlags {
-            // S==1 writing r15 would be an exception return (CPSR restored
-            // from SPSR) on real hardware. SPSR isn't modeled, so that
-            // combination just doesn't touch the flags rather than
-            // corrupting them — comparisons (which never write r15 for
-            // real) are unaffected by this.
+        // S==1 writing r15 is an exception return on real hardware (ARM
+        // DDI 0406C A2.6.7): CPSR is restored from the current mode's
+        // SPSR instead of the flags being set from `result`. Only
+        // meaningful outside User/System mode, which have no SPSR.
+        let modeBitsBeforeWrite = cpsr.rawValue & Self.modeBitsMask
+        let isExceptionReturn = instr.setFlags && instr.rd == Registers.pcIndex && !instr.op.isComparison
+            && modeBitsBeforeWrite != Self.userModeBits && modeBitsBeforeWrite != Self.systemModeBits
+            && savedProgramStatus(forModeBits: modeBitsBeforeWrite) != nil
+
+        if instr.setFlags && !isExceptionReturn {
             if instr.rd != Registers.pcIndex || instr.op.isComparison {
                 cpsr.negative = result.bit(31)
                 cpsr.zero = result == 0
@@ -508,11 +677,17 @@ final class ARMv7CPU: CPU {
         }
 
         if instr.rd == Registers.pcIndex && !instr.op.isComparison {
-            // ALUWritePC: on ARMv7, a data-processing instruction that
-            // writes r15 interworks exactly like BX (checking bit 0),
-            // not just a plain same-state jump.
-            cpsr.thumbState = result.bit(0)
-            registers.pc = result & ~UInt32(0b1)
+            if isExceptionReturn, let savedCPSR = savedProgramStatus(forModeBits: modeBitsBeforeWrite) {
+                cpsr.rawValue = savedCPSR
+                switchProcessorMode(from: modeBitsBeforeWrite, to: cpsr.rawValue & Self.modeBitsMask)
+                registers.pc = result
+            } else {
+                // ALUWritePC: on ARMv7, a data-processing instruction that
+                // writes r15 interworks exactly like BX (checking bit 0),
+                // not just a plain same-state jump.
+                cpsr.thumbState = result.bit(0)
+                registers.pc = result & ~UInt32(0b1)
+            }
         }
     }
 
@@ -604,10 +779,10 @@ final class ARMv7CPU: CPU {
                 address = address &+ 4
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: address)
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
             return
         } catch {
-            lastError = .memoryFault(.unmappedAddress(address), address: address)
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
             return
         }
 
@@ -651,10 +826,10 @@ final class ARMv7CPU: CPU {
                 }
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: transferAddress)
+            if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }
             return
         } catch {
-            lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress)
+            if !raiseDataAbort(.unmappedAddress(transferAddress), faultAddress: transferAddress) { lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress) }
             return
         }
 
@@ -702,10 +877,10 @@ final class ARMv7CPU: CPU {
                 try memory.writeWord16(UInt16(truncatingIfNeeded: operandValue(for: instr.rd)), at: physicalAddress)
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: transferAddress)
+            if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }
             return
         } catch {
-            lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress)
+            if !raiseDataAbort(.unmappedAddress(transferAddress), faultAddress: transferAddress) { lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress) }
             return
         }
 
@@ -747,10 +922,10 @@ final class ARMv7CPU: CPU {
                 try memory.writeWord32(registers[rt2], at: secondPhysicalAddress)
             }
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: transferAddress)
+            if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }
             return
         } catch {
-            lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress)
+            if !raiseDataAbort(.unmappedAddress(transferAddress), faultAddress: transferAddress) { lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress) }
             return
         }
 
