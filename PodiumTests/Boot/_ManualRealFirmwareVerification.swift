@@ -24,6 +24,7 @@ final class ManualRealFirmwareVerification: XCTestCase {
         let bootArgsAddress = (image.highestAddressUsed + 0xFFF) & ~UInt32(0xFFF)
 
         if deviceTree != nil {
+            dumpZeroLengthFourProperties(deviceTree!)
             DeviceTreePatcher.patchClockPlaceholders(&deviceTree!)
             let ramRange = EmulatorCore.physicalMemoryBaseAddress..<(EmulatorCore.physicalMemoryBaseAddress &+ UInt32(EmulatorCore.physicalMemorySize))
             for region in DeviceTreeMemoryMap.peripheralRegions(in: deviceTree!, excluding: ramRange) {
@@ -80,5 +81,42 @@ final class ManualRealFirmwareVerification: XCTestCase {
         let bound = try bus.readWord32(at: ptr &+ 8)
         print("TPIDRPRW=0x\(tpidrprw.hexString8) [+0x4D0]=0x\(ptr.hexString8) [+8 of that]=0x\(bound.hexString8) sp=0x\(cpu.registers.sp.hexString8)")
         XCTAssertTrue(true)
+    }
+
+    /// Every property with a raw length of exactly 4 and value 0 —
+    /// candidates for the same "unpopulated iBoot placeholder" bug class
+    /// DeviceTreePatcher.patchClockPlaceholders already fixes for
+    /// /cpus/cpu0's clock properties, just possibly in other nodes.
+    private func dumpZeroLengthFourProperties(_ data: Data) {
+        func walk(offset: Int, path: [String]) -> Int? {
+            let nodeHeaderSize = 8, propertyNameSize = 32, propertyHeaderSize = 36
+            guard offset + nodeHeaderSize <= data.count else { return nil }
+            let nProperties = Int(data.readUInt32LE(at: offset))
+            let nChildren = Int(data.readUInt32LE(at: offset + 4))
+            var cursor = offset + nodeHeaderSize
+            var nodeName = "?"
+            for _ in 0..<nProperties {
+                guard cursor + propertyHeaderSize <= data.count else { return nil }
+                let nameBytes = data[data.startIndex + cursor..<data.startIndex + cursor + propertyNameSize]
+                let name = String(decoding: nameBytes.prefix(while: { $0 != 0 }), as: UTF8.self)
+                let rawLength = data.readUInt32LE(at: cursor + propertyNameSize)
+                let realLength = Int(rawLength & 0x7FFF_FFFF)
+                let valueOffset = cursor + propertyHeaderSize
+                if name == "name" { nodeName = String(decoding: data[data.startIndex + valueOffset..<data.startIndex + valueOffset + realLength].prefix(while: { $0 != 0 }), as: UTF8.self) }
+                if realLength == 4, valueOffset + 4 <= data.count {
+                    let value = data.readUInt32LE(at: valueOffset)
+                    if value == 0 {
+                        print("ZERO4PROP: \((path + [nodeName]).joined(separator: "/"))/\(name)")
+                    }
+                }
+                cursor = valueOffset + ((realLength + 3) & ~3)
+            }
+            for _ in 0..<nChildren {
+                guard let end = walk(offset: cursor, path: path + [nodeName]) else { return nil }
+                cursor = end
+            }
+            return cursor
+        }
+        _ = walk(offset: 0, path: [])
     }
 }
