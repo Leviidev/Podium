@@ -556,6 +556,19 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[2], 0x7856_3412)
     }
 
+    func testBfiInsertsBitFieldRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE7D3_0812, // bfi r0, r2, #0x10, #4 -- real word from the actual kernel
+        ])
+        cpu.registers[0] = 0xFFFF_FFFF
+        cpu.registers[2] = 0b1010
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Bits [19:16] replaced with r2's low 4 bits (0b1010); rest of r0 untouched.
+        XCTAssertEqual(cpu.registers[0], 0xFFFA_FFFF)
+    }
+
     func testClzCountsLeadingZerosRealKernelWord() {
         let cpu = makeCPU(program: [
             0xE16F_2F12, // clz r2, r2 -- real word from the actual kernel

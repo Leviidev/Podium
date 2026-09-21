@@ -313,6 +313,26 @@ struct RevInstruction: Equatable {
     let rm: Int
 }
 
+/// `BFI Rd, Rn, #lsb, #width` / `BFC Rd, #lsb, #width` (ARM state):
+/// copies `width` low bits of `Rn` into `Rd` starting at bit `lsb`,
+/// leaving the rest of `Rd` untouched — `BFC` is the same encoding with
+/// `Rn == 1111` (no source register field is actually read; those bits
+/// are architecturally just cleared to zero, not filled with `R15`'s
+/// value, hence `sourceRegister: nil` rather than `15`). Not part of
+/// ARMv6's other "media instructions" (parallel add/sub, `REV`) but
+/// shares that same bits[27:25]==011,bit4==1 decode gate — bits[27:21]
+/// == `0b0111110` (`SBFX`'s sibling at `0b0111101`/`0b0111010` isn't
+/// decoded). `width = msb - lsb + 1`, where `msb`/`lsb` are the real
+/// word's own field names. Verified against a real `bfi r0, r2, #0x10,
+/// #4` word from the actual kernel. Doesn't affect flags.
+struct BitFieldInsertInstruction: Equatable {
+    let condition: ARMCondition
+    let rd: Int
+    let sourceRegister: Int?
+    let lsb: Int
+    let width: Int
+}
+
 enum ARMInstruction: Equatable {
     case dataProcessing(DataProcessingInstruction)
     case branch(BranchInstruction)
@@ -327,6 +347,7 @@ enum ARMInstruction: Equatable {
     case coprocessorRegisterTransfer(CoprocessorRegisterTransferInstruction)
     case changeProcessorState(ChangeProcessorStateInstruction)
     case uqsub8(UQSub8Instruction)
+    case bitFieldInsert(BitFieldInsertInstruction)
     case rev(RevInstruction)
     case clz(ClzInstruction)
     case loadExclusive(LoadExclusiveInstruction)

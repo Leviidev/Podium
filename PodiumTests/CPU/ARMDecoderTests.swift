@@ -136,6 +136,30 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rm, 2)
     }
 
+    func testDecodesBfiFromRealKernel() {
+        // bfi r0, r2, #0x10, #4 — from the real kernel at 0x8007dca4,
+        // confirmed via Capstone.
+        guard case .bitFieldInsert(let instr) = ARMDecoder.decode(0xE7D3_0812) else {
+            return XCTFail("Expected bitFieldInsert")
+        }
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertEqual(instr.sourceRegister, 2)
+        XCTAssertEqual(instr.lsb, 16)
+        XCTAssertEqual(instr.width, 4)
+    }
+
+    func testDecodesBfcAsBitFieldInsertWithNoSourceRegister() {
+        // Synthetic word with Rn == 1111 (BFC): same shape as the real
+        // BFI word above but with bits[3:0] set to 0b1111.
+        guard case .bitFieldInsert(let instr) = ARMDecoder.decode(0xE7D3_081F) else {
+            return XCTFail("Expected bitFieldInsert")
+        }
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertNil(instr.sourceRegister)
+        XCTAssertEqual(instr.lsb, 16)
+        XCTAssertEqual(instr.width, 4)
+    }
+
     func testDecodesClzFromRealKernel() {
         // clz r2, r2 — from the real kernel at 0x80089be8, confirmed
         // via Capstone.

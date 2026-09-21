@@ -223,6 +223,10 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeRev(instr)
 
+        case .bitFieldInsert(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeBitFieldInsert(instr)
+
         case .clz(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeClz(instr)
@@ -368,6 +372,16 @@ final class ARMv7CPU: CPU {
 
     private func executeRev(_ instr: RevInstruction) {
         registers[instr.rd] = registers[instr.rm].byteSwapped
+    }
+
+    /// `BFI`/`BFC`: doesn't affect flags. `sourceRegister == nil`
+    /// (`BFC`) inserts zero, matching real ARM semantics rather than
+    /// reading `R15`'s value.
+    private func executeBitFieldInsert(_ instr: BitFieldInsertInstruction) {
+        let sourceValue = instr.sourceRegister.map { registers[$0] } ?? 0
+        let mask: UInt32 = instr.width >= 32 ? 0xFFFF_FFFF : (UInt32(1) << instr.width) - 1
+        let shiftedMask = mask << instr.lsb
+        registers[instr.rd] = (registers[instr.rd] & ~shiftedMask) | ((sourceValue & mask) << instr.lsb)
     }
 
     private func executeClz(_ instr: ClzInstruction) {

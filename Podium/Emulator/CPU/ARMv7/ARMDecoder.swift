@@ -300,11 +300,12 @@ enum ARMDecoder {
     }
 
     /// ARMv6's "media instructions" space (bits[27:25]==011, bit4==1).
-    /// Only `UQSUB8` and `REV` are decoded — see their doc comments —
-    /// via bits[27:20] == 0b01100110 (parallel add/sub, unsigned,
-    /// saturating) with bits[7:5] == 0b111 (the SUB8 op2) for `UQSUB8`,
-    /// or bits[27:20] == 0b01101011 with bits[7:4] == 0b0011 for `REV`;
-    /// everything else in this large space is `.unsupported`.
+    /// `UQSUB8`, `REV`, and `BFI`/`BFC` are decoded — see their doc
+    /// comments — via bits[27:20] == 0b01100110 (parallel add/sub,
+    /// unsigned, saturating) with bits[7:5] == 0b111 (the SUB8 op2) for
+    /// `UQSUB8`, bits[27:20] == 0b01101011 with bits[7:4] == 0b0011 for
+    /// `REV`, or bits[27:21] == 0b0111110 for `BFI`/`BFC`; everything
+    /// else in this large space is `.unsupported`.
     private static func decodeMediaInstructions(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
         if word.bitField(27, 20) == 0b0110_0110, word.bitField(7, 5) == 0b111, word.bitField(11, 8) == 0b1111 {
             return .uqsub8(UQSub8Instruction(
@@ -314,6 +315,24 @@ enum ARMDecoder {
         if word.bitField(27, 20) == 0b0110_1011, word.bitField(11, 8) == 0b1111, word.bitField(7, 4) == 0b0011,
            word.bitField(19, 16) == 0b1111 {
             return .rev(RevInstruction(condition: condition, rd: Int(word.bitField(15, 12)), rm: Int(word.bitField(3, 0))))
+        }
+        if word.bitField(27, 21) == 0b0111110 {
+            // BFI/BFC: verified against a real `bfi r0, r2, #0x10, #4`
+            // word from the actual kernel (see `BitFieldInsertInstruction`'s
+            // doc comment).
+            let msb = word.bitField(20, 16)
+            let lsb = word.bitField(11, 7)
+            guard msb >= lsb else {
+                return .unsupported(rawWord: word)
+            }
+            let rn = word.bitField(3, 0)
+            return .bitFieldInsert(BitFieldInsertInstruction(
+                condition: condition,
+                rd: Int(word.bitField(15, 12)),
+                sourceRegister: rn == 0b1111 ? nil : Int(rn),
+                lsb: Int(lsb),
+                width: Int(msb - lsb + 1)
+            ))
         }
         return .unsupported(rawWord: word)
     }
