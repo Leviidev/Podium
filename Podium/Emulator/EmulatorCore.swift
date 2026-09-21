@@ -173,7 +173,16 @@ final class EmulatorCore {
         )
         do {
             try memory.writeBytes(bootArgs, at: bootArgsAddress)
-            if let deviceTree {
+            if var deviceTree {
+                // The shipped device tree is the unpopulated IPSW
+                // template — iBoot never ran to patch in real
+                // clock/serial data. A handful of clock properties, if
+                // left at their shipped `0`, make the real kernel
+                // dereference that `0` as a pointer (a genuine quirk of
+                // how a Thumb IT block's flags interact here — see
+                // DeviceTreePatcher's doc comment). This only makes
+                // that pointer valid; it doesn't fabricate a frequency.
+                DeviceTreePatcher.patchClockPlaceholders(&deviceTree, guestBaseAddress: deviceTreeAddress)
                 try memory.writeBytes(deviceTree, at: deviceTreeAddress)
                 appendLog("Device tree written at 0x\(deviceTreeAddress.hexString8) (\(Int64(deviceTree.count).formattedByteCount)).")
             }

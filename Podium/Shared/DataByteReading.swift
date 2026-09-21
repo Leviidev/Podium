@@ -12,6 +12,13 @@ extension Data {
             | (UInt32(self[self.startIndex + offset + 3]) << 24)
     }
 
+    mutating func writeUInt32LE(_ value: UInt32, at offset: Int) {
+        self[self.startIndex + offset] = UInt8(value & 0xFF)
+        self[self.startIndex + offset + 1] = UInt8((value >> 8) & 0xFF)
+        self[self.startIndex + offset + 2] = UInt8((value >> 16) & 0xFF)
+        self[self.startIndex + offset + 3] = UInt8((value >> 24) & 0xFF)
+    }
+
     func readUInt32BE(at offset: Int) -> UInt32 {
         (UInt32(self[self.startIndex + offset]) << 24)
             | (UInt32(self[self.startIndex + offset + 1]) << 16)
