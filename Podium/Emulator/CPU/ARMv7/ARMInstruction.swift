@@ -167,6 +167,26 @@ struct HalfwordDataTransferInstruction: Equatable {
     let offset: HalfwordTransferOffset
 }
 
+/// `LDRD`/`STRD` (ARM state): transfers `Rt`/`Rt+1` to/from consecutive
+/// words at `[Rn, #offset]` — a different encoding from Thumb's
+/// `ThumbLoadStoreDualInstruction`, sharing this decoder's "extra
+/// load/store" bit4/bit7 gate with `HalfwordDataTransferInstruction`,
+/// but a genuine architectural quirk of that shared space: with
+/// `bit20 (L) == 0`, `SH == 10` means `LDRD` (a *load*, despite `L`
+/// being clear) and `SH == 11` means `STRD`, rather than following the
+/// normal L-bit convention `LDRH`/`STRH`/`LDRSB`/`LDRSH` use. Verified
+/// against a real `ldrd r0, r1, [r0]` word from the actual kernel.
+struct LoadStoreDualInstruction: Equatable {
+    let condition: ARMCondition
+    let isLoad: Bool
+    let preIndexed: Bool
+    let addOffset: Bool
+    let writeback: Bool
+    let rn: Int
+    let rt: Int
+    let offset: HalfwordTransferOffset
+}
+
 /// `MRS Rd, CPSR`: reads the whole CPSR into a register. SPSR access
 /// (the same instruction shape with R==1) isn't decoded — there's no
 /// exception entry/exit yet for a saved SPSR to matter to.
@@ -373,6 +393,7 @@ enum ARMInstruction: Equatable {
     case branchLinkExchangeImmediate(BranchLinkExchangeImmediateInstruction)
     case blockDataTransfer(BlockDataTransferInstruction)
     case halfwordDataTransfer(HalfwordDataTransferInstruction)
+    case loadStoreDual(LoadStoreDualInstruction)
     case loadStore(LoadStoreInstruction)
     case movWide(MovWideInstruction)
     case moveFromStatusRegister(MRSInstruction)

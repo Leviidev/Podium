@@ -13,19 +13,22 @@ import Foundation
 /// executable interworking branch to Thumb now that
 /// `ARMv7CPU+Thumb.swift` exists), single-register load/store
 /// (immediate *and* register offset), the halfword/signed-byte "extra
-/// load/store" instructions (`LDRH`/`STRH`/`LDRSB`/`LDRSH`), block data
-/// transfer (`LDM`/`STM`, ordinary form only), `MRS`/`MSR` (CPSR only),
-/// `MCR`/`MRC`, `CPS`, `PLD` (immediate), `CLZ`, `UQSUB8`/`REV` (two
-/// instructions decoded from ARMv6's much larger "media instructions"
-/// space — see `decodeMediaInstructions`'s doc comment), and the
-/// `DSB`/`DMB`/`ISB` barriers. Everything else — multiply, the `S`-bit
-/// block-transfer form, the rest of the media-instructions space
-/// (including `REV`'s own `REV16`/`REVSH` siblings), SPSR access, most of
-/// the coprocessor and unconditional-instruction-extension spaces, SWI —
-/// decodes to `.unsupported` rather than being misinterpreted. Every
-/// case added here so far was verified against real, disassembled
-/// instruction words from the actual iPod4,1 6.1.6 kernel, not written
-/// from specification alone.
+/// load/store" instructions (`LDRH`/`STRH`/`LDRSB`/`LDRSH`) and their
+/// `LDRD`/`STRD` sibling sharing that same space (see
+/// `LoadStoreDualInstruction`'s doc comment for the L-bit quirk that
+/// distinguishes them), `LDREX`/`STREX`, `MUL`, block data transfer
+/// (`LDM`/`STM`, ordinary form only), `MRS`/`MSR` (CPSR only), `MCR`/
+/// `MRC`, `CPS`, `PLD` (immediate), `CLZ`, `UQSUB8`/`REV`/`BFI`/`BFC`/
+/// `UBFX` (decoded from ARMv6's much larger "media instructions" space
+/// — see `decodeMediaInstructions`'s doc comment), and the `DSB`/`DMB`/
+/// `ISB` barriers. Everything else — `MLA` and the rest of multiply,
+/// the `S`-bit block-transfer form, the rest of the media-instructions
+/// space (including `REV`'s own `REV16`/`REVSH` siblings), SPSR access,
+/// most of the coprocessor and unconditional-instruction-extension
+/// spaces, SWI — decodes to `.unsupported` rather than being
+/// misinterpreted. Every case added here so far was verified against
+/// real, disassembled instruction words from the actual iPod4,1 6.1.6
+/// kernel, not written from specification alone.
 enum ARMDecoder {
     static func decode(_ word: UInt32) -> ARMInstruction {
         let condBits = word.bitField(31, 28)
@@ -119,13 +122,6 @@ enum ARMDecoder {
                 return .unsupported(rawWord: word)
             }
             let isLoad = word.bit(20)
-            let kind: HalfwordTransferKind = sh == 0b01 ? .unsignedHalfword : (sh == 0b10 ? .signedByte : .signedHalfword)
-            guard isLoad || kind == .unsignedHalfword else {
-                // STRSB/STRSH don't exist — SH==10/11 with L==0 is a
-                // reserved/undefined encoding, not silently treated as
-                // an ordinary halfword store.
-                return .unsupported(rawWord: word)
-            }
 
             let offset: HalfwordTransferOffset
             if word.bit(22) {
@@ -133,6 +129,27 @@ enum ARMDecoder {
             } else {
                 guard word.bitField(11, 8) == 0 else { return .unsupported(rawWord: word) }
                 offset = .register(Int(word.bitField(3, 0)))
+            }
+
+            if !isLoad, sh == 0b10 || sh == 0b11 {
+                // LDRD (sh==10) / STRD (sh==11) — see
+                // LoadStoreDualInstruction's doc comment on this L-bit
+                // quirk.
+                return .loadStoreDual(LoadStoreDualInstruction(
+                    condition: condition,
+                    isLoad: sh == 0b10,
+                    preIndexed: word.bit(24), addOffset: word.bit(23), writeback: word.bit(21),
+                    rn: Int(word.bitField(19, 16)), rt: Int(word.bitField(15, 12)), offset: offset
+                ))
+            }
+
+            let kind: HalfwordTransferKind = sh == 0b01 ? .unsignedHalfword : (sh == 0b10 ? .signedByte : .signedHalfword)
+            guard isLoad || kind == .unsignedHalfword else {
+                // STRSB/STRSH don't exist — SH==10/11 with L==0 is
+                // handled as LDRD/STRD above; any other reserved
+                // combination isn't silently treated as an ordinary
+                // halfword store.
+                return .unsupported(rawWord: word)
             }
 
             return .halfwordDataTransfer(HalfwordDataTransferInstruction(

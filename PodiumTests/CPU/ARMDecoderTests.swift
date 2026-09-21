@@ -213,6 +213,18 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rn, 12)
     }
 
+    func testDecodesLdrdFromRealKernel() {
+        // ldrd r0, r1, [r0] — from the real kernel at 0x8027c224.
+        guard case .loadStoreDual(let instr) = ARMDecoder.decode(0xE1C0_00D0) else {
+            return XCTFail("Expected loadStoreDual")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertEqual(instr.rn, 0)
+        XCTAssertEqual(instr.rt, 0)
+        XCTAssertTrue(instr.preIndexed)
+        XCTAssertEqual(instr.offset, .immediate(0))
+    }
+
     func testDecodesLoadWordImmediateOffset() {
         // LDR r0, [r1, #4]
         guard case .loadStore(let instr) = ARMDecoder.decode(0xE591_0004) else {
@@ -476,14 +488,17 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.offset, .immediate(2))
     }
 
-    func testStoreWithSignedKindIsUnsupported() {
-        // STRSB/STRSH don't exist — SH==10 (signedByte) with L==0
-        // (store) is a reserved encoding, not an ordinary halfword store.
-        let word: UInt32 = 0xE1C0_10D2 // same shape as the real strh, but SH=10 instead of 01
+    func testRegisterOffsetHalfwordWithNonzeroHighNibbleIsUnsupported() {
+        // The register-offset "extra load/store" form (I==0) requires
+        // bits[11:8]==0 (those bits only carry meaning for the
+        // immediate form's high nibble) — a real STRH shape but with
+        // that nibble nonzero is a reserved encoding, not silently
+        // treated as an ordinary register-offset store.
+        let word: UInt32 = 0xE180_11B2 // same shape as a real register-offset strh, but bits[11:8]=1
         if case .unsupported = ARMDecoder.decode(word) {
             // expected
         } else {
-            XCTFail("Expected .unsupported for a store with a signed SH field")
+            XCTFail("Expected .unsupported for a register-offset extra-load-store with a nonzero high nibble")
         }
     }
 

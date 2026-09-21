@@ -594,6 +594,21 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 42)
     }
 
+    func testLdrdLoadsConsecutiveWordsRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE1C0_00D0, // ldrd r0, r1, [r0] -- real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[0] = 16
+        let memory = cpu.memory as! FlatPhysicalMemory
+        try! memory.writeWord32(0x1111_1111, at: 16)
+        try! memory.writeWord32(0x2222_2222, at: 20)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0x1111_1111)
+        XCTAssertEqual(cpu.registers[1], 0x2222_2222)
+    }
+
     func testClzCountsLeadingZerosRealKernelWord() {
         let cpu = makeCPU(program: [
             0xE16F_2F12, // clz r2, r2 -- real word from the actual kernel

@@ -196,6 +196,10 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeHalfwordDataTransfer(instr)
 
+        case .loadStoreDual(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeLoadStoreDual(instr)
+
         case .movWide(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeMovWide(instr)
@@ -702,6 +706,49 @@ final class ARMv7CPU: CPU {
             if instr.writeback {
                 registers[instr.rn] = offsetAddress
             }
+        } else {
+            registers[instr.rn] = offsetAddress
+        }
+    }
+
+    /// `LDRD`/`STRD` (ARM state): transfers `Rt`/`Rt+1` to/from
+    /// consecutive words. `rt2 = rt + 1` (never `PC`, per the real
+    /// architecture's `Rt<0>==0` constraint — not separately checked
+    /// here since no confirmed real word has violated it).
+    private func executeLoadStoreDual(_ instr: LoadStoreDualInstruction) {
+        let base = operandValue(for: instr.rn)
+        let offsetValue: UInt32
+        switch instr.offset {
+        case .immediate(let value):
+            offsetValue = value
+        case .register(let rm):
+            offsetValue = operandValue(for: rm)
+        }
+        let offsetAddress = instr.addOffset ? base &+ offsetValue : base &- offsetValue
+        let transferAddress = instr.preIndexed ? offsetAddress : base
+        let rt2 = instr.rt + 1
+
+        do {
+            let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
+            let secondAddress = transferAddress &+ 4
+            let secondPhysicalAddress = try translatedAddress(secondAddress, access: instr.isLoad ? .read : .write)
+            if instr.isLoad {
+                registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+                registers[rt2] = try memory.readWord32(at: secondPhysicalAddress)
+            } else {
+                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+                try memory.writeWord32(registers[rt2], at: secondPhysicalAddress)
+            }
+        } catch let memoryError as MemoryAccessError {
+            lastError = .memoryFault(memoryError, address: transferAddress)
+            return
+        } catch {
+            lastError = .memoryFault(.unmappedAddress(transferAddress), address: transferAddress)
+            return
+        }
+
+        if instr.preIndexed {
+            if instr.writeback { registers[instr.rn] = offsetAddress }
         } else {
             registers[instr.rn] = offsetAddress
         }
