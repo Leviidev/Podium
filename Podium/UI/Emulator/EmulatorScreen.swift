@@ -8,12 +8,24 @@ struct EmulatorScreen: View {
         firmwareLibrary.activeFirmware
     }
 
+    /// The real `GuestFramebuffer` once the emulator is actually active,
+    /// so there's something in guest memory worth drawing — the honest
+    /// placeholder otherwise, exactly as before.
+    @ViewBuilder
+    private var framebufferView: some View {
+        if emulatorCore.status.isActive, let source = emulatorCore.framebufferSource {
+            GuestFramebufferView(source: source)
+        } else {
+            PlaceholderFramebufferView(statusLabel: emulatorCore.status.label)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 20) {
             Spacer(minLength: 12)
 
             GeometryReader { proxy in
-                PlaceholderFramebufferView(statusLabel: emulatorCore.status.label)
+                framebufferView
                     .contentShape(Rectangle())
                     .gesture(
                         SpatialTapGesture()

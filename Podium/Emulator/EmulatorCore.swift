@@ -23,6 +23,7 @@ final class EmulatorCore {
     private(set) var log: [EmulatorLogEntry] = []
     private(set) var cpu: CPU?
     private(set) var memory: MemoryBus?
+    private(set) var framebufferSource: FramebufferSource?
     private var segmentedBus: SegmentedMemoryBus?
 
     let audioOutput: AudioOutput
@@ -40,11 +41,33 @@ final class EmulatorCore {
     /// documentation (Apple doesn't publish this).
     static let physicalMemoryBaseAddress: UInt32 = 0x8000_0000
 
+    /// The iPod touch 4's actual panel resolution (Section 9 of the
+    /// project spec) and the framebuffer's assumed pixel format — 32
+    /// bits/pixel, no rotation (`BootVideoInfo.depth`'s low byte).
+    /// Nothing confirms this is the exact byte order the real kernel
+    /// draws in; `GuestFramebuffer` copies whatever bytes are actually
+    /// there rather than assuming this guess is correct.
+    static let framebufferWidth = 960
+    static let framebufferHeight = 640
+    private static let framebufferBytesPerPixel = 4
+    private static let framebufferRowBytes = UInt32(framebufferWidth * framebufferBytesPerPixel)
+    private static let framebufferSize = framebufferRowBytes * UInt32(framebufferHeight)
+    /// Reserved at the very top of the 256 MB RAM window, well above
+    /// where the kernel image/device tree/`pram` region load from the
+    /// bottom (see `attemptBoot`) — disjoint from that bottom-up layout
+    /// by construction, not by coincidence.
+    static let framebufferPhysicalAddress: UInt32 = physicalMemoryBaseAddress &+ UInt32(physicalMemorySize) &- framebufferSize
+
     /// Caps a single boot attempt so unsupported guest code halts the
     /// attempt instead of either running forever or never giving the JIT
     /// path (which only engages inside `run`, not single `step`s) a
-    /// chance to actually compile anything.
-    private static let maxBootUnits = 200_000
+    /// chance to actually compile anything. Raised well past the ~200K
+    /// instructions real early-boot code needs — the interpreter has run
+    /// this same kernel clean through 50M+ instructions in
+    /// `_ManualRealFirmwareVerification` — so a real device's JIT gets a
+    /// genuine chance to reach further into boot, not just past the
+    /// first few kernel-init instruction groups.
+    private static let maxBootUnits = 20_000_000
 
     private static let logCapacity = 200
 
@@ -90,6 +113,12 @@ final class EmulatorCore {
         memory = ram
         segmentedBus = bus
         cpu = armCPU
+        framebufferSource = GuestFramebuffer(
+            memory: ram,
+            baseAddress: Self.framebufferPhysicalAddress,
+            pixelWidth: Self.framebufferWidth,
+            pixelHeight: Self.framebufferHeight
+        )
         status = .ready
         let baseHex = "0x" + Self.physicalMemoryBaseAddress.hexString8
         appendLog("ARMv7 interpreter core online (with JIT compilation for eligible instruction sequences). \(Int64(Self.physicalMemorySize).formattedByteCount) physical memory mapped at \(baseHex).")
@@ -218,13 +247,27 @@ final class EmulatorCore {
         }
 
         let topOfKernelData = (pramAddress + pramSize + 0x3FFF) & ~UInt32(0x3FFF)
+        // v_display: iBoot's convention on real hardware is 1 for the
+        // main LCD — unconfirmed against this specific kernel's own
+        // code (unlike every other field here), so this is a real
+        // physical framebuffer either way; only this one field's exact
+        // value is a reasonable default rather than a traced fact.
+        let video = BootVideoInfo(
+            baseAddress: Self.framebufferPhysicalAddress,
+            display: 1,
+            rowBytes: Self.framebufferRowBytes,
+            width: UInt32(Self.framebufferWidth),
+            height: UInt32(Self.framebufferHeight),
+            depth: 32
+        )
         let bootArgs = BootArgsBuilder.build(
             virtBase: Self.physicalMemoryBaseAddress,
             physBase: Self.physicalMemoryBaseAddress,
             memSize: UInt32(Self.physicalMemorySize),
             topOfKernelData: topOfKernelData,
             deviceTreeP: deviceTree != nil ? deviceTreeAddress : 0,
-            deviceTreeLength: deviceTreeLength
+            deviceTreeLength: deviceTreeLength,
+            video: video
         )
         do {
             try memory.writeBytes(bootArgs, at: bootArgsAddress)

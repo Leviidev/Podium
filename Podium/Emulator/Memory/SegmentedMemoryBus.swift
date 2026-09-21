@@ -76,6 +76,10 @@ final class SegmentedMemoryBus: MemoryBus {
         try dispatch(address) { try $0.writeBytes(bytes, at: address) }
     }
 
+    func readBytes(_ count: Int, at address: UInt32) throws -> Data {
+        try dispatch(address) { try $0.readBytes(count, at: address) }
+    }
+
     /// Tries each region in order, since a region only knows its own
     /// bounds (there's no separate range table to keep in sync) —
     /// whichever one doesn't throw `unmappedAddress` for this address

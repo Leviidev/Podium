@@ -14,6 +14,20 @@ import Foundation
 /// `ldr r9, [r0, #4]` then `ldr r8, [r0, #8]` then `ldr r10, [r0, #0xc]`
 /// read exactly `virtBase`, `physBase`, then `memSize` at this struct's
 /// offsets 4, 8, and 12.
+/// `Boot_Video` (`pexpert/pexpert/arm/boot.h`): the framebuffer descriptor
+/// iBoot normally hands the kernel — six `uint32_t` fields, in this exact
+/// order, at `boot_args` offset 20. `depth` packs bits-per-pixel in its
+/// low byte (`kBootVideoDepthMask`) with an optional rotate encoding above
+/// it (`kBootVideoDepthRotateMask`, unused here — 0 means no rotation).
+struct BootVideoInfo {
+    let baseAddress: UInt32
+    let display: UInt32
+    let rowBytes: UInt32
+    let width: UInt32
+    let height: UInt32
+    let depth: UInt32
+}
+
 enum BootArgsBuilder {
     /// sizeof(boot_args) on 32-bit ARM: 2+2+4+4+4+4 (header fields) +
     /// 24 (Boot_Video, six uint32_t) + 4 (machineType) + 4
@@ -43,6 +57,7 @@ enum BootArgsBuilder {
         topOfKernelData: UInt32,
         deviceTreeP: UInt32,
         deviceTreeLength: UInt32,
+        video: BootVideoInfo? = nil,
         commandLine: String = ""
     ) -> Data {
         var data = Data(count: structSize)
@@ -64,8 +79,17 @@ enum BootArgsBuilder {
         writeU32(physBase, at: 8)
         writeU32(memSize, at: 12)
         writeU32(topOfKernelData, at: 16)
-        // Boot_Video at offset 20 (24 bytes) is left zeroed: no
-        // framebuffer to describe yet (Milestone 5 territory).
+        // Boot_Video at offset 20 (24 bytes). Left zeroed when no video
+        // is described — an honest "no display" rather than a guessed
+        // address the kernel would fault trying to draw through.
+        if let video {
+            writeU32(video.baseAddress, at: 20)
+            writeU32(video.display, at: 24)
+            writeU32(video.rowBytes, at: 28)
+            writeU32(video.width, at: 32)
+            writeU32(video.height, at: 36)
+            writeU32(video.depth, at: 40)
+        }
         writeU32(0, at: 44) // machineType — not modeled; 0 is "unknown", not a wrong guess dressed up as a real value.
         writeU32(deviceTreeP, at: 48)
         writeU32(deviceTreeLength, at: 52)

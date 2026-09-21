@@ -2,11 +2,14 @@ import Foundation
 
 /// Produces the guest's display contents for the renderer to draw.
 ///
-/// No implementation exists yet — there is no guest writing pixels
-/// anywhere. `Rendering/PlaceholderFramebufferView` draws an honest
-/// placeholder instead of calling this. Once a real display controller
-/// exists, it will publish frames sized to the iPod touch 4's native
-/// 960×640 panel.
+/// `GuestFramebuffer` is the real implementation: it reads whatever the
+/// guest kernel has actually written into the physical memory region
+/// `boot_args.Video` points at. There's still no dedicated display
+/// *controller* (no LCD peripheral registers, no vsync, no mode-setting)
+/// — this only reads pixels the guest's own kernel/console code decided
+/// to draw on its own, which may be nothing, garbage, or a real frame
+/// depending how far boot actually got. Sized to the iPod touch 4's
+/// native 960×640 panel.
 protocol FramebufferSource: AnyObject {
     var pixelWidth: Int { get }
     var pixelHeight: Int { get }

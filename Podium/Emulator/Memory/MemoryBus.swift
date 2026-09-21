@@ -23,6 +23,12 @@ protocol MemoryBus: AnyObject {
     /// `writeByte` in a loop, correct but not what you want for
     /// megabyte-sized transfers like loading a kernel image.
     func writeBytes(_ bytes: Data, at address: UInt32) throws
+
+    /// Reads a contiguous run of `count` bytes starting at `address`.
+    /// Conformers may override this for a bulk copy; the default just
+    /// calls `readByte` in a loop, correct but not what you want for a
+    /// framebuffer-sized read every frame.
+    func readBytes(_ count: Int, at address: UInt32) throws -> Data
 }
 
 extension MemoryBus {
@@ -30,5 +36,13 @@ extension MemoryBus {
         for (offset, byte) in bytes.enumerated() {
             try writeByte(byte, at: address &+ UInt32(offset))
         }
+    }
+
+    func readBytes(_ count: Int, at address: UInt32) throws -> Data {
+        var bytes = Data(capacity: count)
+        for offset in 0..<count {
+            bytes.append(try readByte(at: address &+ UInt32(offset)))
+        }
+        return bytes
     }
 }
