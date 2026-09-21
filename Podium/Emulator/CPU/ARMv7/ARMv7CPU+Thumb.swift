@@ -176,6 +176,8 @@ extension ARMv7CPU {
             executeThumbExtend(instr)
         case .extendWide(let instr):
             executeThumbExtendWide(instr)
+        case .shiftRegister(let instr):
+            executeThumbShiftRegister(instr)
         case .memoryBarrier:
             // A real no-op: see ThumbInstruction.memoryBarrier's doc comment.
             break
@@ -324,6 +326,17 @@ extension ARMv7CPU {
 
     /// `SXTH.W`/`UXTH.W`/`SXTB.W`/`UXTB.W`: like `executeThumbExtend`
     /// but with `Rm` first rotated right by `rotate*8` bits.
+    /// `LSL`/`LSR`/`ASR`/`ROR` (register-controlled): doesn't affect
+    /// flags — see `ThumbShiftRegisterInstruction`'s doc comment for
+    /// why.
+    private func executeThumbShiftRegister(_ instr: ThumbShiftRegisterInstruction) {
+        let amount = registers[instr.rm] & 0xFF
+        let result = ShifterOperand.applyRegisterSpecifiedShift(
+            instr.shiftType, to: registers[instr.rn], by: amount, currentCarry: cpsr.carry
+        )
+        registers[instr.rd] = result.value
+    }
+
     private func executeThumbExtendWide(_ instr: ThumbExtendWideInstruction) {
         let rotateBits = instr.rotate * 8
         let rotated = rotateBits == 0

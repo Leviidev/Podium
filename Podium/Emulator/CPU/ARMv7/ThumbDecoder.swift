@@ -30,23 +30,23 @@ import Foundation
 /// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDRSB`
 /// (immediate, T3 and T4), `LDM`/
 /// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), `LDRD`/
-/// `STRD` (immediate), `UMULL`, `MLA`, `SXTH.W`/`UXTH.W`/`SXTB.W`/
-/// `UXTB.W` (the `0xFA`-prefixed wide forms of the 16-bit extend
-/// instructions above, no-accumulate shape only — see
-/// `decode32ExtendOrShift`'s doc comment), `DSB`/`DMB`/`ISB` (Thumb-2
-/// forms, real no-ops exactly like ARM state's own barriers), and
-/// `MCR`/`MRC` (reusing ARM state's exact field layout — see
-/// `decode32Coprocessor`'s doc comment). Everything else — PC-relative
-/// `LDR` (format 6),
+/// `STRD` (immediate), `UMULL`, `MLA`, `UXTB.W` (the `0xFA`-prefixed
+/// wide form of the 16-bit `UXTB` above, no-accumulate shape only —
+/// see `decode32ExtendOrShift`'s doc comment), `LSL`/`LSR`/`ASR`/`ROR`
+/// (Thumb-2 register-controlled-shift form, sharing that same `0xFA`
+/// space), `DSB`/`DMB`/`ISB` (Thumb-2 forms, real no-ops exactly like
+/// ARM state's own barriers), and `MCR`/`MRC` (reusing ARM state's
+/// exact field layout — see `decode32Coprocessor`'s doc comment).
+/// Everything else — PC-relative `LDR` (format 6),
 /// `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2 wide form and `MLS` (`MLA`'s
 /// siblings), `SMULL`/`UMLAL`/`SMLAL`/`SDIV`/`UDIV` (`UMULL`'s
 /// siblings), `LDREX`/`STREX` (Thumb-2 forms — `LDRD`/`STRD`'s
 /// siblings in that same space), the rest of the "plain binary
 /// immediate" op table (`SUBW`, its own `Rn==1111` `ADR` alias, `SSAT`/
-/// `SBFX`/`USAT`), the register-controlled-shift instructions and the
-/// accumulate (`SXTAH`/etc.) extend forms sharing `0xFA` with the
-/// decoded extend forms, the rest of the coprocessor space (`CDP`/
-/// `LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
+/// `SBFX`/`USAT`), `SXTH.W`/`UXTH.W`/`SXTB.W` and the accumulate
+/// (`UXTAB`/etc.) extend forms sharing `0xFA` with `UXTB.W`, the rest
+/// of the coprocessor space (`CDP`/`LDC`/`STC`), SIMD/VFP — decodes to
+/// `.unsupported`.
 enum ThumbDecoder {
     /// Whether `firstHalfword` opens a 32-bit Thumb-2 instruction (in
     /// which case the caller must fetch a second halfword before
@@ -507,19 +507,34 @@ enum ThumbDecoder {
     /// aren't, since no real word has confirmed either yet. Verified
     /// against a real `uxtb.w r1, r10` word from the actual kernel.
     private static func decode32ExtendOrShift(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard hw0.bitField16(3, 0) == 0b1111, hw1.bitField16(15, 12) == 0b1111, hw1.bitField16(7, 4) == 0b1000 else {
+        // bit6 of hw0's op nibble (bits[7:4]) is the real discriminator
+        // between the two sub-families sharing this space — confirmed
+        // by two real words landing on either side of it (`lsl.w`,
+        // bits[7:4]==0b0000, bit6 clear; `uxtb.w`, bits[7:4]==0b0101,
+        // bit6 set). An earlier version of this function guessed at
+        // three more extend op values (0b0000/0b0001/0b0100) by
+        // pattern-completing the ARM ARM's table from `uxtb.w` alone —
+        // wrong, since 0b0000 is actually `lsl.w`'s op, not `sxth.w`'s;
+        // only the one value a real word has actually confirmed stays
+        // decoded.
+        if !hw0.bit16(6) {
+            // Register-controlled shift: bits[7:6]==00, bits[5:4] is
+            // the `ShiftType` (matching its raw values directly).
+            // Verified against a real `lsl.w r2, r5, r2` word from the
+            // actual kernel.
+            guard hw1.bitField16(15, 12) == 0b1111, hw1.bitField16(7, 4) == 0, let shiftType = ShiftType(rawValue: UInt8(hw0.bitField16(5, 4))) else {
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+            }
+            return .shiftRegister(ThumbShiftRegisterInstruction(
+                shiftType: shiftType, rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
+            ))
+        }
+        guard hw0.bitField16(3, 0) == 0b1111, hw1.bitField16(15, 12) == 0b1111, hw1.bitField16(7, 4) == 0b1000,
+              hw0.bitField16(7, 4) == 0b0101 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
-        let kind: ThumbExtendKind
-        switch hw0.bitField16(7, 4) {
-        case 0b0000: kind = .signedHalfword
-        case 0b0001: kind = .unsignedHalfword
-        case 0b0100: kind = .signedByte
-        case 0b0101: kind = .unsignedByte
-        default: return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
-        }
         return .extendWide(ThumbExtendWideInstruction(
-            kind: kind, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
+            kind: .unsignedByte, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
         ))
     }
 

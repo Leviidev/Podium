@@ -165,6 +165,17 @@ final class ThumbDecoderTests: XCTestCase {
         }
     }
 
+    func testDecodesLslRegisterWideFromRealKernel() {
+        // lsl.w r2, r5, r2 — from the real kernel at 0x802b94ec.
+        guard case .shiftRegister(let instr) = ThumbDecoder.decode(0xfa05, 0xf202) else {
+            return XCTFail("Expected shiftRegister")
+        }
+        XCTAssertEqual(instr.shiftType, .lsl)
+        XCTAssertEqual(instr.rd, 2)
+        XCTAssertEqual(instr.rn, 5)
+        XCTAssertEqual(instr.rm, 2)
+    }
+
     func testDecodesBicImmediateFromRealKernel() {
         // bic r1, r1, #1 — from the real kernel at 0x802b8578.
         guard case .dataProcessingImmediate(let instr) = ThumbDecoder.decode(0xf021, 0x0101) else {

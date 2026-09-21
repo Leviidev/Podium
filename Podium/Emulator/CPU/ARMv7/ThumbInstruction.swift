@@ -188,15 +188,37 @@ struct ThumbExtendInstruction: Equatable {
     let rd: Int
 }
 
-/// `SXTH`/`UXTH`/`SXTB`/`UXTB` (Thumb-2, 32-bit "wide" forms): the
-/// `0xFA`-prefixed sibling of `ThumbExtendInstruction`'s 16-bit forms —
-/// needed for high registers (`r8`-`r14`) the 16-bit encoding can't
-/// reach, and adds an optional `ROR` (by `rotate*8` bits) applied to
-/// `Rm` before extracting. Only the no-accumulate shape (`Rn == 1111`)
-/// is decoded — `Rn` otherwise selects `SXTAH`/`UXTAH`/`SXTAB`/`UXTAB`
-/// (add `Rm`'s extended value to `Rn`), not decoded since no real word
-/// has confirmed it. Verified against a real `uxtb.w r1, r10` word from
-/// the actual kernel.
+/// `LSL`/`LSR`/`ASR`/`ROR` (Thumb-2, 32-bit register-controlled shift
+/// form): shifts `Rn` by the low byte of `Rm`, sharing this file's
+/// `0xFA`-prefixed space with the wide extend instructions above —
+/// bit 6 clear (vs. set for the extend forms) selects this family,
+/// with `hw0` bits[5:4] as the `ShiftType` (matching `ShiftType`'s own
+/// raw values: `00`=LSL, `01`=LSR, `10`=ASR, `11`=ROR). Reuses
+/// `ShifterOperand.applyRegisterSpecifiedShift`'s exact register-
+/// controlled-shift semantics (amount 0-255 used directly, no
+/// `#0`-means-`#32` immediate-encoding special case). Doesn't model
+/// flag-setting — no real word has confirmed whether/where an `S` bit
+/// lives in this encoding, and the one verified word (a real
+/// `lsl.w r2, r5, r2` from the actual kernel) has every candidate bit
+/// clear either way. Doesn't affect flags.
+struct ThumbShiftRegisterInstruction: Equatable {
+    let shiftType: ShiftType
+    let rd: Int
+    let rn: Int
+    let rm: Int
+}
+
+/// `UXTB` (Thumb-2, 32-bit "wide" form — `SXTH`/`UXTH`/`SXTB` share
+/// this same `kind`-tagged struct architecturally but aren't decoded,
+/// see `decode32ExtendOrShift`'s doc comment for why only `UXTB`'s
+/// exact op value is confirmed): the `0xFA`-prefixed sibling of
+/// `ThumbExtendInstruction`'s 16-bit forms — needed for high registers
+/// (`r8`-`r14`) the 16-bit encoding can't reach, and adds an optional
+/// `ROR` (by `rotate*8` bits) applied to `Rm` before extracting. Only
+/// the no-accumulate shape (`Rn == 1111`) is decoded — `Rn` otherwise
+/// selects `UXTAB` (add `Rm`'s extended value to `Rn`), not decoded
+/// since no real word has confirmed it. Verified against a real
+/// `uxtb.w r1, r10` word from the actual kernel.
 struct ThumbExtendWideInstruction: Equatable {
     let kind: ThumbExtendKind
     let rd: Int
@@ -498,6 +520,7 @@ enum ThumbInstruction: Equatable {
     case compareBranch(ThumbCompareBranchInstruction)
     case extend(ThumbExtendInstruction)
     case extendWide(ThumbExtendWideInstruction)
+    case shiftRegister(ThumbShiftRegisterInstruction)
     /// `DSB`/`DMB`/`ISB` (Thumb-2 forms): a real no-op here, exactly
     /// like ARM state's `ARMInstruction.memoryBarrier` — see that
     /// case's doc comment. Lives in the branch/misc space's

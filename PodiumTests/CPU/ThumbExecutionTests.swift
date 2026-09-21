@@ -506,6 +506,18 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 0xFFFF_F000)
     }
 
+    func testLslRegisterWideShiftsByRegisterAmountRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xfa05, 0xf202, // lsl.w r2, r5, r2, real word from the actual kernel
+        ])
+        cpu.registers[5] = 1
+        cpu.registers[2] = 4
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[2], 16) // 1 << 4
+    }
+
     func testUxtbWideZeroExtendsHighRegisterRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xfa5f, 0xf18a, // uxtb.w r1, r10, real word from the actual kernel
