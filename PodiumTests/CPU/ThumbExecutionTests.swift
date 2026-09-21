@@ -516,6 +516,26 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[5], 0x0FFF_FFFF)
     }
 
+    func testMovPcFromHiRegisterStaysInThumbEvenWithTargetBit0Clear() {
+        // mov pc, r5 -- real word from the actual kernel at 0x80020110,
+        // part of an ordinary compiled switch-statement jump table
+        // (adr.w r2,#table / add.w r5,r2,r6,lsl#2 / mov pc,r5, indexing
+        // into a table of b.w slots). Confirms the real-architecture
+        // fix: a hi-register MOV/ADD into PC, unlike BX, does NOT
+        // interwork -- it must stay in Thumb even though the jump
+        // table's own address (and so every slot address) isn't
+        // 4-byte aligned and has bit 0 clear.
+        let cpu = makeThumbCPU(program: [
+            0x46af, // mov pc, r5
+        ])
+        cpu.registers[5] = 0x80020112 // even address, bit 0 clear
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertTrue(cpu.cpsr.thumbState, "A hi-register MOV/ADD to PC must not interwork -- it stays in whatever state it was already in")
+        XCTAssertEqual(cpu.registers.pc, 0x80020112)
+    }
+
     func testAdrComputesPcRelativeAddressRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xf20f, 0x0216, // addw r2, pc, #0x16 (ADR), real word from the actual kernel, at address 0

@@ -332,14 +332,24 @@ extension ARMv7CPU {
         }
     }
 
-    /// Writing r15 from a hi-register `ADD`/`MOV` performs an
-    /// interworking branch on real ARMv7 (checking bit 0 the same way
-    /// `BX` does), rather than just relocating execution in the current
-    /// state — this is what lets position-independent code compute a
-    /// target with `add r0, pc, r1` and then `mov pc, r0`.
+    /// Writing r15 from a hi-register `ADD`/`MOV` is a plain
+    /// (non-interworking) branch, per the real ARMv7 architecture's
+    /// `ALUWritePC`/`BranchWritePC` pseudocode: only `BX`/`BLX`
+    /// (register), `POP {PC}`/`LDM ... PC`, and `LDR PC, [...]` use the
+    /// interworking `BXWritePC` (checking the target's bit 0 the way
+    /// `executeThumbBranchExchange` does) — a hi-register `MOV`/`ADD`
+    /// into `PC` while already in Thumb state always *stays* in Thumb,
+    /// regardless of the computed target's bit 0. Confirmed against a
+    /// real, ordinary compiled switch-statement jump table in the
+    /// actual kernel (`adr.w r2, #table` / `add.w r5, r2, r6, lsl #2` /
+    /// `mov pc, r5`, indexing into a table of `b.w` slots at `r2`,
+    /// itself not 4-byte aligned) that a bit-0 interworking check here
+    /// incorrectly flips the CPU to ARM state and starts executing
+    /// garbage, even though the whole function — table included — is
+    /// genuinely Thumb-only code; masking bit 0 without touching
+    /// `thumbState` fixes it.
     private func writeThumbResult(_ value: UInt32, to register: Int) {
         if register == Registers.pcIndex {
-            cpsr.thumbState = value.bit(0)
             registers.pc = value & ~UInt32(0b1)
         } else {
             registers[register] = value
