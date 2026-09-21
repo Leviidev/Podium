@@ -90,7 +90,7 @@ final class ARMv7CPUTests: XCTestCase {
     func testUnsupportedInstructionHaltsRunHonestly() {
         let cpu = makeCPU(program: [
             0xE3A0_0005, // MOV r0, #5 -- executes fine
-            0xE000_0090, // multiply-space encoding -- not implemented
+            0xE020_0090, // MLA encoding (multiply-accumulate) -- not implemented
             0xE3A0_00FF, // would set r0 to 0xFF if ever reached
         ])
         cpu.run()
@@ -99,7 +99,7 @@ final class ARMv7CPUTests: XCTestCase {
         guard case .unsupportedInstruction(let rawWord, let address) = cpu.lastError else {
             return XCTFail("Expected .unsupportedInstruction, got \(String(describing: cpu.lastError))")
         }
-        XCTAssertEqual(rawWord, 0xE000_0090)
+        XCTAssertEqual(rawWord, 0xE020_0090)
         XCTAssertEqual(address, 4)
     }
 
@@ -580,6 +580,18 @@ final class ARMv7CPUTests: XCTestCase {
         // Extract 10 bits starting at bit 3: all-ones source gives an
         // all-ones 10-bit result, zero-extended.
         XCTAssertEqual(cpu.registers[3], 0x3FF)
+    }
+
+    func testMulComputesProductRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE000_0493, // mul r0, r3, r4 -- real word from the actual kernel
+        ])
+        cpu.registers[3] = 6
+        cpu.registers[4] = 7
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 42)
     }
 
     func testClzCountsLeadingZerosRealKernelWord() {

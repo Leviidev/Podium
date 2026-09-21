@@ -173,6 +173,17 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.width, 10)
     }
 
+    func testDecodesMulFromRealKernel() {
+        // mul r0, r3, r4 — from the real kernel at 0x8007dd9c,
+        // confirmed via Capstone.
+        guard case .multiply(let instr) = ARMDecoder.decode(0xE000_0493) else {
+            return XCTFail("Expected multiply")
+        }
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertEqual(instr.rm, 3)
+        XCTAssertEqual(instr.rs, 4)
+    }
+
     func testDecodesClzFromRealKernel() {
         // clz r2, r2 — from the real kernel at 0x80089be8, confirmed
         // via Capstone.
@@ -256,12 +267,18 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.offset, .register(rm: Registers.lrIndex, shiftType: .lsl, shiftAmount: 0))
     }
 
-    func testMultiplyEncodingSpaceIsUnsupportedNotDataProcessing() {
-        let word: UInt32 = 0xE000_0090
+    func testMlaEncodingSpaceIsUnsupportedNotDataProcessing() {
+        // Same multiply-space shape as MUL (bits[27:22]==0, SH==00,
+        // bit7==1, bit4==1) but with the A (accumulate) bit set,
+        // selecting MLA — not decoded, unlike plain MUL (see
+        // testDecodesMulFromRealKernel), so this stays the boundary
+        // check that the multiply-space gate doesn't silently
+        // misdecode instructions of that space it hasn't confirmed.
+        let word: UInt32 = 0xE020_0090
         if case .unsupported = ARMDecoder.decode(word) {
             // expected
         } else {
-            XCTFail("Expected .unsupported for multiply-space encoding")
+            XCTFail("Expected .unsupported for MLA (multiply-accumulate) encoding")
         }
     }
 

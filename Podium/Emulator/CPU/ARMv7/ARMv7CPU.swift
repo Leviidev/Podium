@@ -231,6 +231,10 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeBitFieldExtract(instr)
 
+        case .multiply(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeMultiply(instr)
+
         case .clz(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeClz(instr)
@@ -393,6 +397,10 @@ final class ARMv7CPU: CPU {
     private func executeBitFieldExtract(_ instr: BitFieldExtractInstruction) {
         let mask: UInt32 = instr.width >= 32 ? 0xFFFF_FFFF : (UInt32(1) << instr.width) - 1
         registers[instr.rd] = (registers[instr.rn] >> instr.lsb) & mask
+    }
+
+    private func executeMultiply(_ instr: MultiplyInstruction) {
+        registers[instr.rd] = registers[instr.rm] &* registers[instr.rs]
     }
 
     private func executeClz(_ instr: ClzInstruction) {

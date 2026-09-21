@@ -106,6 +106,16 @@ enum ARMDecoder {
                         rt: Int(word.bitField(3, 0)), rn: Int(word.bitField(19, 16))
                     ))
                 }
+                if word.bitField(27, 22) == 0, !word.bit(21), word.bitField(15, 12) == 0 {
+                    // MUL (see MultiplyInstruction's doc comment). A
+                    // (bit21) selects MLA, not decoded here.
+                    return .multiply(MultiplyInstruction(
+                        condition: condition,
+                        rd: Int(word.bitField(19, 16)),
+                        rm: Int(word.bitField(3, 0)),
+                        rs: Int(word.bitField(11, 8))
+                    ))
+                }
                 return .unsupported(rawWord: word)
             }
             let isLoad = word.bit(20)

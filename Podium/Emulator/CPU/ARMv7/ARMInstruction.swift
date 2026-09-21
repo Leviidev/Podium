@@ -280,6 +280,22 @@ struct ClzInstruction: Equatable {
 /// already decoded there); disambiguated by the full bits[27:20]/
 /// [11:8]/[3:0] pattern, verified against a real `ldrex r0, [ip]` word
 /// from the actual kernel.
+/// `MUL Rd, Rm, Rs`: `Rd = Rm * Rs`, low 32 bits only. Lives in the
+/// multiply/extra-load-store space this decoder already carves
+/// `LDREX`/`STREX` out of (bits[27:22]==0, `SH`==00, bit7==1, bit4==1)
+/// — disambiguated from those by requiring bits[15:12]==0 (`MUL`'s
+/// fixed zero field, where `LDREX`/`STREX` instead have a real
+/// bits[27:20] opcode). `MLA` (the accumulate form, `A`==1) and the
+/// `S`-bit (flag-setting) aren't decoded — no real word has confirmed
+/// either yet. Verified against a real `mul r0, r3, r4` word from the
+/// actual kernel. Doesn't affect flags.
+struct MultiplyInstruction: Equatable {
+    let condition: ARMCondition
+    let rd: Int
+    let rm: Int
+    let rs: Int
+}
+
 struct LoadExclusiveInstruction: Equatable {
     let condition: ARMCondition
     let rt: Int
@@ -366,6 +382,7 @@ enum ARMInstruction: Equatable {
     case uqsub8(UQSub8Instruction)
     case bitFieldInsert(BitFieldInsertInstruction)
     case bitFieldExtract(BitFieldExtractInstruction)
+    case multiply(MultiplyInstruction)
     case rev(RevInstruction)
     case clz(ClzInstruction)
     case loadExclusive(LoadExclusiveInstruction)
