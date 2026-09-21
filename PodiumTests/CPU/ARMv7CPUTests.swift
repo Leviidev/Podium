@@ -345,6 +345,19 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers.pc, 16)
     }
 
+    func testBlxRegisterSetsLrAndBranches() {
+        let cpu = makeCPU(program: [
+            0xE3A0_0010, // MOV r0, #16 (word-aligned target)
+            0xE12F_FF30, // blx r0, real word from the actual kernel
+        ])
+        cpu.step() // MOV r0, #16
+        cpu.step() // blx r0
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers.lr, 8) // return address: instruction after blx
+        XCTAssertEqual(cpu.registers.pc, 16)
+    }
+
     func testBxWithBit0SetSwitchesToThumbState() {
         let cpu = makeCPU(program: [
             0xE3A0_E011, // MOV lr, #17     (bit0 set: requests Thumb)

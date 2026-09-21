@@ -85,9 +85,14 @@ struct BranchLinkExchangeImmediateInstruction: Equatable {
 /// switches to Thumb state if `Rm`'s bit 0 is set (that's the whole
 /// point of the name: Branch and *Exchange* instruction sets). Fully
 /// executable — see `ARMv7CPU.executeBranchExchange` — now that a real
-/// Thumb decoder exists to switch into.
+/// Thumb decoder exists to switch into. `link` covers `BLX` (register)
+/// too — identical encoding (`0x12FFF3` vs plain `BX`'s `0x12FFF1`,
+/// differing only in bits[7:4]) with `LR` additionally set to the
+/// return address, verified against a real `blx r0` word from the
+/// actual kernel.
 struct BranchExchangeInstruction: Equatable {
     let condition: ARMCondition
+    let link: Bool
     let rm: Int
 }
 

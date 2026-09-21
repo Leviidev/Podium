@@ -58,13 +58,17 @@ enum ARMDecoder {
     }
 
     private static func decodeDataProcessingBlock(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
-        // BX Rm: bits[27:4] are a fixed pattern (0x12FFF1) that would
-        // otherwise misdecode as a malformed MSR (op TEQ, bit21 set) —
-        // its own guard already rejects that shape as `.unsupported`
-        // rather than misinterpreting it, but checking for the real,
-        // fixed BX encoding explicitly here decodes it correctly instead.
-        if word.bitField(27, 4) == 0x12_FFF1 {
-            return .branchExchange(BranchExchangeInstruction(condition: condition, rm: Int(word.bitField(3, 0))))
+        // BX Rm / BLX Rm: bits[27:4] are a fixed pattern (0x12FFF1 for
+        // BX, 0x12FFF3 for BLX — see BranchExchangeInstruction's doc
+        // comment) that would otherwise misdecode as a malformed MSR
+        // (op TEQ, bit21 set) — its own guard already rejects that
+        // shape as `.unsupported` rather than misinterpreting it, but
+        // checking for these real, fixed encodings explicitly here
+        // decodes them correctly instead.
+        if word.bitField(27, 4) == 0x12_FFF1 || word.bitField(27, 4) == 0x12_FFF3 {
+            return .branchExchange(BranchExchangeInstruction(
+                condition: condition, link: word.bitField(27, 4) == 0x12_FFF3, rm: Int(word.bitField(3, 0))
+            ))
         }
 
         // MOVW/MOVT (ARMv6T2+) share the data-processing block but are a

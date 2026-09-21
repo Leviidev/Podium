@@ -400,6 +400,16 @@ final class ARMDecoderTests: XCTestCase {
             return XCTFail("Expected branchExchange")
         }
         XCTAssertEqual(instr.rm, Registers.lrIndex)
+        XCTAssertFalse(instr.link)
+    }
+
+    func testDecodesBlxRegisterFromRealKernel() {
+        // blx r0 — from the real kernel at 0x8027c358.
+        guard case .branchExchange(let instr) = ARMDecoder.decode(0xE12F_FF30) else {
+            return XCTFail("Expected branchExchange")
+        }
+        XCTAssertEqual(instr.rm, 0)
+        XCTAssertTrue(instr.link)
     }
 
     func testDecodesPushFromRealKernel() {

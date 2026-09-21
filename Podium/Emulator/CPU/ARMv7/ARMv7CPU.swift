@@ -528,6 +528,13 @@ final class ARMv7CPU: CPU {
 
     private func executeBranchExchange(_ instr: BranchExchangeInstruction, instructionAddress: UInt32) {
         let target = operandValue(for: instr.rm)
+        if instr.link {
+            // `registers.pc` already holds the address of the
+            // instruction after this one (see `step()`) — exactly what
+            // LR should hold, the same convention
+            // `executeBranchLinkExchangeImmediate` uses.
+            registers.lr = registers.pc
+        }
         // Real interworking: bit 0 of the target selects the resulting
         // state (1 = Thumb, 0 = ARM) — both are genuinely executable now
         // that `ARMv7CPU+Thumb.swift` exists, so this never halts.
