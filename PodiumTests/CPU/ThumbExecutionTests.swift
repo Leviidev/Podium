@@ -482,6 +482,16 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 1)
     }
 
+    func testMvnImmediateNegatesModifiedImmediateRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xf06f, 0x4570, // mvn r5, #0xf0000000, real word from the actual kernel
+        ])
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[5], 0x0FFF_FFFF)
+    }
+
     func testAddwAddsPlainImmediateRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xf204, 0x40d4, // addw r0, r4, #0x4d4, real word from the actual kernel

@@ -247,6 +247,11 @@ enum ThumbModifiedImmediateOp: UInt8 {
     case and = 0b0000
     case bic = 0b0001
     case orr = 0b0010
+    /// `ORN Rd, Rn, #imm` (`Rd = Rn | ~imm32`) — `Rn == 1111` is the
+    /// `MVN` alias (`Rd = ~imm32`, unmasked by `Rn`, exactly paralleling
+    /// `ORR`'s `MOV` alias). Verified against a real `mvn r5,
+    /// #0xf0000000` word from the actual kernel.
+    case orn = 0b0011
     case eor = 0b0100
     case add = 0b1000
     case adc = 0b1010
@@ -256,7 +261,8 @@ enum ThumbModifiedImmediateOp: UInt8 {
 }
 
 /// Thumb-2 "data-processing (modified immediate)" — the 32-bit family
-/// covering `AND`/`BIC`/`ORR`/`MOV`/`ADD`/`ADC`/`SBC`/`RSB`/`SUB` with a
+/// covering `AND`/`BIC`/`ORR`/`MOV`/`ORN`/`MVN`/`ADD`/`ADC`/`SBC`/`RSB`/
+/// `SUB` with a
 /// 12-bit "modified immediate" (see
 /// `ThumbDecoder.expandModifiedImmediate`), sharing one op-field table
 /// with the CMP/CMN/TST/TEQ comparison forms (`Rd == 1111, S == 1`).

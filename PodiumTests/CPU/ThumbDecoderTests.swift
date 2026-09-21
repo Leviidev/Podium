@@ -138,6 +138,19 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertFalse(instr.setFlags)
     }
 
+    func testDecodesMvnImmediateFromRealKernel() {
+        // mvn r5, #0xf0000000 — from the real kernel at 0x8007ed2e.
+        // ORN with Rn==1111 (the MVN alias).
+        guard case .dataProcessingImmediate(let instr) = ThumbDecoder.decode(0xf06f, 0x4570) else {
+            return XCTFail("Expected dataProcessingImmediate")
+        }
+        XCTAssertEqual(instr.op, .orn)
+        XCTAssertEqual(instr.rn, 15)
+        XCTAssertEqual(instr.rd, 5)
+        XCTAssertEqual(instr.imm32, 0xF000_0000)
+        XCTAssertFalse(instr.setFlags)
+    }
+
     func testDecodesOrrImmediateFromRealKernel() {
         // orr r3, r3, #1 — from the real kernel at 0x802b8584.
         guard case .dataProcessingImmediate(let instr) = ThumbDecoder.decode(0xf043, 0x0301) else {

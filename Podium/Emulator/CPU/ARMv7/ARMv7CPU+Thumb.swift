@@ -610,11 +610,13 @@ extension ARMv7CPU {
         let isComparison = instr.setFlags && instr.rd == Registers.pcIndex
             && (instr.op == .and || instr.op == .eor || instr.op == .add || instr.op == .sub)
         let isMove = instr.op == .orr && instr.rn == Registers.pcIndex
+        let isMvn = instr.op == .orn && instr.rn == Registers.pcIndex
 
         switch instr.op {
         case .and: result = rn & instr.imm32
         case .bic: result = rn & ~instr.imm32
         case .orr: result = isMove ? instr.imm32 : (rn | instr.imm32)
+        case .orn: result = isMvn ? ~instr.imm32 : (rn | ~instr.imm32)
         case .eor: result = rn ^ instr.imm32
         case .add:
             let r = ALU.add(rn, instr.imm32); arithmeticResult = r; result = r.value
@@ -657,11 +659,13 @@ extension ARMv7CPU {
         let isComparison = instr.setFlags && instr.rd == Registers.pcIndex
             && (instr.op == .and || instr.op == .eor || instr.op == .add || instr.op == .sub)
         let isMove = instr.op == .orr && instr.rn == Registers.pcIndex
+        let isMvn = instr.op == .orn && instr.rn == Registers.pcIndex
 
         switch instr.op {
         case .and: result = rn & operand2
         case .bic: result = rn & ~operand2
         case .orr: result = isMove ? operand2 : (rn | operand2)
+        case .orn: result = isMvn ? ~operand2 : (rn | ~operand2)
         case .eor: result = rn ^ operand2
         case .add:
             let r = ALU.add(rn, operand2); arithmeticResult = r; result = r.value
