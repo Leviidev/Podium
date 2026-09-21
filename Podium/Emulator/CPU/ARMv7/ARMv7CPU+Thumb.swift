@@ -176,6 +176,9 @@ extension ARMv7CPU {
             executeThumbExtend(instr)
         case .extendWide(let instr):
             executeThumbExtendWide(instr)
+        case .memoryBarrier:
+            // A real no-op: see ThumbInstruction.memoryBarrier's doc comment.
+            break
         case .conditionalBranch, .it, .compareBranch, .branchWide:
             preconditionFailure("handled in stepThumb before reaching executeThumb")
         case .unsupported(let raw, let second):

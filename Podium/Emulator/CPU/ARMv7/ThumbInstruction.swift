@@ -498,6 +498,13 @@ enum ThumbInstruction: Equatable {
     case compareBranch(ThumbCompareBranchInstruction)
     case extend(ThumbExtendInstruction)
     case extendWide(ThumbExtendWideInstruction)
+    /// `DSB`/`DMB`/`ISB` (Thumb-2 forms): a real no-op here, exactly
+    /// like ARM state's `ARMInstruction.memoryBarrier` — see that
+    /// case's doc comment. Lives in the branch/misc space's
+    /// "miscellaneous control instructions" sub-table, fixed
+    /// `hw0==0xF3BF`, verified against a real `dsb sy` word from the
+    /// actual kernel.
+    case memoryBarrier
     case it(ThumbItInstruction)
     case movWide(ThumbMovWideInstruction)
     case bitFieldExtract(ThumbUbfxInstruction)

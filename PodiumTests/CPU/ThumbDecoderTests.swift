@@ -158,6 +158,13 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rotate, 0)
     }
 
+    func testDecodesDsbFromRealKernel() {
+        // dsb sy — from the real kernel at 0x8007b106.
+        guard case .memoryBarrier = ThumbDecoder.decode(0xf3bf, 0x8f4f) else {
+            return XCTFail("Expected memoryBarrier")
+        }
+    }
+
     func testDecodesBicImmediateFromRealKernel() {
         // bic r1, r1, #1 — from the real kernel at 0x802b8578.
         guard case .dataProcessingImmediate(let instr) = ThumbDecoder.decode(0xf021, 0x0101) else {

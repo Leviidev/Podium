@@ -33,9 +33,11 @@ import Foundation
 /// `STRD` (immediate), `UMULL`, `MLA`, `SXTH.W`/`UXTH.W`/`SXTB.W`/
 /// `UXTB.W` (the `0xFA`-prefixed wide forms of the 16-bit extend
 /// instructions above, no-accumulate shape only — see
-/// `decode32ExtendOrShift`'s doc comment), and `MCR`/`MRC` (reusing ARM
-/// state's exact field layout — see `decode32Coprocessor`'s doc
-/// comment). Everything else — PC-relative `LDR` (format 6),
+/// `decode32ExtendOrShift`'s doc comment), `DSB`/`DMB`/`ISB` (Thumb-2
+/// forms, real no-ops exactly like ARM state's own barriers), and
+/// `MCR`/`MRC` (reusing ARM state's exact field layout — see
+/// `decode32Coprocessor`'s doc comment). Everything else — PC-relative
+/// `LDR` (format 6),
 /// `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2 wide form and `MLS` (`MLA`'s
 /// siblings), `SMULL`/`UMLAL`/`SMLAL`/`SDIV`/`UDIV` (`UMULL`'s
 /// siblings), `LDREX`/`STREX` (Thumb-2 forms — `LDRD`/`STRD`'s
@@ -648,6 +650,16 @@ enum ThumbDecoder {
             // actual kernel.
             let condBits = hw0.bitField16(9, 6)
             guard condBits != 0b1110, condBits != 0b1111 else {
+                // cond==1110/1111 (this space's reserved values) is
+                // actually the "miscellaneous control instructions"
+                // sub-table, of which only DSB/DMB/ISB (fixed
+                // hw0==0xF3BF, hw1 bits[15:8]==0x8F, bits[7:4] one of
+                // 0100/0101/0110) are decoded — a real no-op here, same
+                // as ARM state's memoryBarrier. Verified against a real
+                // `dsb sy` word from the actual kernel.
+                if hw0 == 0xF3BF, hw1.bitField16(15, 8) == 0x8F, (0b0100...0b0110).contains(hw1.bitField16(7, 4)) {
+                    return .memoryBarrier
+                }
                 return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             }
             let offset = decodeConditionalBWOffset(hw0, hw1)
