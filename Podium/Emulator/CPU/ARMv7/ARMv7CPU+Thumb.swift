@@ -146,6 +146,8 @@ extension ARMv7CPU {
             executeThumbBitFieldExtract(instr)
         case .addWide(let instr):
             executeThumbAddWide(instr)
+        case .adr(let instr):
+            executeThumbAdr(instr, instructionAddress: instructionAddress)
         case .bitFieldInsert(let instr):
             executeThumbBitFieldInsert(instr)
         case .dataProcessingImmediate(let instr):
@@ -597,6 +599,14 @@ extension ARMv7CPU {
 
     private func executeThumbAddWide(_ instr: ThumbAddWideInstruction) {
         registers[instr.rd] = registers[instr.rn] &+ UInt32(instr.imm12)
+    }
+
+    /// `ADR` (`ADDW`-based T3 form): `Rd = Align(PC, 4) + imm12`, the
+    /// same PC-relative base format 12's `ADD Rd, PC, #imm8*4`
+    /// (`executeThumbAddress`) uses.
+    private func executeThumbAdr(_ instr: ThumbAdrInstruction, instructionAddress: UInt32) {
+        let base = (instructionAddress &+ 4) & ~UInt32(0b11)
+        registers[instr.rd] = base &+ UInt32(instr.imm12)
     }
 
     /// `BFI`/`BFC`: `sourceRegister == nil` (`BFC`) inserts zero.

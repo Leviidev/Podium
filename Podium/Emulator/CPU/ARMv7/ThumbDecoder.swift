@@ -19,10 +19,10 @@ import Foundation
 /// 11), `ADD Rd,PC/SP,#imm` (format 12), SP adjustment (format 13),
 /// `PUSH`/`POP` (format 14), `SXTH`/`SXTB`/`UXTH`/`UXTB`, conditional
 /// and unconditional branch (formats 16/18), `CBZ`/`CBNZ`, and `IT`.
-/// Covers (32-bit): `MOVW`/`MOVT`, `UBFX`, `ADDW`, and `BFI`/`BFC` (all
-/// sharing the same "data-processing plain binary immediate" op
-/// field), the data-processing modified-immediate family, the
-/// data-processing
+/// Covers (32-bit): `MOVW`/`MOVT`, `UBFX`, `ADDW`, `BFI`/`BFC`, and
+/// `ADR` (`ADDW`'s `Rn==1111` alias; all sharing the same "data-
+/// processing plain binary immediate" op field), the data-processing
+/// modified-immediate family, the data-processing
 /// shifted-register family (sharing the same op table), `BL`, `BLX`
 /// (immediate), `B.W` (both the unconditional T4 form and the
 /// conditional T3 form, which carries its own condition field the same
@@ -36,8 +36,8 @@ import Foundation
 /// `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2 wide form and `MLS` (`MLA`'s
 /// siblings), `SMULL`/`UMLAL`/`SMLAL`/`SDIV`/`UDIV` (`UMULL`'s
 /// siblings), `LDREX`/`STREX` (Thumb-2 forms — `LDRD`/`STRD`'s
-/// siblings in that same space), `ADR` (`ADDW`'s `Rn==1111` sibling),
-/// the rest of the "plain binary immediate" op table (`SUBW`/`SSAT`/
+/// siblings in that same space), the rest of the "plain binary
+/// immediate" op table (`SUBW`, its own `Rn==1111` `ADR` alias, `SSAT`/
 /// `SBFX`/`USAT`), the rest of the coprocessor space (`CDP`/`LDC`/
 /// `STC`), SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
@@ -544,16 +544,16 @@ enum ThumbDecoder {
                     ))
                 }
                 if opField == 0b100000 {
-                    // ADDW: Rn == 1111 is ADR instead, not decoded here
-                    // (see ThumbAddWideInstruction's doc comment).
+                    // ADDW; Rn == 1111 is ADR (see ThumbAdrInstruction's
+                    // doc comment).
                     let rn = hw0.bitField16(3, 0)
-                    guard rn != 0b1111 else {
-                        return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
-                    }
                     let i = hw0.bit16(10) ? UInt32(1) : 0
                     let imm3 = hw1.bitField16(14, 12)
                     let imm8 = hw1.bitField16(7, 0)
                     let imm12 = (i << 11) | (UInt32(imm3) << 8) | UInt32(imm8)
+                    if rn == 0b1111 {
+                        return .adr(ThumbAdrInstruction(rd: Int(hw1.bitField16(11, 8)), imm12: UInt16(imm12)))
+                    }
                     return .addWide(ThumbAddWideInstruction(
                         rd: Int(hw1.bitField16(11, 8)), rn: Int(rn), imm12: UInt16(imm12)
                     ))

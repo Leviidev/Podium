@@ -137,6 +137,16 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.width, 12)
     }
 
+    func testDecodesAdrFromRealKernel() {
+        // addw r2, pc, #0x16 — from the real kernel at 0x800200f8.
+        // ADDW with Rn==1111 is architecturally ADR.
+        guard case .adr(let instr) = ThumbDecoder.decode(0xf20f, 0x0216) else {
+            return XCTFail("Expected adr")
+        }
+        XCTAssertEqual(instr.rd, 2)
+        XCTAssertEqual(instr.imm12, 0x16)
+    }
+
     func testDecodesBicImmediateFromRealKernel() {
         // bic r1, r1, #1 — from the real kernel at 0x802b8578.
         guard case .dataProcessingImmediate(let instr) = ThumbDecoder.decode(0xf021, 0x0101) else {

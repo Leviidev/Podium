@@ -516,6 +516,17 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[5], 0x0FFF_FFFF)
     }
 
+    func testAdrComputesPcRelativeAddressRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xf20f, 0x0216, // addw r2, pc, #0x16 (ADR), real word from the actual kernel, at address 0
+        ])
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Align(PC, 4) + imm12 = Align(0 + 4, 4) + 0x16 = 4 + 22 = 26.
+        XCTAssertEqual(cpu.registers[2], 26)
+    }
+
     func testAddwAddsPlainImmediateRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xf204, 0x40d4, // addw r0, r4, #0x4d4, real word from the actual kernel

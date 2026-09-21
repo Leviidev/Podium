@@ -235,6 +235,20 @@ struct ThumbAddWideInstruction: Equatable {
     let imm12: UInt16
 }
 
+/// `ADR Rd, <label>` (Thumb-2, `ADDW`-based T3 form, `Rn == 1111`):
+/// `Rd = Align(PC, 4) + imm12`, the same `Align(PC, 4)` PC-relative base
+/// format 12's `ADD Rd, PC, #imm8*4` (`ThumbAddressInstruction`) uses,
+/// just with a plain (non-×4-scaled) 12-bit immediate and no `SP`
+/// option. The subtracting `SUBW`-based T2 `ADR` form isn't decoded
+/// (no real word has confirmed it). Verified against a real
+/// `addw r2, pc, #0x16` word (Capstone's literal disassembly of the
+/// `ADDW` encoding; architecturally this *is* `ADR`) from the actual
+/// kernel.
+struct ThumbAdrInstruction: Equatable {
+    let rd: Int
+    let imm12: UInt16
+}
+
 /// `BFI Rd, Rn, #lsb, #width` / `BFC Rd, #lsb, #width` (Thumb-2,
 /// 32-bit): a different encoding from ARM state's `BFI`/`BFC`
 /// (`BitFieldInsertInstruction`), sharing this file's "data-processing
@@ -471,6 +485,7 @@ enum ThumbInstruction: Equatable {
     case movWide(ThumbMovWideInstruction)
     case bitFieldExtract(ThumbUbfxInstruction)
     case addWide(ThumbAddWideInstruction)
+    case adr(ThumbAdrInstruction)
     case bitFieldInsert(ThumbBitFieldInsertInstruction)
     case dataProcessingImmediate(ThumbDataProcessingImmediateInstruction)
     case dataProcessingShiftedRegister(ThumbDataProcessingShiftedRegisterInstruction)
