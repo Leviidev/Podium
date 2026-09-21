@@ -329,18 +329,22 @@ struct ThumbBranchWideInstruction: Equatable {
     let signedOffset: Int32
 }
 
-/// Thumb-2 `LDR`/`STR`/`LDRB`/`STRB`/`LDRSB` (immediate), the T3
-/// (12-bit unsigned, always pre-indexed, never writeback) and T4
+/// Thumb-2 `LDR`/`STR`/`LDRB`/`STRB`/`LDRSB`/`LDRH`/`STRH` (immediate),
+/// the T3 (12-bit unsigned, always pre-indexed, never writeback) and T4
 /// (8-bit signed, pre/post-indexed, optional writeback) sub-forms,
 /// unified the same way `LoadStoreInstruction` unifies ARM's
 /// equivalents — `isSigned` (verified against a real
 /// `ldrsb r0, [r5, #1]!` word) is always paired with `isLoad == true`
 /// and `isByte == true`, since no signed-store or signed-word encoding
-/// exists. Halfword (`LDRH`/`STRH`) and `LDRSH` share this same
-/// encoding space but aren't decoded yet.
+/// exists here (`LDRSH` shares this space's bits[6:5]==01 but isn't
+/// decoded, since it lives in the *signed*-load `0xF9` prefix, not the
+/// plain `0xF8` one `isHalfword` is read from). `isHalfword` (verified
+/// against a real `ldrh.w r1, [r8]` word) is mutually exclusive with
+/// `isByte` — plain word transfer when both are `false`.
 struct ThumbLoadStoreWideInstruction: Equatable {
     let isLoad: Bool
     let isByte: Bool
+    let isHalfword: Bool
     let isSigned: Bool
     let rn: Int
     let rt: Int

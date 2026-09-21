@@ -407,9 +407,11 @@ enum ThumbDecoder {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         let isByte: Bool
+        let isHalfword: Bool
         switch hw0.bitField16(6, 5) {
-        case 0b10: isByte = false
-        case 0b00: isByte = true
+        case 0b10: isByte = false; isHalfword = false
+        case 0b00: isByte = true; isHalfword = false
+        case 0b01: isByte = false; isHalfword = true
         default: return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         let isLoad = hw0.bit16(4)
@@ -418,7 +420,7 @@ enum ThumbDecoder {
         if hw0.bit16(7) {
             // T3: 12-bit unsigned immediate, always add, never writeback.
             return .loadStoreWide(ThumbLoadStoreWideInstruction(
-                isLoad: isLoad, isByte: isByte, isSigned: false, rn: rn, rt: rt,
+                isLoad: isLoad, isByte: isByte, isHalfword: isHalfword, isSigned: false, rn: rn, rt: rt,
                 preIndexed: true, addOffset: true, writeback: false,
                 offset: UInt32(hw1.bitField16(11, 0))
             ))
@@ -428,12 +430,14 @@ enum ThumbDecoder {
         // verified against a real `ldr.w r3, [r5, r0, lsl #3]` word).
         if hw1.bit16(11) {
             return .loadStoreWide(ThumbLoadStoreWideInstruction(
-                isLoad: isLoad, isByte: isByte, isSigned: false, rn: rn, rt: rt,
+                isLoad: isLoad, isByte: isByte, isHalfword: isHalfword, isSigned: false, rn: rn, rt: rt,
                 preIndexed: hw1.bit16(10), addOffset: hw1.bit16(9), writeback: hw1.bit16(8),
                 offset: UInt32(hw1.bitField16(7, 0))
             ))
         }
-        guard hw1.bitField16(11, 6) == 0 else {
+        guard hw1.bitField16(11, 6) == 0, !isHalfword else {
+            // Register-offset halfword form isn't decoded — no real
+            // word has confirmed it yet, unlike byte/word above.
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         return .loadStoreRegister(ThumbLoadStoreRegisterInstruction(
@@ -460,7 +464,7 @@ enum ThumbDecoder {
         let rt = Int(hw1.bitField16(15, 12))
         if hw0.bit16(7) {
             return .loadStoreWide(ThumbLoadStoreWideInstruction(
-                isLoad: true, isByte: true, isSigned: true, rn: rn, rt: rt,
+                isLoad: true, isByte: true, isHalfword: false, isSigned: true, rn: rn, rt: rt,
                 preIndexed: true, addOffset: true, writeback: false,
                 offset: UInt32(hw1.bitField16(11, 0))
             ))
@@ -469,7 +473,7 @@ enum ThumbDecoder {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         return .loadStoreWide(ThumbLoadStoreWideInstruction(
-            isLoad: true, isByte: true, isSigned: true, rn: rn, rt: rt,
+            isLoad: true, isByte: true, isHalfword: false, isSigned: true, rn: rn, rt: rt,
             preIndexed: hw1.bit16(10), addOffset: hw1.bit16(9), writeback: hw1.bit16(8),
             offset: UInt32(hw1.bitField16(7, 0))
         ))

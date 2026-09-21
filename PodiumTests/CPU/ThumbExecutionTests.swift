@@ -363,6 +363,18 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[5], 11) // pre-indexed with writeback.
     }
 
+    func testLdrhWideLoadsHalfwordRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xf8b8, 0x1000, // ldrh.w r1, [r8], real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[8] = 10
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord16(0xBEEF, at: 10)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 0xBEEF)
+    }
+
     func testSubsImmediate3RealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0x1f3c, // subs r4, r7, #4, real word from the actual kernel

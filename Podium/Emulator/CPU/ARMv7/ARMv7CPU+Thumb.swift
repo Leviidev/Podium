@@ -713,9 +713,14 @@ extension ARMv7CPU {
         do {
             let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
-                var value = instr.isByte
-                    ? UInt32(try memory.readByte(at: physicalAddress))
-                    : try memory.readWord32(at: physicalAddress)
+                var value: UInt32
+                if instr.isByte {
+                    value = UInt32(try memory.readByte(at: physicalAddress))
+                } else if instr.isHalfword {
+                    value = UInt32(try memory.readWord16(at: physicalAddress))
+                } else {
+                    value = try memory.readWord32(at: physicalAddress)
+                }
                 if instr.isSigned {
                     value = UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: value))))
                 }
@@ -727,6 +732,8 @@ extension ARMv7CPU {
                 }
             } else if instr.isByte {
                 try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+            } else if instr.isHalfword {
+                try memory.writeWord16(UInt16(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
             } else {
                 try memory.writeWord32(registers[instr.rt], at: physicalAddress)
             }
