@@ -176,6 +176,31 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rm, 2)
     }
 
+    func testDecodesLdmiaFromRealKernel() {
+        // ldm r6, {r2, r3, r6} — from the real kernel at 0x80067e56.
+        // Rn (r6) is itself in the register list, so no writeback.
+        guard case .blockDataTransfer(let instr) = ThumbDecoder.decode(0xce4c, 0) else {
+            return XCTFail("Expected blockDataTransfer")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertTrue(instr.isIncrement)
+        XCTAssertFalse(instr.writeback)
+        XCTAssertEqual(instr.rn, 6)
+        XCTAssertEqual(instr.registerList, 0b0100_1100) // r2, r3, r6
+    }
+
+    func testDecodesLdmiaWithWritebackWhenBaseNotInList() {
+        // ldm r0!, {r2, r3} — synthetic (same shape as the real
+        // ldm r6, {r2,r3,r6} word, but with r0 as base, not in the
+        // list): writeback applies since Rn isn't overwritten by the load.
+        guard case .blockDataTransfer(let instr) = ThumbDecoder.decode(0xc80c, 0) else {
+            return XCTFail("Expected blockDataTransfer")
+        }
+        XCTAssertTrue(instr.writeback)
+        XCTAssertEqual(instr.rn, 0)
+        XCTAssertEqual(instr.registerList, 0b0000_1100) // r2, r3
+    }
+
     func testDecodesBicImmediateFromRealKernel() {
         // bic r1, r1, #1 — from the real kernel at 0x802b8578.
         guard case .dataProcessingImmediate(let instr) = ThumbDecoder.decode(0xf021, 0x0101) else {

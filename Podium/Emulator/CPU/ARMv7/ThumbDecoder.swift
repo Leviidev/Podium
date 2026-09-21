@@ -17,8 +17,11 @@ import Foundation
 /// 5-bit immediate (format 9), halfword load-store with a 5-bit
 /// immediate (format 10), SP-relative (format
 /// 11), `ADD Rd,PC/SP,#imm` (format 12), SP adjustment (format 13),
-/// `PUSH`/`POP` (format 14), `SXTH`/`SXTB`/`UXTH`/`UXTB`, conditional
-/// and unconditional branch (formats 16/18), `CBZ`/`CBNZ`, and `IT`.
+/// `PUSH`/`POP` (format 14), `LDMIA` (format 15 — the load form only;
+/// `STMIA`, same top-level shape with the load bit clear, isn't
+/// decoded since no real word has confirmed it), `SXTH`/`SXTB`/`UXTH`/
+/// `UXTB`, conditional and unconditional branch (formats 16/18),
+/// `CBZ`/`CBNZ`, and `IT`.
 /// Covers (32-bit): `MOVW`/`MOVT`, `UBFX`, `ADDW`, `BFI`/`BFC`, and
 /// `ADR` (`ADDW`'s `Rn==1111` alias; all sharing the same "data-
 /// processing plain binary immediate" op field), the data-processing
@@ -169,6 +172,24 @@ enum ThumbDecoder {
         if hw0.bitField16(15, 12) == 0b1010 {
             return .address(ThumbAddressInstruction(
                 usesSP: hw0.bit16(11), rd: Int(hw0.bitField16(10, 8)), imm8: UInt32(hw0.bitField16(7, 0))
+            ))
+        }
+
+        // Format 15: LDMIA/STMIA Rn!, {reglist} (16-bit, low registers
+        // only). Real ARM ARM quirk for the load form: if `Rn` is
+        // itself in `reglist`, the loaded value overwrites it, so no
+        // separate writeback happens (unlike the store form, which
+        // always writes back regardless of whether `Rn` is listed) —
+        // `ThumbBlockDataTransferInstruction`'s `writeback` flag
+        // already models this generically (shared with `PUSH`/`POP`
+        // and the 32-bit T2 form), this just has to compute it
+        // correctly at decode time. Verified against a real
+        // `ldm r6, {r2, r3, r6}` word from the actual kernel.
+        if hw0.bitField16(15, 11) == 0b11001 {
+            let rn = Int(hw0.bitField16(10, 8))
+            let registerList = UInt16(hw0.bitField16(7, 0))
+            return .blockDataTransfer(ThumbBlockDataTransferInstruction(
+                isLoad: true, isIncrement: true, writeback: !registerList.bit16(rn), rn: rn, registerList: registerList
             ))
         }
 

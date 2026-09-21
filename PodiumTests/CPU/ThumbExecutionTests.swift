@@ -230,6 +230,25 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[1], 1)
     }
 
+    func testLdmiaLoadsRegistersAndSkipsWritebackWhenBaseInListRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xce4c, // ldm r6, {r2, r3, r6}, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[6] = 100
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord32(0x1111_1111, at: 100)
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord32(0x2222_2222, at: 104)
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord32(0x3333_3333, at: 108)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[2], 0x1111_1111)
+        XCTAssertEqual(cpu.registers[3], 0x2222_2222)
+        // r6 (the base) is both loaded from the list and used as the
+        // base -- no separate writeback, so it ends up with the
+        // loaded value, not the incremented base address.
+        XCTAssertEqual(cpu.registers[6], 0x3333_3333)
+    }
+
     func testPushWDbDirectionStoresBelowOriginalSP() {
         let cpu = makeThumbCPU(program: [
             0xe92d, 0x0d00, // push.w {r8, sl, fp}, real word from the actual kernel
