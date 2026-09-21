@@ -19,11 +19,13 @@ import Foundation
 /// 11), `ADD Rd,PC/SP,#imm` (format 12), SP adjustment (format 13),
 /// `PUSH`/`POP` (format 14), `SXTH`/`SXTB`/`UXTH`/`UXTB`, conditional
 /// and unconditional branch (formats 16/18), `CBZ`/`CBNZ`, and `IT`.
-/// Covers (32-bit): `MOVW`/`MOVT`, the data-processing modified-
-/// immediate family, the data-processing shifted-register family
-/// (sharing the same op table), `BL`, `BLX` (immediate), `B.W` (both the
-/// unconditional T4 form and the conditional T3 form, which carries its
-/// own condition field the same way 16-bit `Bcond` does), `LDR`/`STR`/
+/// Covers (32-bit): `MOVW`/`MOVT`, `UBFX` (sharing the same "data-
+/// processing plain binary immediate" op field as `MOVW`/`MOVT`), the
+/// data-processing modified-immediate family, the data-processing
+/// shifted-register family (sharing the same op table), `BL`, `BLX`
+/// (immediate), `B.W` (both the unconditional T4 form and the
+/// conditional T3 form, which carries its own condition field the same
+/// way 16-bit `Bcond` does), `LDR`/`STR`/
 /// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDRSB`
 /// (immediate, T3 and T4), `LDM`/
 /// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), `LDRD`/
@@ -33,8 +35,10 @@ import Foundation
 /// `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2 wide form and `MLS` (`MLA`'s
 /// siblings), `SMULL`/`UMLAL`/`SMLAL`/`SDIV`/`UDIV` (`UMULL`'s
 /// siblings), `LDREX`/`STREX` (Thumb-2 forms — `LDRD`/`STRD`'s
-/// siblings in that same space), the rest of the coprocessor space
-/// (`CDP`/`LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
+/// siblings in that same space), the rest of the "plain binary
+/// immediate" op table (`ADDW`/`SUBW`/`SSAT`/`SBFX`/`BFI`/`BFC`/
+/// `USAT`), the rest of the coprocessor space (`CDP`/`LDC`/`STC`),
+/// SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
     /// Whether `firstHalfword` opens a 32-bit Thumb-2 instruction (in
     /// which case the caller must fetch a second halfword before
@@ -504,19 +508,35 @@ enum ThumbDecoder {
 
         if !isBranchOrMisc {
             // Data-processing: modified-immediate (bit9==0) vs plain
-            // 12-bit immediate (bit9==1, MOVW/MOVT only, so far).
+            // binary immediate (bit9==1) — the latter is a whole real
+            // ARM ARM sub-table (ADDW/MOVW/SUBW/MOVT/SSAT/SBFX/BFI/
+            // USAT/UBFX/…) keyed on the 6-bit field hw0.bits[9:4], of
+            // which only MOVW/MOVT (0b10T100) and UBFX (0b111100,
+            // verified against a real `ubfx r0, r0, #1, #1` word from
+            // the actual kernel: hw0=0xF3C0, hw1=0x0040) are decoded.
             if hw0.bit16(9) {
-                // MOVW/MOVT: bits[9:4] == 0b10T100 (T selects MOVT).
-                guard hw0.bitField16(9, 4) & 0b110111 == 0b100100 else {
-                    return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+                let opField = hw0.bitField16(9, 4)
+                if opField & 0b110111 == 0b100100 {
+                    // MOVW/MOVT: bits[9:4] == 0b10T100 (T selects MOVT).
+                    let isTop = hw0.bit16(7)
+                    let imm4 = hw0.bitField16(3, 0)
+                    let i = hw0.bit16(10) ? UInt32(1) : 0
+                    let imm3 = hw1.bitField16(14, 12)
+                    let imm8 = hw1.bitField16(7, 0)
+                    let imm16 = (UInt32(imm4) << 12) | (i << 11) | (UInt32(imm3) << 8) | UInt32(imm8)
+                    return .movWide(ThumbMovWideInstruction(isTop: isTop, rd: Int(hw1.bitField16(11, 8)), imm16: UInt16(imm16)))
                 }
-                let isTop = hw0.bit16(7)
-                let imm4 = hw0.bitField16(3, 0)
-                let i = hw0.bit16(10) ? UInt32(1) : 0
-                let imm3 = hw1.bitField16(14, 12)
-                let imm8 = hw1.bitField16(7, 0)
-                let imm16 = (UInt32(imm4) << 12) | (i << 11) | (UInt32(imm3) << 8) | UInt32(imm8)
-                return .movWide(ThumbMovWideInstruction(isTop: isTop, rd: Int(hw1.bitField16(11, 8)), imm16: UInt16(imm16)))
+                if opField == 0b111100 {
+                    // UBFX: lsb = imm3:imm2, width = widthm1 + 1.
+                    let imm3 = Int(hw1.bitField16(14, 12))
+                    let imm2 = Int(hw1.bitField16(7, 6))
+                    let lsb = (imm3 << 2) | imm2
+                    let widthMinus1 = Int(hw1.bitField16(4, 0))
+                    return .bitFieldExtract(ThumbUbfxInstruction(
+                        rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)), lsb: lsb, width: widthMinus1 + 1
+                    ))
+                }
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             }
 
             guard let op = ThumbModifiedImmediateOp(rawValue: UInt8(hw0.bitField16(8, 5))) else {

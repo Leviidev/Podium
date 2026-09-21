@@ -142,6 +142,8 @@ extension ARMv7CPU {
             executeThumbPushPop(instr)
         case .movWide(let instr):
             executeThumbMovWide(instr)
+        case .bitFieldExtract(let instr):
+            executeThumbBitFieldExtract(instr)
         case .dataProcessingImmediate(let instr):
             executeThumbDataProcessingImmediate(instr)
         case .dataProcessingShiftedRegister(let instr):
@@ -580,6 +582,13 @@ extension ARMv7CPU {
         } else {
             registers[instr.rd] = UInt32(instr.imm16)
         }
+    }
+
+    /// `UBFX`: zero-extending unsigned bit-field extract. Doesn't
+    /// affect flags.
+    private func executeThumbBitFieldExtract(_ instr: ThumbUbfxInstruction) {
+        let mask: UInt32 = instr.width >= 32 ? 0xFFFF_FFFF : (UInt32(1) << instr.width) - 1
+        registers[instr.rd] = (registers[instr.rn] >> instr.lsb) & mask
     }
 
     // MARK: - Thumb-2: data-processing (modified immediate)

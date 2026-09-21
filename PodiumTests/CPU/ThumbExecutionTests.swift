@@ -470,4 +470,15 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(try! memory.readWord32(at: 20), 0x2222_2222)
         XCTAssertEqual(cpu.registers[8], 16) // No writeback.
     }
+
+    func testUbfxExtractsBitFieldRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xf3c0, 0x0040, // ubfx r0, r0, #1, #1, real word from the actual kernel
+        ])
+        cpu.registers[0] = 0b110 // bit 1 set
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 1)
+    }
 }

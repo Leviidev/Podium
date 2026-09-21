@@ -205,6 +205,21 @@ struct ThumbMovWideInstruction: Equatable {
     let imm16: UInt16
 }
 
+/// `UBFX` (Thumb-2, 32-bit): unsigned bit-field extract — copies
+/// `width` bits starting at bit `lsb` of `Rn` into `Rd`'s low bits,
+/// zero-extending the rest. Doesn't affect flags. Shares the same
+/// top-level 32-bit "data-processing (plain binary immediate)" op
+/// field as `MOVW`/`MOVT` (`hw0` bits[9:4]) — verified against a real
+/// `ubfx r0, r0, #1, #1` word from the actual kernel (`hw0=0xF3C0`,
+/// `hw1=0x0040`): op field `0b111100`, `lsb = (imm3<<2)|imm2`,
+/// `width = widthm1+1`.
+struct ThumbUbfxInstruction: Equatable {
+    let rd: Int
+    let rn: Int
+    let lsb: Int
+    let width: Int
+}
+
 /// The 32-bit "data-processing (modified immediate)" op-field table —
 /// distinct from `ThumbDataProcessingOp` (format 4's table): the two
 /// share no bit-value in common (confirmed against real kernel words:
@@ -412,6 +427,7 @@ enum ThumbInstruction: Equatable {
     case extend(ThumbExtendInstruction)
     case it(ThumbItInstruction)
     case movWide(ThumbMovWideInstruction)
+    case bitFieldExtract(ThumbUbfxInstruction)
     case dataProcessingImmediate(ThumbDataProcessingImmediateInstruction)
     case dataProcessingShiftedRegister(ThumbDataProcessingShiftedRegisterInstruction)
     case branchLink(ThumbBranchLinkInstruction)
