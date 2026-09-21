@@ -525,6 +525,17 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 0xFFFF_F000)
     }
 
+    func testClzWideCountsLeadingZerosRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xfab5, 0xf185, // clz r1, r5, real word from the actual kernel
+        ])
+        cpu.registers[5] = 0x0000_0010 // bit 4 set: 27 leading zeros
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 27)
+    }
+
     func testLslRegisterWideShiftsByRegisterAmountRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xfa05, 0xf202, // lsl.w r2, r5, r2, real word from the actual kernel

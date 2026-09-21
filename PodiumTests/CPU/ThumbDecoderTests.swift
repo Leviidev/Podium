@@ -201,6 +201,15 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.registerList, 0b0000_1100) // r2, r3
     }
 
+    func testDecodesClzWideFromRealKernel() {
+        // clz r1, r5 — from the real kernel at 0x80287cf2.
+        guard case .clz(let instr) = ThumbDecoder.decode(0xfab5, 0xf185) else {
+            return XCTFail("Expected clz")
+        }
+        XCTAssertEqual(instr.rd, 1)
+        XCTAssertEqual(instr.rm, 5)
+    }
+
     func testDecodesBicImmediateFromRealKernel() {
         // bic r1, r1, #1 — from the real kernel at 0x802b8578.
         guard case .dataProcessingImmediate(let instr) = ThumbDecoder.decode(0xf021, 0x0101) else {

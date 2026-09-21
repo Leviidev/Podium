@@ -37,9 +37,11 @@ import Foundation
 /// wide form of the 16-bit `UXTB` above, no-accumulate shape only —
 /// see `decode32ExtendOrShift`'s doc comment), `LSL`/`LSR`/`ASR`/`ROR`
 /// (Thumb-2 register-controlled-shift form, sharing that same `0xFA`
-/// space), `DSB`/`DMB`/`ISB` (Thumb-2 forms, real no-ops exactly like
-/// ARM state's own barriers), and `MCR`/`MRC` (reusing ARM state's
-/// exact field layout — see `decode32Coprocessor`'s doc comment).
+/// space), `CLZ` (Thumb-2 form, also sharing `0xFA` — a different
+/// encoding from ARM state's own `CLZ`), `DSB`/`DMB`/`ISB` (Thumb-2
+/// forms, real no-ops exactly like ARM state's own barriers), and
+/// `MCR`/`MRC` (reusing ARM state's exact field layout — see
+/// `decode32Coprocessor`'s doc comment).
 /// Everything else — PC-relative `LDR` (format 6),
 /// `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2 wide form and `MLS` (`MLA`'s
 /// siblings), `SMULL`/`UMLAL`/`SMLAL`/`SDIV`/`UDIV` (`UMULL`'s
@@ -528,17 +530,27 @@ enum ThumbDecoder {
     /// aren't, since no real word has confirmed either yet. Verified
     /// against a real `uxtb.w r1, r10` word from the actual kernel.
     private static func decode32ExtendOrShift(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        // bit6 of hw0's op nibble (bits[7:4]) is the real discriminator
-        // between the two sub-families sharing this space — confirmed
-        // by two real words landing on either side of it (`lsl.w`,
-        // bits[7:4]==0b0000, bit6 clear; `uxtb.w`, bits[7:4]==0b0101,
-        // bit6 set). An earlier version of this function guessed at
-        // three more extend op values (0b0000/0b0001/0b0100) by
-        // pattern-completing the ARM ARM's table from `uxtb.w` alone —
-        // wrong, since 0b0000 is actually `lsl.w`'s op, not `sxth.w`'s;
-        // only the one value a real word has actually confirmed stays
-        // decoded.
-        if !hw0.bit16(6) {
+        // hw0's op nibble (bits[7:4]) splits this space into (at
+        // least) three real sub-families by its own top two bits,
+        // bits[7:6] — confirmed by three real words landing on three
+        // different values: `lsl.w` (bits[7:4]==0b0000, bits[7:6]==00,
+        // register-controlled shift), `uxtb.w` (bits[7:4]==0b0101,
+        // bits[7:6]==01, sign/zero-extend), and `clz` (Thumb-2 form,
+        // bits[7:4]==0b1011, bits[7:6]==10, alongside — per the real
+        // ARM ARM, though unconfirmed here — `REV`/`REV16`/`RBIT`/
+        // `REVSH`). An earlier version of this function used just bit6
+        // as the discriminator, which happened to route `lsl.w`
+        // correctly but let a *different* bit6==0 op value (`clz`'s
+        // 0b1011) fall into the shift-register branch instead of being
+        // recognized — its own `hw1` fixed-marker guard rejected it
+        // there as unsupported rather than misdecoding it, but the fix
+        // is branching on the full 2-bit field. That same earlier
+        // version also guessed at three more extend op values
+        // (0b0000/0b0001/0b0100) by pattern-completing the ARM ARM's
+        // table from `uxtb.w` alone — wrong, since 0b0000 is actually
+        // `lsl.w`'s op; only the one value a real word has actually
+        // confirmed for each sub-family stays decoded.
+        if hw0.bitField16(7, 6) == 0b00 {
             // Register-controlled shift: bits[7:6]==00, bits[5:4] is
             // the `ShiftType` (matching its raw values directly).
             // Verified against a real `lsl.w r2, r5, r2` word from the
@@ -550,13 +562,19 @@ enum ThumbDecoder {
                 shiftType: shiftType, rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
             ))
         }
-        guard hw0.bitField16(3, 0) == 0b1111, hw1.bitField16(15, 12) == 0b1111, hw1.bitField16(7, 4) == 0b1000,
-              hw0.bitField16(7, 4) == 0b0101 else {
+        guard hw1.bitField16(15, 12) == 0b1111, hw1.bitField16(7, 4) == 0b1000 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
-        return .extendWide(ThumbExtendWideInstruction(
-            kind: .unsignedByte, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
-        ))
+        switch hw0.bitField16(7, 4) {
+        case 0b0101 where hw0.bitField16(3, 0) == 0b1111:
+            return .extendWide(ThumbExtendWideInstruction(
+                kind: .unsignedByte, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
+            ))
+        case 0b1011:
+            return .clz(ThumbClzInstruction(rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0))))
+        default:
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
     }
 
     private static func decode32LongMultiply(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {

@@ -208,6 +208,20 @@ struct ThumbShiftRegisterInstruction: Equatable {
     let rm: Int
 }
 
+/// `CLZ` (Thumb-2, 32-bit): counts leading zero bits (32 if `Rm` is
+/// zero) — a different encoding from ARM state's own `ClzInstruction`,
+/// sharing this file's `0xFA`-prefixed "miscellaneous" space (bit6 set)
+/// with `UXTB.W`, disambiguated by op (`hw0` bits[7:4] == `0b1011`
+/// here, vs. `UXTB.W`'s `0b0101`). `Rm` is redundantly encoded in both
+/// halfwords (`hw0` bits[3:0] and `hw1` bits[3:0]) per the real ARM
+/// ARM; this reads from `hw1`'s copy, matching every other instruction
+/// in this file. Verified against a real `clz r1, r5` word from the
+/// actual kernel. Doesn't affect flags.
+struct ThumbClzInstruction: Equatable {
+    let rd: Int
+    let rm: Int
+}
+
 /// `UXTB` (Thumb-2, 32-bit "wide" form — `SXTH`/`UXTH`/`SXTB` share
 /// this same `kind`-tagged struct architecturally but aren't decoded,
 /// see `decode32ExtendOrShift`'s doc comment for why only `UXTB`'s
@@ -521,6 +535,7 @@ enum ThumbInstruction: Equatable {
     case extend(ThumbExtendInstruction)
     case extendWide(ThumbExtendWideInstruction)
     case shiftRegister(ThumbShiftRegisterInstruction)
+    case clz(ThumbClzInstruction)
     /// `DSB`/`DMB`/`ISB` (Thumb-2 forms): a real no-op here, exactly
     /// like ARM state's `ARMInstruction.memoryBarrier` — see that
     /// case's doc comment. Lives in the branch/misc space's

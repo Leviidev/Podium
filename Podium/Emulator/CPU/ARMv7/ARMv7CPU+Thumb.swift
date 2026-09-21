@@ -178,6 +178,8 @@ extension ARMv7CPU {
             executeThumbExtendWide(instr)
         case .shiftRegister(let instr):
             executeThumbShiftRegister(instr)
+        case .clz(let instr):
+            executeThumbClz(instr)
         case .memoryBarrier:
             // A real no-op: see ThumbInstruction.memoryBarrier's doc comment.
             break
@@ -335,6 +337,10 @@ extension ARMv7CPU {
             instr.shiftType, to: registers[instr.rn], by: amount, currentCarry: cpsr.carry
         )
         registers[instr.rd] = result.value
+    }
+
+    private func executeThumbClz(_ instr: ThumbClzInstruction) {
+        registers[instr.rd] = UInt32(registers[instr.rm].leadingZeroBitCount)
     }
 
     private func executeThumbExtendWide(_ instr: ThumbExtendWideInstruction) {
