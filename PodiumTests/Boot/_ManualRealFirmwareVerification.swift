@@ -66,7 +66,12 @@ final class ManualRealFirmwareVerification: XCTestCase {
         cpu.loadInitialRegisters(initialRegisters)
 
         let fastForwarded = cpu.run(maxUnits: 50_000_000)
-        print("RESULT: ran \(fastForwarded) units, pc=0x\(cpu.registers.pc.hexString8), error=\(String(describing: cpu.lastError))")
+        print("RESULT: ran \(fastForwarded) units, pc=0x\(cpu.registers.pc.hexString8), error=\(String(describing: cpu.lastError)), thumbState=\(cpu.cpsr.thumbState)")
+        if case .unsupportedInstruction(_, let haltAddress)? = cpu.lastError {
+            let hw0 = try bus.readWord16(at: haltAddress)
+            let hw1 = try bus.readWord16(at: haltAddress &+ 2)
+            print("RAW HALFWORDS at 0x\(haltAddress.hexString8): hw0=0x\(String(format: "%04X", hw0)) hw1=0x\(String(format: "%04X", hw1))")
+        }
         XCTAssertTrue(true)
     }
 }

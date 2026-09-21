@@ -64,6 +64,7 @@ final class ARMv7CPU: CPU {
     var cpsr = CPSR()
     var lastError: CPUError?
     var cp15 = CP15State()
+    var neon = NEONRegisters()
 
     let jit: JITEngine?
 
@@ -324,6 +325,9 @@ final class ARMv7CPU: CPU {
             // A real no-op: see ARMInstruction.memoryBarrier's doc comment.
             break
 
+        case .vectorRoundingShiftLeft(let instr):
+            executeVectorRoundingShiftLeft(instr)
+
         case .unsupported:
             lastError = .unsupportedInstruction(rawWord: rawWord, address: instructionAddress)
 
@@ -561,6 +565,71 @@ final class ARMv7CPU: CPU {
 
     private func executeRev(_ instr: RevInstruction) {
         registers[instr.rd] = registers[instr.rm].byteSwapped
+    }
+
+    private func executeVectorRoundingShiftLeft(_ instr: VRSHLInstruction) {
+        let laneBits: Int
+        switch instr.size {
+        case .bits8: laneBits = 8
+        case .bits16: laneBits = 16
+        case .bits32: laneBits = 32
+        case .bits64: laneBits = 64
+        }
+        let laneCount = 64 / laneBits
+        let laneMask: UInt64 = laneBits == 64 ? .max : (UInt64(1) << laneBits) - 1
+
+        let shiftedValue = neon[instr.vm]
+        let shiftAmounts = neon[instr.vn]
+        var result: UInt64 = 0
+        for lane in 0..<laneCount {
+            let offset = laneBits * lane
+            let element = (shiftedValue >> offset) & laneMask
+            // The shift amount for every lane, regardless of element
+            // size, is always just the low 8 bits of that lane's own
+            // corresponding value in the shift-amount operand, read as
+            // signed (ARM DDI 0406C A8.8.316).
+            let shiftAmount = Int(Int8(bitPattern: UInt8((shiftAmounts >> offset) & 0xFF)))
+            let shifted = Self.roundingShiftLeft(element, by: shiftAmount, laneBits: laneBits, unsigned: instr.unsigned)
+            result |= (shifted & laneMask) << offset
+        }
+        neon[instr.vd] = result
+    }
+
+    /// `Shift()`'s rounding-shift-left helper (ARM DDI 0406C A8.8.316,
+    /// used by `VRSHL`/`VRSHR`/friends): a non-negative `shiftAmount`
+    /// shifts left with no rounding (nothing is lost); a negative one
+    /// shifts right by its magnitude with a rounding constant added
+    /// first, arithmetically for a signed element or logically for an
+    /// unsigned one. A magnitude at or beyond `laneBits` shifts every
+    /// value bit out, so the result is 0 (or, for the signed rounding
+    /// path, the sign bit replicated) regardless of the operand.
+    private static func roundingShiftLeft(_ element: UInt64, by shiftAmount: Int, laneBits: Int, unsigned: Bool) -> UInt64 {
+        if shiftAmount >= 0 {
+            guard shiftAmount < laneBits else { return 0 }
+            return element << shiftAmount
+        }
+
+        let magnitude = -shiftAmount
+        let roundConst: UInt64 = magnitude > 0 && magnitude <= 64 ? (UInt64(1) << (magnitude - 1)) : 0
+
+        if unsigned {
+            guard magnitude < 64 else { return 0 }
+            let sum = element &+ roundConst
+            return magnitude >= laneBits + 1 ? 0 : sum >> magnitude
+        }
+
+        let signExtended: Int64
+        if laneBits >= 64 {
+            signExtended = Int64(bitPattern: element)
+        } else {
+            let signBit = UInt64(1) << (laneBits - 1)
+            signExtended = element & signBit != 0
+                ? Int64(bitPattern: element | ~((UInt64(1) << laneBits) - 1))
+                : Int64(bitPattern: element)
+        }
+        let sum = signExtended &+ Int64(bitPattern: roundConst)
+        guard magnitude < 64 else { return sum < 0 ? UInt64.max : 0 }
+        return UInt64(bitPattern: sum >> magnitude)
     }
 
     /// `BFI`/`BFC`: doesn't affect flags. `sourceRegister == nil`

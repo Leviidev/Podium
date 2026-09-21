@@ -525,6 +525,46 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 1)
     }
 
+    func testLdrPcRelativeLoadsFromAlignedLiteralPool() {
+        // ldr r0, [pc, #0x24] — real word from the actual kernel, the
+        // instruction that halted execution before format 6 was decoded
+        // at all. At address 0: base = Align(0+4,4) = 4, so the literal
+        // lives at 4 + 0x24 = 0x28.
+        let cpu = makeThumbCPU(program: [0x4809])
+        try! cpu.memory.writeWord32(0xDEAD_BEEF, at: 0x28)
+
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0xDEAD_BEEF)
+    }
+
+    func testSbfxSignExtendsBitFieldRealKernelWord() {
+        // sbfx r5, r5, #0, #1 — real word from the actual kernel, the
+        // instruction that halted execution before SBFX was decoded at
+        // all. Extracting a single set bit sign-extends it to all 1s,
+        // not just 1 — the whole point of `S` vs `U`BFX.
+        let cpu = makeThumbCPU(program: [
+            0xf345, 0x0500, // sbfx r5, r5, #0, #1, real word from the actual kernel
+        ])
+        cpu.registers[5] = 0b1 // bit 0 set
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[5], 0xFFFF_FFFF)
+    }
+
+    func testSbfxExtractsZeroBitAsZero() {
+        let cpu = makeThumbCPU(program: [
+            0xf345, 0x0500, // sbfx r5, r5, #0, #1, real word from the actual kernel
+        ])
+        cpu.registers[5] = 0b10 // bit 0 clear, bit 1 set (outside the extracted field)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[5], 0)
+    }
+
     func testBfcClearsBitFieldRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xf36f, 0x000b, // bfc r0, #0, #0xc, real word from the actual kernel

@@ -387,8 +387,8 @@ struct BitFieldInsertInstruction: Equatable {
 }
 
 /// `UBFX Rd, Rn, #lsb, #width` (ARM state): unsigned bit-field extract —
-/// this is a *different* encoding from Thumb-2's `UBFX`
-/// (`ThumbUbfxInstruction`), sharing ARM state's "media instructions"
+/// this is a *different* encoding from Thumb-2's `UBFX`/`SBFX`
+/// (`ThumbBitFieldExtractInstruction`), sharing ARM state's "media instructions"
 /// bits[27:25]==011,bit4==1 gate with `BFI`/`BFC`/`REV`/`UQSUB8` rather
 /// than Thumb's "data-processing plain binary immediate" space. Keyed
 /// on bits[27:21] == `0b0111111` (one more than `BFI`/`BFC`'s
@@ -401,6 +401,33 @@ struct BitFieldExtractInstruction: Equatable {
     let rn: Int
     let lsb: Int
     let width: Int
+}
+
+/// `VRSHL.<type><size> Dd, Dm, Dn`: Advanced SIMD (NEON) vector rounding
+/// shift left — per lane, `Dd[i] = Dm[i] << SInt(Dn[i]<7:0>)` for a
+/// non-negative shift, or a rounding right shift by the negated amount
+/// otherwise (ARM DDI 0406C A8.8.316). `unsigned` selects a logical vs.
+/// arithmetic right shift for that rounding path (irrelevant for a plain
+/// left shift, which is the same bit pattern either way). Only this one
+/// opcode from NEON's large "three registers of the same length" space
+/// (opc bits[11:8]) is decoded, `Q`-register (128-bit) width isn't
+/// (bit6==0 required) — confirmed via Capstone against a real word from
+/// the actual kernel ("vrshl.u8 d16, d0, d5", the instruction that halted
+/// execution before any NEON encoding was decoded at all).
+struct VRSHLInstruction: Equatable {
+    enum ElementSize: UInt8 {
+        case bits8 = 0, bits16 = 1, bits32 = 2, bits64 = 3
+    }
+
+    let unsigned: Bool
+    let size: ElementSize
+    /// `Dd`, `Dm` (the value being shifted), `Dn` (the per-lane shift
+    /// amount) — named to match `VRSHL`'s own real assembly operand
+    /// order, not the raw encoding's `Vd`/`Vn`/`Vm` field letters (`Vn`
+    /// is the shift amount here, `Vm` the shifted value).
+    let vd: Int
+    let vm: Int
+    let vn: Int
 }
 
 enum ARMInstruction: Equatable {
@@ -432,13 +459,17 @@ enum ARMInstruction: Equatable {
     /// this CPU, correctly implementing any of these *is* treating them
     /// as a no-op, not a missing feature.
     case memoryBarrier
+    case vectorRoundingShiftLeft(VRSHLInstruction)
     /// A recognized-but-not-yet-implemented instruction family: multiply
     /// and the "extra load/store" SWP/reserved encodings (SH==00), the
     /// `S`-bit form of block data transfer (see
     /// `BlockDataTransferInstruction`'s doc comment), register-shifted-
     /// by-register operand2, most of the coprocessor space (anything but
-    /// MCR/MRC), SWI, and most of the unconditional-instruction-extension
-    /// space (anything but CPS and the DSB/DMB/ISB barriers).
+    /// MCR/MRC), SWI, most of the unconditional-instruction-extension
+    /// space (anything but CPS and the DSB/DMB/ISB barriers), and all of
+    /// NEON except `VRSHL` (`Q`-register width, and every other opcode in
+    /// its "three registers of the same length" encoding family — VADD,
+    /// VMUL, VAND, VMAX, dozens more — sharing that same bit shape).
     case unsupported(rawWord: UInt32)
     /// A genuinely undefined/reserved encoding.
     case undefined(rawWord: UInt32)

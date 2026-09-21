@@ -470,6 +470,25 @@ enum ARMDecoder {
             return .memoryBarrier
         }
 
+        // VRSHL (NEON "three registers of the same length" family,
+        // bits[31:25]==0b1111001, opc bits[11:8]==0b0101): field layout
+        // (U/D/size/Vn/Vd/N/Q/M/Vm, and which disassembly operand each
+        // maps to) empirically confirmed by varying each field one at a
+        // time through Capstone against the real halting word
+        // (0xF3450500 = "vrshl.u8 d16, d0, d5"), not read off a manual
+        // table from memory. Only opc==0b0101 (VRSHL) and Q==0 (D-register
+        // width) are decoded; every other opcode/width in this same shape
+        // stays `.unsupported` until a real word confirms one is needed.
+        if word.bitField(31, 25) == 0b1111_001, word.bitField(11, 8) == 0b0101, !word.bit(6) {
+            guard let size = VRSHLInstruction.ElementSize(rawValue: UInt8(word.bitField(21, 20))) else {
+                return .unsupported(rawWord: word)
+            }
+            let vd = Int((word.bit(22) ? 1 << 4 : 0) | word.bitField(15, 12))
+            let vm = Int((word.bit(5) ? 1 << 4 : 0) | word.bitField(3, 0))
+            let vn = Int((word.bit(7) ? 1 << 4 : 0) | word.bitField(19, 16))
+            return .vectorRoundingShiftLeft(VRSHLInstruction(unsigned: word.bit(24), size: size, vd: vd, vm: vm, vn: vn))
+        }
+
         return .unsupported(rawWord: word)
     }
 }

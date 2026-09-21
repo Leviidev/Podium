@@ -181,6 +181,43 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers.pc, 8)
     }
 
+    func testVrshlLeftShiftsEachByteLaneWithNoRounding() {
+        // vrshl.u8 d16, d0, d5 — real word from the actual kernel.
+        let cpu = makeCPU(program: [0xF345_0500])
+        cpu.neon[0] = 0x0807_0605_0403_0201 // Vm (shifted value): bytes 1...8
+        cpu.neon[5] = 0x0101_0101_0101_0101 // Vn (shift amount): +1 in every lane
+
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[16], 0x100E_0C0A_0806_0402) // each byte doubled
+    }
+
+    func testVrshlNegativeShiftRoundsRightUnsigned() {
+        // vrshl.u8 d16, d0, d5 — real word from the actual kernel.
+        let cpu = makeCPU(program: [0xF345_0500])
+        cpu.neon[0] = 0xFFFF_FFFF_FFFF_FFFF // Vm: 255 in every lane
+        cpu.neon[5] = 0xFFFF_FFFF_FFFF_FFFF // Vn: -1 (0xFF) in every lane
+
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Unsigned rounding shift right by 1: (255 + 1) >> 1 == 128.
+        XCTAssertEqual(cpu.neon[16], 0x8080_8080_8080_8080)
+    }
+
+    func testVrshlZeroShiftLeavesValueUnchanged() {
+        // vrshl.u8 d16, d0, d5 — real word from the actual kernel.
+        let cpu = makeCPU(program: [0xF345_0500])
+        cpu.neon[0] = 0x1122_3344_5566_7788
+        cpu.neon[5] = 0 // shift amount 0 in every lane
+
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[16], 0x1122_3344_5566_7788)
+    }
+
     func testMcrThenMrcRoundTripsThroughCP15() {
         let cpu = makeCPU(program: [
             0xE3A0_302A, // MOV r3, #42

@@ -110,10 +110,34 @@ final class ThumbDecoderTests: XCTestCase {
         guard case .bitFieldExtract(let instr) = ThumbDecoder.decode(0xf3c0, 0x0040) else {
             return XCTFail("Expected bitFieldExtract")
         }
+        XCTAssertFalse(instr.signed)
         XCTAssertEqual(instr.rd, 0)
         XCTAssertEqual(instr.rn, 0)
         XCTAssertEqual(instr.lsb, 1)
         XCTAssertEqual(instr.width, 1)
+    }
+
+    func testDecodesSbfxFromRealKernel() {
+        // sbfx r5, r5, #0, #1 — from the real kernel, the instruction
+        // that halted execution before this op value was decoded at all.
+        guard case .bitFieldExtract(let instr) = ThumbDecoder.decode(0xf345, 0x0500) else {
+            return XCTFail("Expected bitFieldExtract")
+        }
+        XCTAssertTrue(instr.signed)
+        XCTAssertEqual(instr.rd, 5)
+        XCTAssertEqual(instr.rn, 5)
+        XCTAssertEqual(instr.lsb, 0)
+        XCTAssertEqual(instr.width, 1)
+    }
+
+    func testDecodesLdrPcRelativeFromRealKernel() {
+        // ldr r0, [pc, #0x24] — from the real kernel, the instruction
+        // that halted execution before format 6 was decoded at all.
+        guard case .loadPCRelative(let instr) = ThumbDecoder.decode(0x4809, 0) else {
+            return XCTFail("Expected loadPCRelative")
+        }
+        XCTAssertEqual(instr.rt, 0)
+        XCTAssertEqual(instr.offset, 0x24)
     }
 
     func testDecodesAddwFromRealKernel() {

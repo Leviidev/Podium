@@ -133,6 +133,8 @@ extension ARMv7CPU {
             executeThumbBranchExchange(instr, instructionAddress: instructionAddress)
         case .loadStoreImmediate(let instr):
             executeThumbLoadStoreImmediate(instr)
+        case .loadPCRelative(let instr):
+            executeThumbLoadPCRelative(instr, instructionAddress: instructionAddress)
         case .loadStoreRegisterOffset(let instr):
             executeThumbLoadStoreRegisterOffset(instr)
         case .address(let instr):
@@ -439,6 +441,22 @@ extension ARMv7CPU {
         }
     }
 
+    /// Format 6: base is `Align(PC,4)` — this instruction's own address
+    /// + 4, word-aligned down — exactly `executeThumbAddress`'s `usesSP
+    /// == false` case, since both formats share the identical real ARM
+    /// PC-relative-base rule.
+    private func executeThumbLoadPCRelative(_ instr: ThumbLoadPCRelativeInstruction, instructionAddress: UInt32) {
+        let address = ((instructionAddress &+ 4) & ~UInt32(0b11)) &+ instr.offset
+        do {
+            let physicalAddress = try translatedAddress(address, access: .read)
+            registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+        } catch let memoryError as MemoryAccessError {
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
+        } catch {
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
+        }
+    }
+
     // MARK: - Formats 7/8: register-offset load/store
 
     private func executeThumbLoadStoreRegisterOffset(_ instr: ThumbLoadStoreRegisterOffsetInstruction) {
@@ -650,11 +668,21 @@ extension ARMv7CPU {
         }
     }
 
-    /// `UBFX`: zero-extending unsigned bit-field extract. Doesn't
-    /// affect flags.
-    private func executeThumbBitFieldExtract(_ instr: ThumbUbfxInstruction) {
-        let mask: UInt32 = instr.width >= 32 ? 0xFFFF_FFFF : (UInt32(1) << instr.width) - 1
-        registers[instr.rd] = (registers[instr.rn] >> instr.lsb) & mask
+    /// `UBFX`/`SBFX`: zero- or sign-extending bit-field extract. Doesn't
+    /// affect flags. The signed path shifts the extracted field up to
+    /// the register's top bit and back down arithmetically — the
+    /// standard sign-extension-by-shift idiom — rather than a
+    /// mask-and-branch, so it's correct even when `width == 32` (nothing
+    /// to extend, the shifts are no-ops).
+    private func executeThumbBitFieldExtract(_ instr: ThumbBitFieldExtractInstruction) {
+        let extracted = registers[instr.rn] >> instr.lsb
+        if instr.signed {
+            let shift = UInt32(32 - instr.width)
+            registers[instr.rd] = UInt32(bitPattern: Int32(bitPattern: extracted << shift) >> shift)
+        } else {
+            let mask: UInt32 = instr.width >= 32 ? 0xFFFF_FFFF : (UInt32(1) << instr.width) - 1
+            registers[instr.rd] = extracted & mask
+        }
     }
 
     private func executeThumbAddWide(_ instr: ThumbAddWideInstruction) {

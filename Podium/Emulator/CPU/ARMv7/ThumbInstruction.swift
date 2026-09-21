@@ -117,6 +117,23 @@ struct ThumbLoadStoreImmediateInstruction: Equatable {
     let offset: UInt32
 }
 
+/// Format 6: `LDR Rd, [PC, #imm8*4]` — a PC-relative literal pool load.
+/// Deliberately its own instruction rather than reusing
+/// `ThumbLoadStoreImmediateInstruction` with `rn == Registers.pcIndex`:
+/// real ARM semantics define the base as `Align(PC,4)`, where `PC` here
+/// means *this instruction's own address + 4* (the classic pipeline
+/// convention), word-aligned down regardless of whether this 16-bit
+/// instruction itself sits at a 4-byte-aligned address — not simply
+/// "whatever `registers.pc` currently holds", which by execute time
+/// already points at the *next* instruction (+2, not +4) and isn't
+/// aligned.
+struct ThumbLoadPCRelativeInstruction: Equatable {
+    let rt: Int
+    /// Already scaled (×4) — the raw field's own imm8 differs by this
+    /// scale factor, resolved at decode time.
+    let offset: UInt32
+}
+
 /// Format 12: `ADD Rd, PC/SP, #imm8*4` — an address-formation add, not
 /// a flag-setting one.
 struct ThumbAddressInstruction: Equatable {
@@ -257,15 +274,18 @@ struct ThumbMovWideInstruction: Equatable {
     let imm16: UInt16
 }
 
-/// `UBFX` (Thumb-2, 32-bit): unsigned bit-field extract — copies
-/// `width` bits starting at bit `lsb` of `Rn` into `Rd`'s low bits,
-/// zero-extending the rest. Doesn't affect flags. Shares the same
-/// top-level 32-bit "data-processing (plain binary immediate)" op
-/// field as `MOVW`/`MOVT` (`hw0` bits[9:4]) — verified against a real
-/// `ubfx r0, r0, #1, #1` word from the actual kernel (`hw0=0xF3C0`,
-/// `hw1=0x0040`): op field `0b111100`, `lsb = (imm3<<2)|imm2`,
+/// `UBFX`/`SBFX` (Thumb-2, 32-bit): unsigned/signed bit-field extract —
+/// copies `width` bits starting at bit `lsb` of `Rn` into `Rd`'s low
+/// bits, zero- or sign-extending the rest per `signed`. Doesn't affect
+/// flags. Both share the same top-level 32-bit "data-processing (plain
+/// binary immediate)" op field as `MOVW`/`MOVT` (`hw0` bits[9:4]),
+/// differing only in that field's value — verified against real kernel
+/// words for each: `ubfx r0, r0, #1, #1` (`hw0=0xF3C0`, `hw1=0x0040`, op
+/// field `0b111100`) and `sbfx r5, r5, #0, #1` (`hw0=0xF345`,
+/// `hw1=0x0500`, op field `0b110100`). Both: `lsb = (imm3<<2)|imm2`,
 /// `width = widthm1+1`.
-struct ThumbUbfxInstruction: Equatable {
+struct ThumbBitFieldExtractInstruction: Equatable {
+    let signed: Bool
     let rd: Int
     let rn: Int
     let lsb: Int
@@ -533,6 +553,7 @@ enum ThumbInstruction: Equatable {
     case hiRegister(ThumbHiRegisterInstruction)
     case branchExchange(ThumbBranchExchangeInstruction)
     case loadStoreImmediate(ThumbLoadStoreImmediateInstruction)
+    case loadPCRelative(ThumbLoadPCRelativeInstruction)
     case loadStoreRegisterOffset(ThumbLoadStoreRegisterOffsetInstruction)
     case address(ThumbAddressInstruction)
     case adjustStack(ThumbAdjustStackInstruction)
@@ -553,7 +574,7 @@ enum ThumbInstruction: Equatable {
     case memoryBarrier
     case it(ThumbItInstruction)
     case movWide(ThumbMovWideInstruction)
-    case bitFieldExtract(ThumbUbfxInstruction)
+    case bitFieldExtract(ThumbBitFieldExtractInstruction)
     case addWide(ThumbAddWideInstruction)
     case adr(ThumbAdrInstruction)
     case bitFieldInsert(ThumbBitFieldInsertInstruction)

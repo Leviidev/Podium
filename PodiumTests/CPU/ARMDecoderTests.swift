@@ -366,6 +366,22 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.mode, 0x17)
     }
 
+    func testDecodesVrshlFromRealKernel() {
+        // vrshl.u8 d16, d0, d5 — from the real kernel, the instruction
+        // that halted execution before any NEON encoding was decoded at
+        // all. Field-to-operand mapping empirically confirmed via
+        // Capstone (see ARMDecoder's decode-site comment), not read off a
+        // manual table from memory.
+        guard case .vectorRoundingShiftLeft(let instr) = ARMDecoder.decode(0xF345_0500) else {
+            return XCTFail("Expected vectorRoundingShiftLeft")
+        }
+        XCTAssertTrue(instr.unsigned)
+        XCTAssertEqual(instr.size, .bits8)
+        XCTAssertEqual(instr.vd, 16)
+        XCTAssertEqual(instr.vm, 0)
+        XCTAssertEqual(instr.vn, 5)
+    }
+
     func testDecodesIsbFromRealKernel() {
         // isb sy, from the real kernel at 0x8008609c.
         guard case .memoryBarrier = ARMDecoder.decode(0xF57F_F06F) else {

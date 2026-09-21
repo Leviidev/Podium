@@ -130,6 +130,19 @@ enum ThumbDecoder {
             return .hiRegister(ThumbHiRegisterInstruction(op: op, rdn: rdn, rm: rm))
         }
 
+        // Format 6: LDR Rd, [PC, #imm8*4] — a PC-relative literal load
+        // (see ThumbLoadPCRelativeInstruction's doc comment for why this
+        // is its own case rather than reusing the generic immediate
+        // load/store with rn==PC). Verified against a real
+        // `ldr r0, [pc, #0x24]` word from the actual kernel, the
+        // instruction that halted execution before this format was
+        // decoded at all.
+        if hw0.bitField16(15, 11) == 0b01001 {
+            return .loadPCRelative(ThumbLoadPCRelativeInstruction(
+                rt: Int(hw0.bitField16(10, 8)), offset: UInt32(hw0.bitField16(7, 0)) * 4
+            ))
+        }
+
         // Formats 7/8: register-offset STR/STRH/STRB/LDRSB/LDR/LDRH/
         // LDRB/LDRSH Rd, [Rn, Rm]. bits[15:12] == 0101 (fixed),
         // bits[11:9] select the 8-way opcode. Verified against a real
@@ -615,7 +628,10 @@ enum ThumbDecoder {
             // USAT/UBFX/…) keyed on the 6-bit field hw0.bits[9:4], of
             // which MOVW/MOVT (0b10T100), UBFX (0b111100, verified
             // against a real `ubfx r0, r0, #1, #1` word: hw0=0xF3C0,
-            // hw1=0x0040), and ADDW (0b100000 with Rn!=1111, verified
+            // hw1=0x0040), SBFX (0b110100, verified against a real
+            // `sbfx r5, r5, #0, #1` word: hw0=0xF345, hw1=0x0500 — the
+            // instruction that halted execution before this op value was
+            // decoded at all), and ADDW (0b100000 with Rn!=1111, verified
             // against a real `addw r0, r4, #0x4d4` word: hw0=0xF204,
             // hw1=0x40D4) are decoded.
             if hw0.bit16(9) {
@@ -630,13 +646,17 @@ enum ThumbDecoder {
                     let imm16 = (UInt32(imm4) << 12) | (i << 11) | (UInt32(imm3) << 8) | UInt32(imm8)
                     return .movWide(ThumbMovWideInstruction(isTop: isTop, rd: Int(hw1.bitField16(11, 8)), imm16: UInt16(imm16)))
                 }
-                if opField == 0b111100 {
-                    // UBFX: lsb = imm3:imm2, width = widthm1 + 1.
+                if opField == 0b111100 || opField == 0b110100 {
+                    // UBFX (0b111100) / SBFX (0b110100): lsb = imm3:imm2,
+                    // width = widthm1 + 1 — identical field layout,
+                    // differing only in this op value and zero- vs
+                    // sign-extension.
                     let imm3 = Int(hw1.bitField16(14, 12))
                     let imm2 = Int(hw1.bitField16(7, 6))
                     let lsb = (imm3 << 2) | imm2
                     let widthMinus1 = Int(hw1.bitField16(4, 0))
-                    return .bitFieldExtract(ThumbUbfxInstruction(
+                    return .bitFieldExtract(ThumbBitFieldExtractInstruction(
+                        signed: opField == 0b110100,
                         rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)), lsb: lsb, width: widthMinus1 + 1
                     ))
                 }
