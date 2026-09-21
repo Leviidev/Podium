@@ -144,6 +144,8 @@ extension ARMv7CPU {
             executeThumbMovWide(instr)
         case .bitFieldExtract(let instr):
             executeThumbBitFieldExtract(instr)
+        case .addWide(let instr):
+            executeThumbAddWide(instr)
         case .dataProcessingImmediate(let instr):
             executeThumbDataProcessingImmediate(instr)
         case .dataProcessingShiftedRegister(let instr):
@@ -589,6 +591,10 @@ extension ARMv7CPU {
     private func executeThumbBitFieldExtract(_ instr: ThumbUbfxInstruction) {
         let mask: UInt32 = instr.width >= 32 ? 0xFFFF_FFFF : (UInt32(1) << instr.width) - 1
         registers[instr.rd] = (registers[instr.rn] >> instr.lsb) & mask
+    }
+
+    private func executeThumbAddWide(_ instr: ThumbAddWideInstruction) {
+        registers[instr.rd] = registers[instr.rn] &+ UInt32(instr.imm12)
     }
 
     // MARK: - Thumb-2: data-processing (modified immediate)

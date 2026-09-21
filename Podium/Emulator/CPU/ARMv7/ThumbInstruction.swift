@@ -220,6 +220,21 @@ struct ThumbUbfxInstruction: Equatable {
     let width: Int
 }
 
+/// `ADDW Rd, Rn, #imm12` (Thumb-2, 32-bit): a plain, non-flag-setting
+/// 12-bit-immediate add — a different encoding from the modified-
+/// immediate `ADD` (`ThumbDataProcessingImmediateInstruction`), sharing
+/// the same "data-processing plain binary immediate" op field as
+/// `MOVW`/`MOVT`/`UBFX` (`hw0` bits[8:4] == `0b00000`, `Rn != 1111`;
+/// `Rn == 1111` is `ADR` instead, not decoded here). `imm12 =
+/// i:imm3:imm8`, the same construction `MOVW`'s `imm16` uses minus its
+/// `imm4` field. Verified against a real `addw r0, r4, #0x4d4` word
+/// from the actual kernel. Doesn't affect flags.
+struct ThumbAddWideInstruction: Equatable {
+    let rd: Int
+    let rn: Int
+    let imm12: UInt16
+}
+
 /// The 32-bit "data-processing (modified immediate)" op-field table —
 /// distinct from `ThumbDataProcessingOp` (format 4's table): the two
 /// share no bit-value in common (confirmed against real kernel words:
@@ -428,6 +443,7 @@ enum ThumbInstruction: Equatable {
     case it(ThumbItInstruction)
     case movWide(ThumbMovWideInstruction)
     case bitFieldExtract(ThumbUbfxInstruction)
+    case addWide(ThumbAddWideInstruction)
     case dataProcessingImmediate(ThumbDataProcessingImmediateInstruction)
     case dataProcessingShiftedRegister(ThumbDataProcessingShiftedRegisterInstruction)
     case branchLink(ThumbBranchLinkInstruction)
