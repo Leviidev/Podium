@@ -58,32 +58,52 @@ final class DeviceTreePatcherTests: XCTestCase {
         return range.lowerBound - tree.startIndex + 32 + 4
     }
 
-    func testPatchesOnlyTheSixNamedFrequencyPropertiesUnderCpusCpu0() {
+    func testExpandsTheSixNamedFrequencyPropertiesUnderCpusCpu0To8Bytes() {
         var tree = makeSyntheticDeviceTree()
-        let guestBase: UInt32 = 0x8100_0000
+        DeviceTreePatcher.patchClockPlaceholders(&tree)
 
-        DeviceTreePatcher.patchClockPlaceholders(&tree, guestBaseAddress: guestBase)
-
-        let frequencyNames = ["bus-frequency", "peripheral-frequency", "memory-frequency", "timebase-frequency", "clock-frequency", "fixed-frequency"]
-        for name in frequencyNames {
+        let expected: [String: UInt64] = [
+            "bus-frequency": 0,
+            "peripheral-frequency": 0,
+            "memory-frequency": 0,
+            "timebase-frequency": 24_000_000,
+            "clock-frequency": 0,
+            "fixed-frequency": 0,
+        ]
+        for (name, expectedValue) in expected {
             guard let offset = valueOffset(of: name, in: tree) else {
                 return XCTFail("Could not locate \(name) in the patched tree")
             }
-            let value = tree.readUInt32LE(at: offset)
-            XCTAssertEqual(value, guestBase &+ UInt32(offset), "\(name) should self-reference its own address")
+            XCTAssertEqual(tree.readUInt32LE(at: offset - 4), 8, "\(name)'s length field should now be 8")
+            let low = UInt64(tree.readUInt32LE(at: offset))
+            let high = UInt64(tree.readUInt32LE(at: offset + 4))
+            XCTAssertEqual(low | (high << 32), expectedValue, "\(name) should hold its real/zero-extended 64-bit value")
         }
 
         // The unrelated property (not in the patch list) must be untouched.
         guard let unrelatedOffset = valueOffset(of: "unrelated-4byte-prop", in: tree) else {
             return XCTFail("Could not locate unrelated-4byte-prop in the patched tree")
         }
-        XCTAssertEqual(tree.readUInt32LE(at: unrelatedOffset), 0, "unrelated-4byte-prop must be left alone")
+        XCTAssertEqual(tree.readUInt32LE(at: unrelatedOffset - 4), 4, "unrelated-4byte-prop's length must stay 4")
+        XCTAssertEqual(tree.readUInt32LE(at: unrelatedOffset), 0, "unrelated-4byte-prop's value must stay untouched")
     }
 
-    func testLeavesTreeSizeUnchanged() {
+    func testGrowsTreeByExactlyFourBytesPerExpandedProperty() {
         var tree = makeSyntheticDeviceTree()
         let originalSize = tree.count
-        DeviceTreePatcher.patchClockPlaceholders(&tree, guestBaseAddress: 0x8100_0000)
-        XCTAssertEqual(tree.count, originalSize, "patching values in place must never resize the tree")
+        DeviceTreePatcher.patchClockPlaceholders(&tree)
+        // Six properties, each growing from a 4-byte value to an
+        // 8-byte one: +4 bytes apiece, nothing else changes size.
+        XCTAssertEqual(tree.count, originalSize + 6 * 4)
+    }
+
+    func testIsIdempotent() {
+        var tree = makeSyntheticDeviceTree()
+        DeviceTreePatcher.patchClockPlaceholders(&tree)
+        let onceSize = tree.count
+        // A second pass must not find any more 4-byte placeholders to
+        // expand (they're all 8 bytes now), so nothing should change.
+        DeviceTreePatcher.patchClockPlaceholders(&tree)
+        XCTAssertEqual(tree.count, onceSize)
     }
 }

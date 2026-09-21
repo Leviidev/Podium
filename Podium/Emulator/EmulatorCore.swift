@@ -160,6 +160,19 @@ final class EmulatorCore {
         // hands the kernel, and `topOfKernelData` below is computed to
         // cover it, so there's no risk of the kernel's own early
         // allocator reusing this range.
+        // The shipped device tree is the unpopulated IPSW template —
+        // iBoot never ran to patch in real clock/serial data. A
+        // handful of clock properties, left at their shipped 4-byte
+        // `0`, make the real kernel dereference `0` as a pointer (a
+        // genuine quirk of how a Thumb IT block's flags interact here
+        // — see DeviceTreePatcher's doc comment). Patching happens
+        // before any size-dependent layout below, since expanding
+        // those properties to their real 8-byte encoding changes the
+        // tree's total length.
+        if deviceTree != nil {
+            DeviceTreePatcher.patchClockPlaceholders(&deviceTree!)
+        }
+
         let deviceTreeAddress = (bootArgsAddress + UInt32(BootArgsBuilder.structSize) + 0xFFF) & ~UInt32(0xFFF)
         let deviceTreeLength = UInt32(deviceTree?.count ?? 0)
         let topOfKernelData = (deviceTreeAddress + deviceTreeLength + 0x3FFF) & ~UInt32(0x3FFF)
@@ -173,16 +186,7 @@ final class EmulatorCore {
         )
         do {
             try memory.writeBytes(bootArgs, at: bootArgsAddress)
-            if var deviceTree {
-                // The shipped device tree is the unpopulated IPSW
-                // template — iBoot never ran to patch in real
-                // clock/serial data. A handful of clock properties, if
-                // left at their shipped `0`, make the real kernel
-                // dereference that `0` as a pointer (a genuine quirk of
-                // how a Thumb IT block's flags interact here — see
-                // DeviceTreePatcher's doc comment). This only makes
-                // that pointer valid; it doesn't fabricate a frequency.
-                DeviceTreePatcher.patchClockPlaceholders(&deviceTree, guestBaseAddress: deviceTreeAddress)
+            if let deviceTree {
                 try memory.writeBytes(deviceTree, at: deviceTreeAddress)
                 appendLog("Device tree written at 0x\(deviceTreeAddress.hexString8) (\(Int64(deviceTree.count).formattedByteCount)).")
             }
