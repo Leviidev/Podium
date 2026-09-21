@@ -65,13 +65,25 @@ final class EmulatorCore {
         guard cpu == nil else { return }
 
         let ram = FlatPhysicalMemory(length: Self.physicalMemorySize, baseAddress: Self.physicalMemoryBaseAddress)
+        // A small on-chip SRAM at low physical addresses, entirely
+        // separate from the external DRAM window at
+        // `physicalMemoryBaseAddress` — a standard feature on SoCs of
+        // this era (and this one specifically: a real page-table walk
+        // this session hit a coarse second-level table the kernel's
+        // own pmap had allocated at physical `0x3000`, well below
+        // DRAM, while mapping the `arm-io` peripheral bus — real
+        // hardware plausibly keeps early/critical page tables in this
+        // always-present on-chip SRAM rather than general DRAM). Not
+        // firmware-specific like the peripheral map below, so backed
+        // unconditionally here rather than waiting on a device tree.
+        let lowSRAM = FlatPhysicalMemory(length: 0x0010_0000, baseAddress: 0)
         // Real SoC peripheral registers live at physical addresses
         // nowhere near DRAM — see `SegmentedMemoryBus`'s doc comment.
-        // Only RAM is known at this point; `attemptBoot` enriches this
-        // same bus with the real peripheral map once a specific
+        // Only RAM/SRAM are known at this point; `attemptBoot` enriches
+        // this same bus with the real peripheral map once a specific
         // firmware's device tree has actually been read (see
         // `DeviceTreeMemoryMap`).
-        let bus = SegmentedMemoryBus(regions: [ram])
+        let bus = SegmentedMemoryBus(regions: [ram, lowSRAM])
         let armCPU = ARMv7CPU(memory: bus, jit: JITEngine())
         armCPU.reset()
 
