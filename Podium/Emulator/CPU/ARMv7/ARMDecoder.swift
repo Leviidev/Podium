@@ -432,20 +432,28 @@ enum ARMDecoder {
             return .branchLinkExchangeImmediate(BranchLinkExchangeImmediateInstruction(signedOffset: signedOffset))
         }
 
-        // CPS: bits[27:20] == 0b0001_0000 (fixed).
+        // CPS: bits[27:20] == 0b0001_0000 (fixed). bit17 (mmod/M) and
+        // bits[4:0] (mode) carry an independent mode change that applies
+        // regardless of imod — confirmed against a real word from the
+        // actual kernel's Data Abort handler setup ("cpsid if, #0x17",
+        // entering Abort mode with IRQ/FIQ masked in one instruction).
+        // imod==0b00 with mmod set is real boot code's per-mode-stack-setup
+        // idiom (`CPS #<mode>`, no IE/ID prefix — mode change only, no mask
+        // change); only mmod==0 with imod==0b00/0b01 is genuinely
+        // UNPREDICTABLE (asks for neither a mask change nor a mode change).
         if word.bitField(27, 20) == 0b0001_0000 {
             let imod = word.bitField(19, 18)
-            // imod == 0b10/0b11 select enable/disable; 0b00/0b01 are
-            // reserved for a form (changing mode without touching masks)
-            // this CPU doesn't model.
-            guard imod == 0b10 || imod == 0b11 else {
+            let mmod = word.bit(17)
+            guard imod == 0b10 || imod == 0b11 || mmod else {
                 return .unsupported(rawWord: word)
             }
             return .changeProcessorState(ChangeProcessorStateInstruction(
                 enable: imod == 0b10,
                 affectsAbort: word.bit(8),
                 affectsIRQ: word.bit(7),
-                affectsFIQ: word.bit(6)
+                affectsFIQ: word.bit(6),
+                changesMode: mmod,
+                mode: word.bitField(4, 0)
             ))
         }
 

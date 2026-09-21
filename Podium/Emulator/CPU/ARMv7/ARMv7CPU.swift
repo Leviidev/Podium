@@ -83,6 +83,7 @@ final class ARMv7CPU: CPU {
 
     static let modeBitsMask: UInt32 = 0x1F
     static let userModeBits: UInt32 = 0b10000
+    static let svcModeBits: UInt32 = 0b10011
     static let systemModeBits: UInt32 = 0b11111
     static let abortModeBits: UInt32 = 0b10111
 
@@ -531,6 +532,17 @@ final class ARMv7CPU: CPU {
         // affectsAbort (the 'A' bit) isn't modeled: CPSR doesn't expose
         // an abort mask bit yet, and nothing raises an abort exception
         // for it to gate.
+
+        // Real ARM boot code's per-mode-stack-setup idiom: `CPS #<mode>`
+        // (mode-only) or `CPSID if, #<mode>` (masks + mode together) to
+        // enter each exception mode just long enough to give it a real
+        // `SP` via a following `LDR SP, =...` /`MOV SP, ...`, exactly like
+        // `executeMoveToStatusRegister`'s `MSR CPSR_c` mode-change path.
+        if instr.changesMode {
+            let oldModeBits = cpsr.rawValue & Self.modeBitsMask
+            cpsr.rawValue = (cpsr.rawValue & ~Self.modeBitsMask) | (instr.mode & Self.modeBitsMask)
+            switchProcessorMode(from: oldModeBits, to: instr.mode & Self.modeBitsMask)
+        }
     }
 
     private func executeUqsub8(_ instr: UQSub8Instruction) {

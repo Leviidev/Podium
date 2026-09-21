@@ -338,6 +338,32 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertFalse(instr.affectsAbort)
         XCTAssertTrue(instr.affectsIRQ)
         XCTAssertTrue(instr.affectsFIQ)
+        XCTAssertFalse(instr.changesMode)
+    }
+
+    func testDecodesCpsWithModeChangeFromRealKernel() {
+        // cpsid i, #0x13 — from the real kernel's Data Abort handler at
+        // 0x80084808 and again at 0x80084874, switching into SVC mode to
+        // reach a real (larger) stack for the handler's actual work —
+        // the mode-only/combined form this CPU didn't decode at all
+        // before (bit17 mmod + bits[4:0] mode, independent of imod).
+        guard case .changeProcessorState(let instr) = ARMDecoder.decode(0xF10E_0093) else {
+            return XCTFail("Expected changeProcessorState")
+        }
+        XCTAssertTrue(instr.changesMode)
+        XCTAssertEqual(instr.mode, 0x13)
+        XCTAssertTrue(instr.affectsIRQ)
+        XCTAssertFalse(instr.affectsFIQ)
+    }
+
+    func testDecodesCpsWithModeChangeToAbortFromRealKernel() {
+        // cpsid i, #0x17 — from the real kernel at 0x80084864, switching
+        // back into Abort mode from within the handler's SVC-mode work.
+        guard case .changeProcessorState(let instr) = ARMDecoder.decode(0xF10E_0097) else {
+            return XCTFail("Expected changeProcessorState")
+        }
+        XCTAssertTrue(instr.changesMode)
+        XCTAssertEqual(instr.mode, 0x17)
     }
 
     func testDecodesIsbFromRealKernel() {

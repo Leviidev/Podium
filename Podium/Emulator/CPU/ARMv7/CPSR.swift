@@ -23,11 +23,14 @@ struct CPSR {
     private static let fiqDisabledBit: UInt32 = 1 << 6
     private static let thumbBit: UInt32 = 1 << 5
 
-    /// System mode (0b11111): all registers unbanked, matching
-    /// `Registers`' unbanked model. Chosen over User mode only so
-    /// privileged-only encodings this CPU might later decode don't need
-    /// a separate "are we privileged" special case yet.
-    static let resetValue: UInt32 = 0b1_1111
+    /// Supervisor/SVC mode (0b10011) — real ARM hardware always resets
+    /// directly into SVC mode (ARM DDI 0406C B1.6.15), never System mode.
+    /// `ARMv7CPU`'s per-mode SP/LR/SPSR banking (`switchProcessorMode`)
+    /// depends on this being right: the kernel's `LC_UNIXTHREAD`-supplied
+    /// initial `SP` is only ever banked into SVC's own slot if the CPU
+    /// genuinely starts there, the same way real hardware would arrive at
+    /// the kernel's entry point already in SVC mode.
+    static let resetValue: UInt32 = 0b1_0011
 
     init(rawValue: UInt32 = CPSR.resetValue) {
         self.rawValue = rawValue

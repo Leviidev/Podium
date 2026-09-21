@@ -266,6 +266,13 @@ struct ChangeProcessorStateInstruction: Equatable {
     let affectsAbort: Bool
     let affectsIRQ: Bool
     let affectsFIQ: Bool
+    /// Whether this `CPS` also carries a mode change (the `mmod`/`M` bit,
+    /// bit17) — independent of `enable`/`affectsXxx`: real ARM boot code's
+    /// standard per-mode-stack-setup idiom (`CPS #<mode>` with no `IE`/`ID`
+    /// prefix, `imod==0b00`) changes *only* mode, touching no mask bits at
+    /// all.
+    let changesMode: Bool
+    let mode: UInt32
 }
 
 /// `UQSUB8 Rd, Rn, Rm`: four parallel unsigned 8-bit saturating

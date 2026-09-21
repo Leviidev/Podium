@@ -140,6 +140,36 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertTrue(cpu.cpsr.fiqDisabled)
     }
 
+    func testResetStartsInSupervisorMode() {
+        // Real ARM hardware always resets into SVC mode (ARM DDI 0406C
+        // B1.6.15) — never System mode. Getting this wrong meant the
+        // kernel's LC_UNIXTHREAD-supplied initial SP was never actually
+        // banked into SVC's own slot, so any later `CPS #0x13` "return to
+        // SVC" (e.g. from the Data Abort handler) read back an
+        // uninitialized SP instead of a real one.
+        let cpu = makeCPU(program: [])
+        XCTAssertEqual(cpu.cpsr.rawValue & ARMv7CPU.modeBitsMask, ARMv7CPU.svcModeBits)
+    }
+
+    func testCpsModeChangeSwitchesModeAndBanksPreviousModesStackPointer() {
+        // cpsid i, #0x13 -- real word from the actual kernel's Data Abort
+        // handler, switching into SVC mode.
+        let cpu = makeCPU(program: [0xF10E_0093])
+        cpu.registers.sp = 0x8020_0000 // SVC mode's own real stack
+        cpu.switchProcessorMode(from: ARMv7CPU.svcModeBits, to: ARMv7CPU.abortModeBits)
+        cpu.cpsr.rawValue = (cpu.cpsr.rawValue & ~ARMv7CPU.modeBitsMask) | ARMv7CPU.abortModeBits
+        cpu.registers.sp = 0x8123_4567 // Abort mode's own, distinct live SP
+
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.cpsr.rawValue & ARMv7CPU.modeBitsMask, ARMv7CPU.svcModeBits)
+        XCTAssertTrue(cpu.cpsr.irqDisabled)
+        // Returns to SVC mode's own real, previously-banked SP — not
+        // Abort's SP, and not the uninitialized-bank default of 0.
+        XCTAssertEqual(cpu.registers.sp, 0x8020_0000)
+    }
+
     func testMemoryBarriersAreNoOpsThatAdvancePC() {
         let cpu = makeCPU(program: [
             0xF57F_F04F, // dsb sy, real word from the actual kernel

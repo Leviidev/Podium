@@ -40,10 +40,20 @@ final class ManualRealFirmwareVerification: XCTestCase {
         }
 
         let topOfKernelData = (pramAddress + pramSize + 0x3FFF) & ~UInt32(0x3FFF)
+        // Mirrors EmulatorCore.attemptBoot's video setup exactly, so this
+        // trace reflects what the live app actually does now, not the
+        // pre-video-support boot path.
+        let video = BootVideoInfo(
+            baseAddress: EmulatorCore.framebufferPhysicalAddress, display: 1,
+            rowBytes: UInt32(EmulatorCore.framebufferWidth * 4),
+            width: UInt32(EmulatorCore.framebufferWidth), height: UInt32(EmulatorCore.framebufferHeight),
+            depth: 32
+        )
         let bootArgs = BootArgsBuilder.build(
             virtBase: EmulatorCore.physicalMemoryBaseAddress, physBase: EmulatorCore.physicalMemoryBaseAddress,
             memSize: UInt32(EmulatorCore.physicalMemorySize), topOfKernelData: topOfKernelData,
-            deviceTreeP: deviceTree != nil ? deviceTreeAddress : 0, deviceTreeLength: deviceTreeLength
+            deviceTreeP: deviceTree != nil ? deviceTreeAddress : 0, deviceTreeLength: deviceTreeLength,
+            video: video
         )
         try bus.writeBytes(bootArgs, at: bootArgsAddress)
         if let deviceTree { try bus.writeBytes(deviceTree, at: deviceTreeAddress) }
