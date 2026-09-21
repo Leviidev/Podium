@@ -23,6 +23,7 @@ final class EmulatorCore {
     private(set) var log: [EmulatorLogEntry] = []
     private(set) var cpu: CPU?
     private(set) var memory: MemoryBus?
+    private var segmentedBus: SegmentedMemoryBus?
 
     let audioOutput: AudioOutput
     let networkInterface: NetworkInterface
@@ -64,10 +65,18 @@ final class EmulatorCore {
         guard cpu == nil else { return }
 
         let ram = FlatPhysicalMemory(length: Self.physicalMemorySize, baseAddress: Self.physicalMemoryBaseAddress)
-        let armCPU = ARMv7CPU(memory: ram, jit: JITEngine())
+        // Real SoC peripheral registers live at physical addresses
+        // nowhere near DRAM — see `SegmentedMemoryBus`'s doc comment.
+        // Only RAM is known at this point; `attemptBoot` enriches this
+        // same bus with the real peripheral map once a specific
+        // firmware's device tree has actually been read (see
+        // `DeviceTreeMemoryMap`).
+        let bus = SegmentedMemoryBus(regions: [ram])
+        let armCPU = ARMv7CPU(memory: bus, jit: JITEngine())
         armCPU.reset()
 
         memory = ram
+        segmentedBus = bus
         cpu = armCPU
         status = .ready
         let baseHex = "0x" + Self.physicalMemoryBaseAddress.hexString8
@@ -171,6 +180,15 @@ final class EmulatorCore {
         // tree's total length.
         if deviceTree != nil {
             DeviceTreePatcher.patchClockPlaceholders(&deviceTree!)
+
+            // Real SoC peripheral registers this specific firmware's
+            // device tree declares (see `DeviceTreeMemoryMap`'s doc
+            // comment) — backed now, once actually known, rather than
+            // guessed at when the bus was first stood up.
+            let ramRange = Self.physicalMemoryBaseAddress..<(Self.physicalMemoryBaseAddress &+ UInt32(Self.physicalMemorySize))
+            for region in DeviceTreeMemoryMap.peripheralRegions(in: deviceTree!, excluding: ramRange) {
+                segmentedBus?.addRegion(FlatPhysicalMemory(length: Int(region.size), baseAddress: region.address))
+            }
         }
 
         let deviceTreeAddress = (bootArgsAddress + UInt32(BootArgsBuilder.structSize) + 0xFFF) & ~UInt32(0xFFF)
