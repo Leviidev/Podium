@@ -126,6 +126,17 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.imm12, 0x4D4)
     }
 
+    func testDecodesBfcFromRealKernel() {
+        // bfc r0, #0, #0xc — from the real kernel at 0x8007eefa.
+        guard case .bitFieldInsert(let instr) = ThumbDecoder.decode(0xf36f, 0x000b) else {
+            return XCTFail("Expected bitFieldInsert")
+        }
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertNil(instr.sourceRegister)
+        XCTAssertEqual(instr.lsb, 0)
+        XCTAssertEqual(instr.width, 12)
+    }
+
     func testDecodesBicImmediateFromRealKernel() {
         // bic r1, r1, #1 — from the real kernel at 0x802b8578.
         guard case .dataProcessingImmediate(let instr) = ThumbDecoder.decode(0xf021, 0x0101) else {

@@ -235,6 +235,23 @@ struct ThumbAddWideInstruction: Equatable {
     let imm12: UInt16
 }
 
+/// `BFI Rd, Rn, #lsb, #width` / `BFC Rd, #lsb, #width` (Thumb-2,
+/// 32-bit): a different encoding from ARM state's `BFI`/`BFC`
+/// (`BitFieldInsertInstruction`), sharing this file's "data-processing
+/// plain binary immediate" op field with `MOVW`/`MOVT`/`UBFX`/`ADDW`
+/// (op == `0b110110`). `Rn == 1111` is `BFC`: `sourceRegister: nil`
+/// inserts zero rather than reading the (non-existent) source
+/// register, matching ARM state's `BFC` semantics. `width = msb - lsb
+/// + 1`, where `msb`/`lsb` are the real word's own field names.
+/// Verified against a real `bfc r0, #0, #0xc` word from the actual
+/// kernel. Doesn't affect flags.
+struct ThumbBitFieldInsertInstruction: Equatable {
+    let rd: Int
+    let sourceRegister: Int?
+    let lsb: Int
+    let width: Int
+}
+
 /// The 32-bit "data-processing (modified immediate)" op-field table —
 /// distinct from `ThumbDataProcessingOp` (format 4's table): the two
 /// share no bit-value in common (confirmed against real kernel words:
@@ -450,6 +467,7 @@ enum ThumbInstruction: Equatable {
     case movWide(ThumbMovWideInstruction)
     case bitFieldExtract(ThumbUbfxInstruction)
     case addWide(ThumbAddWideInstruction)
+    case bitFieldInsert(ThumbBitFieldInsertInstruction)
     case dataProcessingImmediate(ThumbDataProcessingImmediateInstruction)
     case dataProcessingShiftedRegister(ThumbDataProcessingShiftedRegisterInstruction)
     case branchLink(ThumbBranchLinkInstruction)

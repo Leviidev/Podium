@@ -146,6 +146,8 @@ extension ARMv7CPU {
             executeThumbBitFieldExtract(instr)
         case .addWide(let instr):
             executeThumbAddWide(instr)
+        case .bitFieldInsert(let instr):
+            executeThumbBitFieldInsert(instr)
         case .dataProcessingImmediate(let instr):
             executeThumbDataProcessingImmediate(instr)
         case .dataProcessingShiftedRegister(let instr):
@@ -595,6 +597,15 @@ extension ARMv7CPU {
 
     private func executeThumbAddWide(_ instr: ThumbAddWideInstruction) {
         registers[instr.rd] = registers[instr.rn] &+ UInt32(instr.imm12)
+    }
+
+    /// `BFI`/`BFC`: `sourceRegister == nil` (`BFC`) inserts zero.
+    /// Doesn't affect flags.
+    private func executeThumbBitFieldInsert(_ instr: ThumbBitFieldInsertInstruction) {
+        let sourceValue = instr.sourceRegister.map { registers[$0] } ?? 0
+        let mask: UInt32 = instr.width >= 32 ? 0xFFFF_FFFF : (UInt32(1) << instr.width) - 1
+        let shiftedMask = mask << instr.lsb
+        registers[instr.rd] = (registers[instr.rd] & ~shiftedMask) | ((sourceValue & mask) << instr.lsb)
     }
 
     // MARK: - Thumb-2: data-processing (modified immediate)

@@ -482,6 +482,18 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 1)
     }
 
+    func testBfcClearsBitFieldRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xf36f, 0x000b, // bfc r0, #0, #0xc, real word from the actual kernel
+        ])
+        cpu.registers[0] = 0xFFFF_FFFF
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Low 12 bits cleared to zero, rest of r0 untouched.
+        XCTAssertEqual(cpu.registers[0], 0xFFFF_F000)
+    }
+
     func testMvnImmediateNegatesModifiedImmediateRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xf06f, 0x4570, // mvn r5, #0xf0000000, real word from the actual kernel

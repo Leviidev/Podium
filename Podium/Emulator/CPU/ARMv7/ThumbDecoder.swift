@@ -19,9 +19,10 @@ import Foundation
 /// 11), `ADD Rd,PC/SP,#imm` (format 12), SP adjustment (format 13),
 /// `PUSH`/`POP` (format 14), `SXTH`/`SXTB`/`UXTH`/`UXTB`, conditional
 /// and unconditional branch (formats 16/18), `CBZ`/`CBNZ`, and `IT`.
-/// Covers (32-bit): `MOVW`/`MOVT`, `UBFX`, and `ADDW` (all three sharing
-/// the same "data-processing plain binary immediate" op field), the
-/// data-processing modified-immediate family, the data-processing
+/// Covers (32-bit): `MOVW`/`MOVT`, `UBFX`, `ADDW`, and `BFI`/`BFC` (all
+/// sharing the same "data-processing plain binary immediate" op
+/// field), the data-processing modified-immediate family, the
+/// data-processing
 /// shifted-register family (sharing the same op table), `BL`, `BLX`
 /// (immediate), `B.W` (both the unconditional T4 form and the
 /// conditional T3 form, which carries its own condition field the same
@@ -37,8 +38,8 @@ import Foundation
 /// siblings), `LDREX`/`STREX` (Thumb-2 forms — `LDRD`/`STRD`'s
 /// siblings in that same space), `ADR` (`ADDW`'s `Rn==1111` sibling),
 /// the rest of the "plain binary immediate" op table (`SUBW`/`SSAT`/
-/// `SBFX`/`BFI`/`BFC`/`USAT`), the rest of the coprocessor space
-/// (`CDP`/`LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
+/// `SBFX`/`USAT`), the rest of the coprocessor space (`CDP`/`LDC`/
+/// `STC`), SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
     /// Whether `firstHalfword` opens a 32-bit Thumb-2 instruction (in
     /// which case the caller must fetch a second halfword before
@@ -551,6 +552,22 @@ enum ThumbDecoder {
                     let imm12 = (i << 11) | (UInt32(imm3) << 8) | UInt32(imm8)
                     return .addWide(ThumbAddWideInstruction(
                         rd: Int(hw1.bitField16(11, 8)), rn: Int(rn), imm12: UInt16(imm12)
+                    ))
+                }
+                if opField == 0b110110 {
+                    // BFI/BFC (see ThumbBitFieldInsertInstruction's doc
+                    // comment).
+                    let msb = Int(hw1.bitField16(4, 0))
+                    let lsb = (Int(hw1.bitField16(14, 12)) << 2) | Int(hw1.bitField16(7, 6))
+                    guard msb >= lsb else {
+                        return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+                    }
+                    let rn = hw0.bitField16(3, 0)
+                    return .bitFieldInsert(ThumbBitFieldInsertInstruction(
+                        rd: Int(hw1.bitField16(11, 8)),
+                        sourceRegister: rn == 0b1111 ? nil : Int(rn),
+                        lsb: lsb,
+                        width: msb - lsb + 1
                     ))
                 }
                 return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
