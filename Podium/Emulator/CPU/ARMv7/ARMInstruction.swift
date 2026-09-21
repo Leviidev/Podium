@@ -333,6 +333,23 @@ struct BitFieldInsertInstruction: Equatable {
     let width: Int
 }
 
+/// `UBFX Rd, Rn, #lsb, #width` (ARM state): unsigned bit-field extract —
+/// this is a *different* encoding from Thumb-2's `UBFX`
+/// (`ThumbUbfxInstruction`), sharing ARM state's "media instructions"
+/// bits[27:25]==011,bit4==1 gate with `BFI`/`BFC`/`REV`/`UQSUB8` rather
+/// than Thumb's "data-processing plain binary immediate" space. Keyed
+/// on bits[27:21] == `0b0111111` (one more than `BFI`/`BFC`'s
+/// `0b0111110`) and bits[6:4] == `0b101`. `width = widthm1 + 1`.
+/// Verified against a real `ubfx r3, r0, #3, #0xa` word from the actual
+/// kernel. Doesn't affect flags.
+struct BitFieldExtractInstruction: Equatable {
+    let condition: ARMCondition
+    let rd: Int
+    let rn: Int
+    let lsb: Int
+    let width: Int
+}
+
 enum ARMInstruction: Equatable {
     case dataProcessing(DataProcessingInstruction)
     case branch(BranchInstruction)
@@ -348,6 +365,7 @@ enum ARMInstruction: Equatable {
     case changeProcessorState(ChangeProcessorStateInstruction)
     case uqsub8(UQSub8Instruction)
     case bitFieldInsert(BitFieldInsertInstruction)
+    case bitFieldExtract(BitFieldExtractInstruction)
     case rev(RevInstruction)
     case clz(ClzInstruction)
     case loadExclusive(LoadExclusiveInstruction)

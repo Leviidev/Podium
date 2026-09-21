@@ -569,6 +569,19 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 0xFFFA_FFFF)
     }
 
+    func testUbfxArmStateExtractsBitFieldRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE7E9_31D0, // ubfx r3, r0, #3, #0xa -- real word from the actual kernel
+        ])
+        cpu.registers[0] = 0xFFFF_FFFF
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Extract 10 bits starting at bit 3: all-ones source gives an
+        // all-ones 10-bit result, zero-extended.
+        XCTAssertEqual(cpu.registers[3], 0x3FF)
+    }
+
     func testClzCountsLeadingZerosRealKernelWord() {
         let cpu = makeCPU(program: [
             0xE16F_2F12, // clz r2, r2 -- real word from the actual kernel

@@ -160,6 +160,19 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.width, 4)
     }
 
+    func testDecodesUbfxArmStateFromRealKernel() {
+        // ubfx r3, r0, #3, #0xa — from the real kernel at 0x8007dd80,
+        // confirmed via Capstone. A different encoding from Thumb's
+        // UBFX (see BitFieldExtractInstruction's doc comment).
+        guard case .bitFieldExtract(let instr) = ARMDecoder.decode(0xE7E9_31D0) else {
+            return XCTFail("Expected bitFieldExtract")
+        }
+        XCTAssertEqual(instr.rd, 3)
+        XCTAssertEqual(instr.rn, 0)
+        XCTAssertEqual(instr.lsb, 3)
+        XCTAssertEqual(instr.width, 10)
+    }
+
     func testDecodesClzFromRealKernel() {
         // clz r2, r2 — from the real kernel at 0x80089be8, confirmed
         // via Capstone.

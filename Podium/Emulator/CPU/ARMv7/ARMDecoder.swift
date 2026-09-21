@@ -300,12 +300,13 @@ enum ARMDecoder {
     }
 
     /// ARMv6's "media instructions" space (bits[27:25]==011, bit4==1).
-    /// `UQSUB8`, `REV`, and `BFI`/`BFC` are decoded — see their doc
-    /// comments — via bits[27:20] == 0b01100110 (parallel add/sub,
+    /// `UQSUB8`, `REV`, `BFI`/`BFC`, and `UBFX` are decoded — see their
+    /// doc comments — via bits[27:20] == 0b01100110 (parallel add/sub,
     /// unsigned, saturating) with bits[7:5] == 0b111 (the SUB8 op2) for
     /// `UQSUB8`, bits[27:20] == 0b01101011 with bits[7:4] == 0b0011 for
-    /// `REV`, or bits[27:21] == 0b0111110 for `BFI`/`BFC`; everything
-    /// else in this large space is `.unsupported`.
+    /// `REV`, bits[27:21] == 0b0111110 for `BFI`/`BFC`, or bits[27:21]
+    /// == 0b0111111 with bits[6:4] == 0b101 for `UBFX`; everything else
+    /// in this large space is `.unsupported`.
     private static func decodeMediaInstructions(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
         if word.bitField(27, 20) == 0b0110_0110, word.bitField(7, 5) == 0b111, word.bitField(11, 8) == 0b1111 {
             return .uqsub8(UQSub8Instruction(
@@ -332,6 +333,19 @@ enum ARMDecoder {
                 sourceRegister: rn == 0b1111 ? nil : Int(rn),
                 lsb: Int(lsb),
                 width: Int(msb - lsb + 1)
+            ))
+        }
+        if word.bitField(27, 21) == 0b0111111, word.bitField(6, 4) == 0b101 {
+            // UBFX (ARM state): verified against a real `ubfx r3, r0,
+            // #3, #0xa` word from the actual kernel (see
+            // `BitFieldExtractInstruction`'s doc comment).
+            let widthMinus1 = word.bitField(20, 16)
+            return .bitFieldExtract(BitFieldExtractInstruction(
+                condition: condition,
+                rd: Int(word.bitField(15, 12)),
+                rn: Int(word.bitField(3, 0)),
+                lsb: Int(word.bitField(11, 7)),
+                width: Int(widthMinus1 + 1)
             ))
         }
         return .unsupported(rawWord: word)

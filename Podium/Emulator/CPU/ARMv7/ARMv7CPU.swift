@@ -227,6 +227,10 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeBitFieldInsert(instr)
 
+        case .bitFieldExtract(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeBitFieldExtract(instr)
+
         case .clz(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeClz(instr)
@@ -382,6 +386,13 @@ final class ARMv7CPU: CPU {
         let mask: UInt32 = instr.width >= 32 ? 0xFFFF_FFFF : (UInt32(1) << instr.width) - 1
         let shiftedMask = mask << instr.lsb
         registers[instr.rd] = (registers[instr.rd] & ~shiftedMask) | ((sourceValue & mask) << instr.lsb)
+    }
+
+    /// `UBFX` (ARM state): zero-extending unsigned bit-field extract.
+    /// Doesn't affect flags.
+    private func executeBitFieldExtract(_ instr: BitFieldExtractInstruction) {
+        let mask: UInt32 = instr.width >= 32 ? 0xFFFF_FFFF : (UInt32(1) << instr.width) - 1
+        registers[instr.rd] = (registers[instr.rn] >> instr.lsb) & mask
     }
 
     private func executeClz(_ instr: ClzInstruction) {
