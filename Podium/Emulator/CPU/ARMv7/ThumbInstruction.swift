@@ -188,6 +188,22 @@ struct ThumbExtendInstruction: Equatable {
     let rd: Int
 }
 
+/// `SXTH`/`UXTH`/`SXTB`/`UXTB` (Thumb-2, 32-bit "wide" forms): the
+/// `0xFA`-prefixed sibling of `ThumbExtendInstruction`'s 16-bit forms —
+/// needed for high registers (`r8`-`r14`) the 16-bit encoding can't
+/// reach, and adds an optional `ROR` (by `rotate*8` bits) applied to
+/// `Rm` before extracting. Only the no-accumulate shape (`Rn == 1111`)
+/// is decoded — `Rn` otherwise selects `SXTAH`/`UXTAH`/`SXTAB`/`UXTAB`
+/// (add `Rm`'s extended value to `Rn`), not decoded since no real word
+/// has confirmed it. Verified against a real `uxtb.w r1, r10` word from
+/// the actual kernel.
+struct ThumbExtendWideInstruction: Equatable {
+    let kind: ThumbExtendKind
+    let rd: Int
+    let rm: Int
+    let rotate: Int
+}
+
 /// `IT`: begins a 1-4 instruction conditional-execution block. See
 /// `ARMv7CPU.ThumbITState` for how `firstCondition`/`mask` drive the
 /// per-instruction condition that follows.
@@ -481,6 +497,7 @@ enum ThumbInstruction: Equatable {
     case branch(ThumbBranchInstruction)
     case compareBranch(ThumbCompareBranchInstruction)
     case extend(ThumbExtendInstruction)
+    case extendWide(ThumbExtendWideInstruction)
     case it(ThumbItInstruction)
     case movWide(ThumbMovWideInstruction)
     case bitFieldExtract(ThumbUbfxInstruction)

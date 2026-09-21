@@ -174,6 +174,8 @@ extension ARMv7CPU {
             executeThumbBranch(instr, instructionAddress: instructionAddress)
         case .extend(let instr):
             executeThumbExtend(instr)
+        case .extendWide(let instr):
+            executeThumbExtendWide(instr)
         case .conditionalBranch, .it, .compareBranch, .branchWide:
             preconditionFailure("handled in stepThumb before reaching executeThumb")
         case .unsupported(let raw, let second):
@@ -314,6 +316,25 @@ extension ARMv7CPU {
             registers[instr.rd] = value & 0xFFFF
         case .unsignedByte:
             registers[instr.rd] = value & 0xFF
+        }
+    }
+
+    /// `SXTH.W`/`UXTH.W`/`SXTB.W`/`UXTB.W`: like `executeThumbExtend`
+    /// but with `Rm` first rotated right by `rotate*8` bits.
+    private func executeThumbExtendWide(_ instr: ThumbExtendWideInstruction) {
+        let rotateBits = instr.rotate * 8
+        let rotated = rotateBits == 0
+            ? registers[instr.rm]
+            : (registers[instr.rm] >> rotateBits) | (registers[instr.rm] << (32 - rotateBits))
+        switch instr.kind {
+        case .signedHalfword:
+            registers[instr.rd] = UInt32(bitPattern: Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: rotated))))
+        case .signedByte:
+            registers[instr.rd] = UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: rotated))))
+        case .unsignedHalfword:
+            registers[instr.rd] = rotated & 0xFFFF
+        case .unsignedByte:
+            registers[instr.rd] = rotated & 0xFF
         }
     }
 

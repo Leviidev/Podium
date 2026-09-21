@@ -30,7 +30,10 @@ import Foundation
 /// `LDRB`/`STRB` (immediate, T3 and T4, and register-offset), `LDRSB`
 /// (immediate, T3 and T4), `LDM`/
 /// `STM` (T2, both IA and DB), `TBB`/`TBH` (table branch), `LDRD`/
-/// `STRD` (immediate), `UMULL`, `MLA`, and `MCR`/`MRC` (reusing ARM
+/// `STRD` (immediate), `UMULL`, `MLA`, `SXTH.W`/`UXTH.W`/`SXTB.W`/
+/// `UXTB.W` (the `0xFA`-prefixed wide forms of the 16-bit extend
+/// instructions above, no-accumulate shape only — see
+/// `decode32ExtendOrShift`'s doc comment), and `MCR`/`MRC` (reusing ARM
 /// state's exact field layout — see `decode32Coprocessor`'s doc
 /// comment). Everything else — PC-relative `LDR` (format 6),
 /// `REV`/`REV16`/`REVSH`, `MUL`'s Thumb-2 wide form and `MLS` (`MLA`'s
@@ -38,8 +41,10 @@ import Foundation
 /// siblings), `LDREX`/`STREX` (Thumb-2 forms — `LDRD`/`STRD`'s
 /// siblings in that same space), the rest of the "plain binary
 /// immediate" op table (`SUBW`, its own `Rn==1111` `ADR` alias, `SSAT`/
-/// `SBFX`/`USAT`), the rest of the coprocessor space (`CDP`/`LDC`/
-/// `STC`), SIMD/VFP — decodes to `.unsupported`.
+/// `SBFX`/`USAT`), the register-controlled-shift instructions and the
+/// accumulate (`SXTAH`/etc.) extend forms sharing `0xFA` with the
+/// decoded extend forms, the rest of the coprocessor space (`CDP`/
+/// `LDC`/`STC`), SIMD/VFP — decodes to `.unsupported`.
 enum ThumbDecoder {
     /// Whether `firstHalfword` opens a 32-bit Thumb-2 instruction (in
     /// which case the caller must fetch a second halfword before
@@ -263,15 +268,20 @@ enum ThumbDecoder {
             // bits[9:8] split this class further — verified against
             // real words from each confirmed branch: `00` plain byte/
             // word/register load-store (`0xF8` prefix), `01` the
-            // signed-load family (`0xF9` prefix), `11` long multiply/
-            // multiply-accumulate/divide (`0xFB` prefix, of which only
-            // `UMULL`'s exact bits[7:4] pattern is decoded). `10`
-            // (`0xFA`, SIMD/media-adjacent) isn't decoded.
+            // signed-load family (`0xF9` prefix), `10` (`0xFA`)
+            // register-controlled-shift and sign/zero-extend
+            // instructions (of which only the extend forms' no-
+            // accumulate shape is decoded — see
+            // `decode32ExtendOrShift`'s doc comment), `11` long
+            // multiply/multiply-accumulate/divide (`0xFB` prefix, of
+            // which only `UMULL`'s exact bits[7:4] pattern is decoded).
             switch hw0.bitField16(9, 8) {
             case 0b00:
                 return decode32LoadStoreSingle(hw0, hw1)
             case 0b01:
                 return decode32LoadStoreSignedByte(hw0, hw1)
+            case 0b10:
+                return decode32ExtendOrShift(hw0, hw1)
             case 0b11:
                 return decode32LongMultiply(hw0, hw1)
             default:
@@ -485,6 +495,32 @@ enum ThumbDecoder {
     /// `ThumbMlaInstruction`/`ThumbUmullInstruction`'s doc comments for
     /// the exact bit splits and their sibling instructions that aren't
     /// decoded.
+    /// The `0xFA`-prefixed space: register-controlled shift
+    /// instructions (`ASR`/`LSL`/`LSR`/`ROR` register form, hw0
+    /// bits[7:4] top bit clear) and sign/zero-extend instructions
+    /// (bits[7:4] top bit set). Only the extend forms' no-accumulate
+    /// shape (`Rn == 1111`, `hw0` bits[7:4] ∈ {0000=SXTH, 0001=UXTH,
+    /// 0100=SXTB, 0101=UXTB}) are decoded — the register-shift
+    /// instructions and the accumulate (`Rn != 1111`) extend forms
+    /// aren't, since no real word has confirmed either yet. Verified
+    /// against a real `uxtb.w r1, r10` word from the actual kernel.
+    private static func decode32ExtendOrShift(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
+        guard hw0.bitField16(3, 0) == 0b1111, hw1.bitField16(15, 12) == 0b1111, hw1.bitField16(7, 4) == 0b1000 else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        let kind: ThumbExtendKind
+        switch hw0.bitField16(7, 4) {
+        case 0b0000: kind = .signedHalfword
+        case 0b0001: kind = .unsignedHalfword
+        case 0b0100: kind = .signedByte
+        case 0b0101: kind = .unsignedByte
+        default: return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        return .extendWide(ThumbExtendWideInstruction(
+            kind: kind, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
+        ))
+    }
+
     private static func decode32LongMultiply(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
         guard hw0.bitField16(15, 8) == 0b1111_1011, hw1.bitField16(7, 4) == 0 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
