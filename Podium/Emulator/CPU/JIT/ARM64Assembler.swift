@@ -82,6 +82,88 @@ enum ARM64Assembler {
     /// `RET` (implicitly via `x30`/LR, as set by the caller's `blr`).
     static let ret: UInt32 = 0xD65F_03C0
 
+    /// `ADD Wd, Wn, #imm12` (immediate, no shift). `imm12` must fit
+    /// unsigned in 12 bits (0...4095) — the small positive immediate
+    /// offsets real load/store instructions carry are comfortably
+    /// within that range.
+    static func addImmediate32(rd: Int, rn: Int, imm12: UInt32) -> UInt32 {
+        precondition(imm12 <= 0xFFF, "imm12 out of encodable range")
+        return 0x1100_0000 | (imm12 << 10) | (reg(rn) << 5) | reg(rd)
+    }
+
+    /// `CMP Wn, Wm` (the standard alias for `SUBS WZR, Wn, Wm`) — sets
+    /// flags only, discards the result.
+    static func cmp32(rn: Int, rm: Int) -> UInt32 {
+        0x6B00_001F | (reg(rm) << 16) | (reg(rn) << 5)
+    }
+
+    /// `B.HS #(instructionsForward*4)` — branches forward past
+    /// `instructionsForward` instructions (this one included in the
+    /// count, i.e. `1` branches to the very next word) when the last
+    /// flag-setting compare found the left operand unsigned `>=` the
+    /// right (`HS`/`CS`) — used for the "address in bounds" check in
+    /// `ThumbJITTranslator`'s load/store fast path (`CMP` against the
+    /// region length first negates the sense, so this fires exactly when
+    /// the address is *out* of bounds). `instructionsForward` must be
+    /// positive — only forward branches are needed here, since every
+    /// compiled block is straight-line code laid out in one pass.
+    static func branchIfHS(instructionsForward: Int) -> UInt32 {
+        precondition(instructionsForward > 0 && instructionsForward < (1 << 18), "branch target out of encodable/expected range")
+        let imm19 = UInt32(instructionsForward) & 0x7_FFFF
+        return 0x5400_0000 | (imm19 << 5) | 0b0010
+    }
+
+    /// `B #(instructionsForward*4)` (unconditional) — same forward-only,
+    /// self-inclusive counting convention as `branchIfHS`.
+    static func branch(instructionsForward: Int) -> UInt32 {
+        precondition(instructionsForward > 0 && instructionsForward < (1 << 25), "branch target out of encodable/expected range")
+        return 0x1400_0000 | (UInt32(instructionsForward) & 0x3FF_FFFF)
+    }
+
+    /// `LDR Wt, [Xn, Wm, UXTW]` (register offset, 32-bit, zero-extended
+    /// 32-bit index) — the fast-path guest-memory read `ThumbJITTranslator`
+    /// uses once a load's guest address has been range-checked and turned
+    /// into a host-relative offset in `rm`.
+    static func ldrWordRegisterOffsetUXTW(rt: Int, rn: Int, rm: Int) -> UInt32 {
+        0xB860_4800 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rt)
+    }
+
+    /// `STR Wt, [Xn, Wm, UXTW]` — the store counterpart of
+    /// `ldrWordRegisterOffsetUXTW`.
+    static func strWordRegisterOffsetUXTW(rt: Int, rn: Int, rm: Int) -> UInt32 {
+        0xB820_4800 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rt)
+    }
+
+    /// `LDRB Wt, [Xn, Wm, UXTW]` (zero-extends the loaded byte to 32 bits).
+    static func ldrbRegisterOffsetUXTW(rt: Int, rn: Int, rm: Int) -> UInt32 {
+        0x3860_4800 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rt)
+    }
+
+    /// `STRB Wt, [Xn, Wm, UXTW]`.
+    static func strbRegisterOffsetUXTW(rt: Int, rn: Int, rm: Int) -> UInt32 {
+        0x3820_4800 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rt)
+    }
+
+    /// `LDRH Wt, [Xn, Wm, UXTW]` (zero-extends the loaded halfword to 32 bits).
+    static func ldrhRegisterOffsetUXTW(rt: Int, rn: Int, rm: Int) -> UInt32 {
+        0x7860_4800 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rt)
+    }
+
+    /// `STRH Wt, [Xn, Wm, UXTW]`.
+    static func strhRegisterOffsetUXTW(rt: Int, rn: Int, rm: Int) -> UInt32 {
+        0x7820_4800 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rt)
+    }
+
+    /// `LDRSB Wt, [Xn, Wm, UXTW]` (sign-extends the loaded byte to 32 bits).
+    static func ldrsbRegisterOffsetUXTW(rt: Int, rn: Int, rm: Int) -> UInt32 {
+        0x38E0_4800 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rt)
+    }
+
+    /// `LDRSH Wt, [Xn, Wm, UXTW]` (sign-extends the loaded halfword to 32 bits).
+    static func ldrshRegisterOffsetUXTW(rt: Int, rn: Int, rm: Int) -> UInt32 {
+        0x78E0_4800 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rt)
+    }
+
     private static func reg(_ index: Int) -> UInt32 {
         precondition((0...31).contains(index), "AArch64 register index out of range: \(index)")
         return UInt32(index)

@@ -291,8 +291,43 @@ final class ARMv7CPU: CPU {
         // interpreter for the (at most 4) instructions an IT block can
         // cover is a small, bounded cost next to getting this wrong.
         if let jit, itState == 0, let block = jit.block(at: registers.pc, thumbState: cpsr.thumbState, memory: memory) {
-            registers.withUnsafeMutableStorage { block.run(registers: $0) }
-            registers.pc = registers.pc &+ UInt32(block.totalByteLength)
+            // The fast-path region (if any) covering the *current* pc —
+            // queried fresh each unit rather than cached, since which
+            // region (or whether one exists at all) can only be answered
+            // for a specific address. Gated on `containsMemoryAccess`:
+            // most compiled blocks are register-only and never read
+            // `x1`/`w2`/`w3` at all, so resolving a region for them was
+            // pure waste — measured as a real, if modest, per-unit cost
+            // (`SegmentedMemoryBus.fastPathRegion` walks its region list)
+            // that, paid on every single cache hit regardless of whether
+            // the block could ever use it, was enough to turn this
+            // session's load/store rollout into a net *slowdown* before
+            // this check was added.
+            let completed: Int
+            if block.containsMemoryAccess {
+                let fastPath = memory.fastPathRegion(for: registers.pc)
+                completed = registers.withUnsafeMutableStorage { regPtr in
+                    block.run(registers: regPtr, ramHostPointer: fastPath?.pointer, ramGuestBase: fastPath?.regionBaseAddress ?? 0, ramGuestLength: UInt32(fastPath?.regionLength ?? 0))
+                }
+            } else {
+                completed = registers.withUnsafeMutableStorage { regPtr in
+                    block.run(registers: regPtr)
+                }
+            }
+            registers.pc = registers.pc &+ UInt32(block.byteLength(afterCompleting: completed))
+            // A load/store's runtime address can fall outside the offered
+            // fast-path region (or no region was offered at all) even
+            // though the *instruction* was JIT-eligible — see
+            // `ThumbJITTranslator`'s doc comment. `completed == 0` means
+            // this call's block did nothing at all (its very first
+            // instruction bailed), so `pc` hasn't moved; run one real
+            // interpreted step right now so this call still makes
+            // guaranteed forward progress, instead of leaving the next
+            // `runOneUnit()` call to re-discover the same block, get the
+            // same cache hit, and bail at the same address again.
+            if completed == 0 {
+                step()
+            }
         } else {
             step()
         }

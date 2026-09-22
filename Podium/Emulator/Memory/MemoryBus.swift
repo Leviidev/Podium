@@ -29,6 +29,18 @@ protocol MemoryBus: AnyObject {
     /// calls `readByte` in a loop, correct but not what you want for a
     /// framebuffer-sized read every frame.
     func readBytes(_ count: Int, at address: UInt32) throws -> Data
+
+    /// A raw, stable host pointer to the backing storage of whichever
+    /// region actually covers `address`, for a JIT fast path — see
+    /// `ThumbJITTranslator`'s load/store support. Most conformers can't
+    /// offer this (this codebase only has one that meaningfully can,
+    /// `FlatPhysicalMemory`, whose backing array is fixed-size for its
+    /// whole lifetime once constructed); the default implementation
+    /// returns `nil`, and JIT-compiled loads/stores fall back to the
+    /// interpreter whenever it does. Returns `nil` when `address` isn't
+    /// covered by this bus at all, so a caller doesn't need a separate
+    /// bounds check before asking.
+    func fastPathRegion(for address: UInt32) -> (pointer: UnsafeMutableRawPointer, regionBaseAddress: UInt32, regionLength: Int)?
 }
 
 extension MemoryBus {
@@ -44,5 +56,9 @@ extension MemoryBus {
             bytes.append(try readByte(at: address &+ UInt32(offset)))
         }
         return bytes
+    }
+
+    func fastPathRegion(for address: UInt32) -> (pointer: UnsafeMutableRawPointer, regionBaseAddress: UInt32, regionLength: Int)? {
+        nil
     }
 }

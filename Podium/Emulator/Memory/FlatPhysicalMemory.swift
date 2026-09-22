@@ -10,11 +10,27 @@ import Foundation
 final class FlatPhysicalMemory: MemoryBus {
     let baseAddress: UInt32
     private var storage: [UInt8]
+    /// Obtained once at construction and stable for this object's whole
+    /// lifetime, since `storage` is a fixed-size array from `init`
+    /// onward — nothing in this class ever replaces or resizes it (no
+    /// `append`/`removeAll`/reassignment), so its buffer never
+    /// reallocates. Safe to hand out as a long-lived raw pointer on that
+    /// basis, unlike a `withUnsafeMutableBufferPointer` pointer's
+    /// normal (closure-scoped) lifetime guarantee.
+    private let fastPathPointer: UnsafeMutableRawPointer
 
     init(length: Int, baseAddress: UInt32 = 0) {
         precondition(length > 0, "Memory region must have a nonzero length")
         self.baseAddress = baseAddress
         self.storage = [UInt8](repeating: 0, count: length)
+        self.fastPathPointer = self.storage.withUnsafeMutableBytes { $0.baseAddress! }
+    }
+
+    func fastPathRegion(for address: UInt32) -> (pointer: UnsafeMutableRawPointer, regionBaseAddress: UInt32, regionLength: Int)? {
+        guard address >= baseAddress, UInt64(address - baseAddress) < UInt64(storage.count) else {
+            return nil
+        }
+        return (fastPathPointer, baseAddress, storage.count)
     }
 
     var length: Int { storage.count }

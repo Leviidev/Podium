@@ -50,6 +50,10 @@ enum JITTranslator {
             guard let generated = emit(instruction) else { return nil }
             words.append(contentsOf: generated)
         }
+        // No instruction this translator emits can ever fail at runtime
+        // (no memory access, no bounds to check), so the block always
+        // completes in full — the epilogue just reports that.
+        words.append(ARM64Assembler.movz32(rd: 0, imm16: UInt16(instructions.count)))
         words.append(ARM64Assembler.ret)
 
         let byteCount = words.count * MemoryLayout<UInt32>.size
@@ -63,7 +67,7 @@ enum JITTranslator {
             return nil
         }
 
-        return CompiledBlock(memory: memory, byteCount: byteCount, instructionCount: instructions.count)
+        return CompiledBlock(memory: memory, byteCount: byteCount, instructionByteLengths: Array(repeating: 4, count: instructions.count))
     }
 
     private static func emit(_ instruction: DataProcessingInstruction) -> [UInt32]? {

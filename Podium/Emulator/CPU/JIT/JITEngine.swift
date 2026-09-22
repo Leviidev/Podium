@@ -28,7 +28,22 @@ final class JITEngine {
     // interworking, and an ARM-state block compiled from one interpretation
     // of those bytes must never be handed back for a Thumb-state call at
     // that same address, or vice versa.
-    private var cache: [UInt32: CompiledBlock] = [:]
+    //
+    // The value is a *double* Optional (`CompiledBlock??`, `.some(nil)`
+    // distinct from a missing key): a confirmed-ineligible address caches
+    // `.some(nil)`, not just "absent". Without that, every future visit to
+    // an address whose instruction was never JIT-eligible in the first
+    // place — a branch, almost any instruction type this engine doesn't
+    // cover yet — re-ran full discovery (decode, then ask
+    // `isSupported`/`byteLength` for each candidate) from scratch, forever,
+    // since only a *successful* compile got cached. Real code re-visits
+    // ordinary (ineligible) instructions constantly — every branch target,
+    // every loop body's non-eligible instructions — so this was measured
+    // to cost more than the JIT saved overall on a real kernel trace
+    // (interpreterFallbackCount running into the hundreds of millions
+    // while compiledBlockCount stayed in the thousands) before this cache
+    // was added.
+    private var cache: [UInt32: CompiledBlock?] = [:]
     private let maxBlockLength: Int
 
     init(maxBlockLength: Int = 32) {
@@ -45,26 +60,34 @@ final class JITEngine {
     /// instruction at `address` isn't JIT-eligible (or JIT has been
     /// disabled after an earlier allocation failure) — callers should
     /// interpret a single instruction in that case, then ask again at the
-    /// next address.
+    /// next address. A `nil` result is itself cached (see this type's own
+    /// doc comment on `cache`), so asking again at the *same* address is
+    /// cheap, not a repeat of full discovery.
     func block(at address: UInt32, thumbState: Bool, memory: MemoryBus) -> CompiledBlock? {
         guard isAvailable else { return nil }
 
         let key = Self.cacheKey(address: address, thumbState: thumbState)
         if let cached = cache[key] {
-            stats.cacheHitCount += 1
-            return cached
+            if let block = cached {
+                stats.cacheHitCount += 1
+                return block
+            } else {
+                stats.interpreterFallbackCount += 1
+                return nil
+            }
         }
 
         let compiled = thumbState
             ? compileThumb(startingAt: address, memory: memory)
             : compileARM(startingAt: address, memory: memory)
 
+        cache[key] = compiled
+
         guard let compiled else {
             stats.interpreterFallbackCount += 1
             return nil
         }
 
-        cache[key] = compiled
         stats.compiledBlockCount += 1
         return compiled
     }

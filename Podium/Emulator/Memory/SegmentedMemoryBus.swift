@@ -80,6 +80,15 @@ final class SegmentedMemoryBus: MemoryBus {
         try dispatch(address) { try $0.readBytes(count, at: address) }
     }
 
+    func fastPathRegion(for address: UInt32) -> (pointer: UnsafeMutableRawPointer, regionBaseAddress: UInt32, regionLength: Int)? {
+        for region in regions {
+            if let found = region.fastPathRegion(for: address) {
+                return found
+            }
+        }
+        return nil
+    }
+
     /// Tries each region in order, since a region only knows its own
     /// bounds (there's no separate range table to keep in sync) —
     /// whichever one doesn't throw `unmappedAddress` for this address

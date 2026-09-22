@@ -4,6 +4,20 @@ import Foundation
 /// a `CompiledBlock` — the Thumb-state sibling of `JITTranslator`, which
 /// only ever handles ARM-state `DataProcessingInstruction`s.
 ///
+/// Calling convention (see `CompiledBlock.EntryPoint`): `x0` is the guest
+/// register array (as in `JITTranslator`); `x1`/`w2`/`w3` are a fast-path
+/// memory region (`x1` a host pointer, `w2` its guest base address, `w3`
+/// its guest length) that load/store instructions range-check against
+/// before touching. `w2`/`w3` are **reserved for the whole block**, not
+/// just the instruction that needs them — every register-only emitter
+/// here uses `w4`/`w5`/`w6` as scratch specifically so a memory
+/// instruction elsewhere in the same block can still trust `w2`/`w3`
+/// after a register-only instruction has run (using `w1`/`w2` the way
+/// `JITTranslator`'s ARM-state scratch does would silently corrupt the
+/// region bounds for every later memory instruction in a mixed block —
+/// this only matters once a block can mix the two kinds, which is why
+/// `JITTranslator` itself doesn't need to care).
+///
 /// Scope, deliberately narrow for the same reasons as `JITTranslator`:
 /// - `ThumbDataProcessingShiftedRegisterInstruction` (the Thumb-2 32-bit
 ///   "data-processing (shifted register)" encoding): `AND`/`BIC`/`ORR`/
@@ -11,31 +25,50 @@ import Foundation
 ///   register operand2 only (`shiftType == .lsl && shiftAmount == 0`) —
 ///   `ADC`/`SBC` need `cpsr.carry` as an extra input this calling
 ///   convention doesn't carry, and `RSB`/`ORN` need either operand-order
-///   or negation handling not worth the complexity yet. Real, non-shift
-///   uses of this instruction (plain register-register ALU ops) are
-///   extremely common in this kernel's compiled code — see the
-///   `/tmp/podium_profile` instruction-mix sample this was written
-///   against.
+///   or negation handling not worth the complexity yet.
 /// - `ThumbHiRegisterInstruction`'s `ADD`/`MOV` forms only (never `CMP`,
-///   which sets flags) — the Thumb16 "hi register operations" format,
-///   verified never to set flags for these two (see
-///   `ARMv7CPU+Thumb.swift`'s `executeThumbHiRegister`). `rdn == pc` is
-///   excluded (a real, if unusual, branch — `writeThumbResult`'s own doc
-///   comment covers why writing `pc` this way is a plain, non-
-///   interworking jump, which this translator has no way to represent);
-///   `rm == pc` is excluded too, since reading `pc` here means the
-///   *aligned instruction address + 4* per `thumbOperandValue`, not the
-///   raw register file value this translator's calling convention reads.
+///   which sets flags). `rdn == pc` and `rm == pc` are excluded — see
+///   `writeThumbResult`'s/`thumbOperandValue`'s doc comments.
+/// - `ThumbLoadStoreImmediateInstruction` (Thumb16 formats 9/10/11:
+///   `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`, 5-bit immediate offset,
+///   `Rn` any register including `SP`): the guest address is range-
+///   checked against `[w2, w2+w3)` at runtime (the caller only offers a
+///   fast-path region when it's the identity-mapped main RAM window —
+///   see `ARMv7CPU.runOneUnit()`); on a hit, the access goes straight to
+///   host memory via `x1`. On a miss (or when no fast-path region was
+///   offered at all, signaled by `w3 == 0`, which makes the unsigned
+///   bounds check fail for every address without a separate null check),
+///   the compiled code stops *at that instruction* and reports how many
+///   *earlier* instructions in the block already completed — see
+///   `CompiledBlock.byteLength(afterCompleting:)`. Every instruction
+///   before the failing one has already fully committed its effects (to
+///   the register array, and for a completed store, to memory), so nothing
+///   needs to be undone; the caller just resumes via the interpreter at
+///   the failing instruction's own address, which correctly performs (or
+///   properly faults) the access this fast path declined to risk.
 ///
-/// Everything else — conditional execution (there is none at the Thumb16
-/// level, but `IT`-block predication is a separate, unhandled
-/// instruction), flag setting, shifted/rotated operands, `ADC`/`SBC`/
-/// `RSB`/`ORN`, branches, memory access — falls back to the interpreter.
+/// Everything else — conditional execution (`IT`-block predication is a
+/// separate, unhandled instruction, and `ARMv7CPU.runOneUnit()` refuses
+/// the JIT outright whenever an IT block is active — see its own doc
+/// comment for why), flag setting, shifted/rotated operands, `ADC`/`SBC`/
+/// `RSB`/`ORN`, branches, the Thumb-2 wide load/store forms, writeback —
+/// falls back to the interpreter.
 enum ThumbJITTranslator {
+    /// Scratch registers for register-only work — `w2`/`w3` are off
+    /// limits (reserved for the fast-path region's bounds for the whole
+    /// block; see this type's doc comment), and `w0`/`w1` are the
+    /// entry point's own first two arguments.
     private enum Scratch {
-        static let a = 1
-        static let b = 2
+        static let a = 4
+        static let b = 5
     }
+
+    /// The extra scratch register load/store instructions need beyond
+    /// `Scratch.a` (which they reuse to hold the resolved guest address,
+    /// then the loaded/stored value, since those two uses never overlap
+    /// within one instruction) — the address-minus-region-base offset,
+    /// kept alive across the bounds check and into the actual access.
+    private static let relativeOffsetScratch = 6
 
     private static func byteOffset(_ registerIndex: Int) -> Int {
         registerIndex * 4
@@ -43,13 +76,9 @@ enum ThumbJITTranslator {
 
     /// Whether `instruction` is in the supported subset, without
     /// generating code for it — used to decide how far a basic block
-    /// extends before committing to compiling it. `byteLength` is 2 for
-    /// `hiRegister` (Thumb16) and 4 for `dataProcessingShiftedRegister`
-    /// (Thumb-2, 32-bit) — the caller needs this to know how far to
-    /// advance its own discovery cursor even for an ineligible
-    /// instruction it's deciding whether to stop at.
+    /// extends before committing to compiling it.
     static func isSupported(_ instruction: ThumbInstruction) -> Bool {
-        emit(instruction) != nil
+        emit(instruction, completedInstructionsIfBail: 0) != nil
     }
 
     /// Compiles `instructions` (a straight-line run, in order) into a
@@ -61,12 +90,17 @@ enum ThumbJITTranslator {
         guard !instructions.isEmpty else { return nil }
 
         var words: [UInt32] = []
-        var totalByteLength = 0
-        for instruction in instructions {
-            guard let generated = emit(instruction) else { return nil }
+        var instructionByteLengths: [Int] = []
+        var containsMemoryAccess = false
+        for (index, instruction) in instructions.enumerated() {
+            guard let generated = emit(instruction, completedInstructionsIfBail: index) else { return nil }
             words.append(contentsOf: generated.code)
-            totalByteLength += generated.byteLength
+            instructionByteLengths.append(generated.byteLength)
+            if case .loadStoreImmediate = instruction { containsMemoryAccess = true }
         }
+        // Reached only if every instruction's memory access (if any) was
+        // in bounds — the whole block completed.
+        words.append(ARM64Assembler.movz32(rd: 0, imm16: UInt16(instructions.count)))
         words.append(ARM64Assembler.ret)
 
         let byteCount = words.count * MemoryLayout<UInt32>.size
@@ -80,7 +114,11 @@ enum ThumbJITTranslator {
             return nil
         }
 
-        return CompiledBlock(memory: memory, byteCount: byteCount, instructionCount: instructions.count, totalByteLength: totalByteLength)
+        var cumulative = [0]
+        for length in instructionByteLengths {
+            cumulative.append(cumulative[cumulative.count - 1] + length)
+        }
+        return CompiledBlock(memory: memory, byteCount: byteCount, instructionCount: instructions.count, cumulativeByteLengths: cumulative, containsMemoryAccess: containsMemoryAccess)
     }
 
     /// Real Thumb instruction byte length for `instruction`, regardless
@@ -89,7 +127,7 @@ enum ThumbJITTranslator {
     /// only peeking at to decide where a block ends.
     static func byteLength(of instruction: ThumbInstruction) -> Int {
         switch instruction {
-        case .hiRegister:
+        case .hiRegister, .loadStoreImmediate:
             return 2
         default:
             // Every other case this translator's `emit` can ever accept
@@ -102,12 +140,14 @@ enum ThumbJITTranslator {
         }
     }
 
-    private static func emit(_ instruction: ThumbInstruction) -> (code: [UInt32], byteLength: Int)? {
+    private static func emit(_ instruction: ThumbInstruction, completedInstructionsIfBail: Int) -> (code: [UInt32], byteLength: Int)? {
         switch instruction {
         case .dataProcessingShiftedRegister(let instr):
             return emitDataProcessingShiftedRegister(instr).map { ($0, 4) }
         case .hiRegister(let instr):
             return emitHiRegister(instr).map { ($0, 2) }
+        case .loadStoreImmediate(let instr):
+            return emitLoadStoreImmediate(instr, completedInstructionsIfBail: completedInstructionsIfBail).map { ($0, 2) }
         default:
             return nil
         }
@@ -160,5 +200,61 @@ enum ThumbJITTranslator {
         case .cmp:
             return nil // Sets flags — see this file's doc comment.
         }
+    }
+
+    /// `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH Rt, [Rn, #imm]` (Thumb16
+    /// formats 9/10/11). See this file's doc comment for the bounds-check
+    /// and partial-completion scheme.
+    private static func emitLoadStoreImmediate(_ instr: ThumbLoadStoreImmediateInstruction, completedInstructionsIfBail: Int) -> [UInt32]? {
+        guard instr.rn != Registers.pcIndex, instr.rt != Registers.pcIndex, instr.offset <= 0xFFF else {
+            return nil
+        }
+
+        let addr = Scratch.a
+        let rel = relativeOffsetScratch
+        let value = Scratch.a // Safe to reuse: `addr`'s value is fully consumed by the `SUB` below before `value` is ever written.
+
+        var code: [UInt32] = [
+            ARM64Assembler.ldrWordUnsignedOffset(rt: addr, rn: 0, byteOffset: byteOffset(instr.rn)),
+        ]
+        if instr.offset != 0 {
+            code.append(ARM64Assembler.addImmediate32(rd: addr, rn: addr, imm12: instr.offset))
+        }
+        code.append(ARM64Assembler.sub32(rd: rel, rn: addr, rm: 2)) // rel = addr - ramGuestBase(w2)
+        code.append(ARM64Assembler.cmp32(rn: rel, rm: 3)) // compare against ramGuestLength(w3)
+        code.append(ARM64Assembler.branchIfHS(instructionsForward: 4)) // out of bounds -> bail (4 words ahead: the 2-word access, the skip-branch, then bail)
+
+        switch instr.size {
+        case .word:
+            if instr.isLoad {
+                code.append(ARM64Assembler.ldrWordRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+                code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rt)))
+            } else {
+                code.append(ARM64Assembler.ldrWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rt)))
+                code.append(ARM64Assembler.strWordRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            }
+        case .byte:
+            if instr.isLoad {
+                code.append(ARM64Assembler.ldrbRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+                code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rt)))
+            } else {
+                code.append(ARM64Assembler.ldrWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rt)))
+                code.append(ARM64Assembler.strbRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            }
+        case .halfword:
+            if instr.isLoad {
+                code.append(ARM64Assembler.ldrhRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+                code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rt)))
+            } else {
+                code.append(ARM64Assembler.ldrWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rt)))
+                code.append(ARM64Assembler.strhRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            }
+        }
+
+        code.append(ARM64Assembler.branch(instructionsForward: 3)) // success -> skip the bail sequence below
+        code.append(ARM64Assembler.movz32(rd: 0, imm16: UInt16(completedInstructionsIfBail)))
+        code.append(ARM64Assembler.ret)
+
+        return code
     }
 }
