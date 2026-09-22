@@ -458,6 +458,184 @@ struct VRSHLInstruction: Equatable {
     let vn: Int
 }
 
+/// `VEOR` (NEON bitwise exclusive-OR), `Dd = Dn ^ Dm` (or the `Q`-register
+/// equivalent). Shares the "three registers of the same length" shape
+/// with `VRSHL` but from the family's "bitwise operations" sub-space:
+/// opc(bits[11:8])==0b0001 with size(bits[21:20])==0b00 and U(bit24)==1
+/// selects `VEOR` specifically out of that sub-space's `VAND`/`VBIC`/
+/// `VORR`/`VORN`/`VEOR`/`VBSL`/`VBIT`/`VBIF` siblings — confirmed against
+/// a real `veor q14, q14, q14` word from the actual kernel (a common
+/// register-zeroing idiom) via Capstone. Unlike `VRSHL`, this is the
+/// first NEON instruction needing `Q` (128-bit, `Q`==bit6==1) width:
+/// `vd`/`vn`/`vm` are `Q`-register indices when `isQuad` is set (real
+/// hardware requires the underlying 5-bit `D`-register field's low bit
+/// be 0 in that case, and defines `Qn` as the pair `D[2n]`:`D[2n+1]`),
+/// `D`-register indices otherwise.
+struct VEORInstruction: Equatable {
+    let vd: Int
+    let vn: Int
+    let vm: Int
+    let isQuad: Bool
+}
+
+/// `VADD.I<size>` (NEON integer add), `Qd = Qn + Qm` per lane (or the `D`
+/// equivalent). Shares the "three registers of the same length" shape
+/// with `VRSHL`/`VEOR`/`VORR` but from the "integer add/subtract" opc
+/// (bits[11:8]==0b1000; `U`(bit24)==0 selects add, ==1 would select
+/// `VSUB`, not decoded). Unlike `VRSHL`, this one is needed at `Q`
+/// (128-bit) width — confirmed against a real `vadd.i32 q12, q4, q15`
+/// word from the actual kernel.
+struct VADDInstruction: Equatable {
+    enum ElementSize: UInt8 {
+        case bits8 = 0, bits16 = 1, bits32 = 2, bits64 = 3
+    }
+
+    let size: ElementSize
+    let vd: Int
+    let vn: Int
+    let vm: Int
+    let isQuad: Bool
+}
+
+/// `VORR` (NEON bitwise OR, register form), `Dd = Dn | Dm` (or the `Q`
+/// equivalent) — real code's `VORR Qd, Qn, Qn` idiom is also how `VMOV`
+/// (register) is encoded for `Q`/`D` registers (no dedicated encoding
+/// exists; `Vn==Vm` is simply the identity case of a bitwise OR). Shares
+/// `VEOR`'s "bitwise operations" sub-space (opc==0b0001) but with
+/// size(bits[21:20])==0b10 and `U`(bit24)==0 selecting `VORR`
+/// specifically out of that sub-space's `VAND`/`VBIC`/`VORR`/`VORN`
+/// (`U`==0) siblings — confirmed against a real `vorr q8, q12, q12` word
+/// from the actual kernel via Capstone.
+struct VORRInstruction: Equatable {
+    let vd: Int
+    let vn: Int
+    let vm: Int
+    let isQuad: Bool
+}
+
+/// `VEXT`: extracts `registerBytes` (8 for `D`, 16 for `Q`) consecutive
+/// bytes starting at byte offset `byteOffset` from the logical
+/// concatenation of `Vn` (low) followed by `Vm` (high) — ARM DDI 0406C
+/// A8.8.111. The assembly's `.8`/`.16`/`.32`/`.64` "size" suffix is
+/// purely a display convenience: the encoded `imm4` field is always a
+/// raw byte count, confirmed empirically against two real kernel words
+/// (`vext.64 q8, q4, q11, #1` -> imm4=8, `vext.32 q12, q9, q14, #1` ->
+/// imm4=4 — the assembly-displayed `#1` means "1 element", but the byte
+/// offset scales with element size, so this codebase only needs to track
+/// the already-resolved byte offset, not the element size itself).
+struct VEXTInstruction: Equatable {
+    let vd: Int
+    let vn: Int
+    let vm: Int
+    let isQuad: Bool
+    let byteOffset: Int
+}
+
+/// `VSHL`/`VSHR` (immediate). Shares the "two registers and a shift
+/// amount" NEON space; `opc`(bits[11:8])==0b0101 with `U`(bit24)==0
+/// selects `VSHL` (left, non-saturating, non-inserting), `opc`==0b0000
+/// selects `VSHR` (right, arithmetic when `U`==0, logical when `U`==1).
+/// The encoded `imm6` field packs both the element size and the shift
+/// amount together: the position of its highest set bit selects the
+/// element size (bit5→32-bit, bit4→16-bit, bit3→8-bit; the 64-bit case
+/// uses a different encoding entirely and isn't decoded), and the
+/// remaining bits give the shift amount — `imm6 - size` for a left
+/// shift, `2*size - imm6` for a right shift (already resolved into
+/// `shiftAmount` at decode time, not carried as raw `imm6`). Verified
+/// against two real kernel words: `vshl.i32 q12, q8, #1` (imm6=33 ->
+/// size=32, left-shift 1) and `vshr.u32 q8, q8, #0x1f` (imm6=33 ->
+/// size=32, right-shift 31) — the shared size-decoding logic makes both
+/// self-consistent, not two independent guesses.
+struct VectorShiftImmediateInstruction: Equatable {
+    enum Direction {
+        case left, right
+    }
+
+    let direction: Direction
+    let unsigned: Bool
+    let elementBits: Int
+    let shiftAmount: Int
+    let vd: Int
+    let vm: Int
+    let isQuad: Bool
+}
+
+/// `VREV16`/`VREV32`/`VREV64`: reverses the order of `elementBits`-wide
+/// elements within each `groupSize`-wide group of a `D` or `Q` register.
+/// From NEON's "two registers, miscellaneous" space — bits[8:7] (`op`)
+/// select the group size (`00`→64-bit, `01`→32-bit, `10`→16-bit) and
+/// bits[19:18] (`size`) select the element width being reversed within
+/// each group (`00`→8-bit, `01`→16-bit, `10`→32-bit). Verified against a
+/// real `vrev32.8 q4, q12` word from the actual kernel (op=01→32-bit
+/// groups, size=00→8-bit elements, Q=1→128-bit width).
+struct VREVInstruction: Equatable {
+    enum GroupSize: UInt8 {
+        case bits64 = 0, bits32 = 1, bits16 = 2
+    }
+
+    let groupSize: GroupSize
+    let elementBits: Int
+    let vd: Int
+    let vm: Int
+    let isQuad: Bool
+}
+
+/// `VLD1`/`VST1` ("multiple single elements"): loads/stores 1, 2, 3, or 4
+/// consecutive `D` registers as raw bytes from/to memory at `[Rn]`, with
+/// optional post-increment writeback. Since this is the "single
+/// elements" (not "single lane" or "all lanes") form, the `size` field
+/// only ever affects alignment checking (not modeled) — no deinterleave/
+/// reorder happens regardless of element size, so each `D` register is
+/// just its 8 raw memory bytes in address order, exactly like the `LDRD`/
+/// `STRD`/`LDREXD`/`STREXD` low-word-then-high-word convention elsewhere
+/// in this codebase. Verified against a real `vld1.32 {d30,d31},
+/// [r3:0x80]!` word from the actual kernel: bits[11:8] (`type`)==0b1010
+/// selects a 2-register list (the full 1/2/3/4 → 0b0111/0b1010/0b0110/
+/// 0b0010 table is ARM's own fixed mapping, not a guess); `Rm`==0b1101 is
+/// the real, spec-defined "add the transfer size" writeback idiom (the
+/// plain `!` with no explicit offset register) — distinct from `Rm`==
+/// 0b1111 (no writeback) and any other value (an explicit offset
+/// register).
+struct ElementLoadStoreInstruction: Equatable {
+    enum Writeback: Equatable {
+        case none
+        case byTransferSize
+        case register(Int)
+    }
+
+    let isLoad: Bool
+    let rn: Int
+    /// `Dd`: the first (lowest-numbered) `D` register transferred.
+    let firstRegister: Int
+    let registerCount: Int
+    let writeback: Writeback
+}
+
+/// `VSTM`/`VLDM`/`VPUSH`/`VPOP` for double-precision (`D`) extension
+/// registers — the "increment after" (`VSTMIA`/`VLDMIA`) and "decrement
+/// before" (`VSTMDB`/`VLDMDB`, which is also `VPUSH`/`VPOP` when
+/// `rn`==SP) addressing forms. Verified against a real `vpush {d16-d31}`
+/// word from the actual kernel (0xed6d0b20: P=1,U=0,D=1,W=1,L=0,
+/// Rn=13(SP), Vd=0, imm8=0x20 -> firstRegister=16, registerCount=16, a
+/// full VFPv3/NEON context save). Only the double-precision encoding
+/// (bits[11:8]==0b1011) is decoded; the single-precision sibling
+/// (bits[11:8]==0b1010, `S` registers) stays `.unsupported` until a real
+/// word needs it. `W` (writeback) is always required to be set by the
+/// decoder for this family — real hardware only defines this shape with
+/// writeback; a plain non-writeback "load/store multiple" doesn't exist
+/// for extension registers the way it does for the core `LDM`/`STM`.
+struct ExtensionRegisterLoadStoreMultipleInstruction: Equatable {
+    let condition: ARMCondition
+    let isLoad: Bool
+    /// `true` = increment after (`VSTMIA`/`VLDMIA`), `false` = decrement
+    /// before (`VSTMDB`/`VLDMDB`).
+    let addOffset: Bool
+    let rn: Int
+    /// `Dd`: the first (lowest-numbered) `D` register transferred.
+    let firstRegister: Int
+    let registerCount: Int
+}
+
 enum ARMInstruction: Equatable {
     case dataProcessing(DataProcessingInstruction)
     case branch(BranchInstruction)
@@ -490,6 +668,14 @@ enum ARMInstruction: Equatable {
     /// as a no-op, not a missing feature.
     case memoryBarrier
     case vectorRoundingShiftLeft(VRSHLInstruction)
+    case bitwiseExclusiveOr(VEORInstruction)
+    case bitwiseOr(VORRInstruction)
+    case integerAdd(VADDInstruction)
+    case vectorExtract(VEXTInstruction)
+    case vectorShiftImmediate(VectorShiftImmediateInstruction)
+    case elementLoadStore(ElementLoadStoreInstruction)
+    case reverseElements(VREVInstruction)
+    case extensionRegisterLoadStoreMultiple(ExtensionRegisterLoadStoreMultipleInstruction)
     /// A recognized-but-not-yet-implemented instruction family: multiply
     /// and the "extra load/store" SWP/reserved encodings (SH==00), the
     /// `S`-bit form of block data transfer (see

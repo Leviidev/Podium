@@ -172,6 +172,8 @@ extension ARMv7CPU {
             executeThumbLoadStoreDual(instr)
         case .umull(let instr):
             executeThumbUmull(instr)
+        case .smull(let instr):
+            executeThumbSmull(instr)
         case .mla(let instr):
             executeThumbMla(instr)
         case .mls(let instr):
@@ -360,6 +362,9 @@ extension ARMv7CPU {
             registers[instr.rd] = value & 0xFFFF
         case .unsignedByte:
             registers[instr.rd] = value & 0xFF
+        case .unsignedByte16:
+            // UXTB16 has no Thumb16 encoding; the 16-bit decoder never produces this kind.
+            preconditionFailure("UXTB16 has no Thumb16 encoding")
         }
     }
 
@@ -405,6 +410,11 @@ extension ARMv7CPU {
             registers[instr.rd] = rotated & 0xFFFF
         case .unsignedByte:
             registers[instr.rd] = rotated & 0xFF
+        case .unsignedByte16:
+            // UXTB16 (ARM DDI 0406C A8.8.274): zero-extends byte 0 and
+            // byte 2 of the rotated value independently into the low
+            // and high halfwords of Rd.
+            registers[instr.rd] = (rotated & 0xFF) | (((rotated >> 16) & 0xFF) << 16)
         }
     }
 
@@ -668,6 +678,13 @@ extension ARMv7CPU {
         let product = UInt64(registers[instr.rn]) &* UInt64(registers[instr.rm])
         registers[instr.rdLo] = UInt32(truncatingIfNeeded: product)
         registers[instr.rdHi] = UInt32(truncatingIfNeeded: product >> 32)
+    }
+
+    private func executeThumbSmull(_ instr: ThumbSmullInstruction) {
+        let product = Int64(Int32(bitPattern: registers[instr.rn])) &* Int64(Int32(bitPattern: registers[instr.rm]))
+        let bits = UInt64(bitPattern: product)
+        registers[instr.rdLo] = UInt32(truncatingIfNeeded: bits)
+        registers[instr.rdHi] = UInt32(truncatingIfNeeded: bits >> 32)
     }
 
     private func executeThumbMla(_ instr: ThumbMlaInstruction) {
@@ -1013,13 +1030,18 @@ extension ARMv7CPU {
         do {
             let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
-                let value: UInt32
+                var value: UInt32
                 if instr.isByte {
                     value = UInt32(try memory.readByte(at: physicalAddress))
                 } else if instr.isHalfword {
                     value = UInt32(try memory.readWord16(at: physicalAddress))
                 } else {
                     value = try memory.readWord32(at: physicalAddress)
+                }
+                if instr.isSigned {
+                    value = instr.isHalfword
+                        ? UInt32(bitPattern: Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: value))))
+                        : UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: value))))
                 }
                 if instr.rt == Registers.pcIndex && !instr.isByte && !instr.isHalfword {
                     cpsr.thumbState = value.bit(0)

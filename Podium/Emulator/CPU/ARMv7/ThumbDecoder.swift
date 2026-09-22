@@ -588,7 +588,7 @@ enum ThumbDecoder {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         return .loadStoreRegister(ThumbLoadStoreRegisterInstruction(
-            isLoad: isLoad, isByte: isByte, isHalfword: isHalfword, rn: rn, rt: rt,
+            isLoad: isLoad, isByte: isByte, isHalfword: isHalfword, isSigned: false, rn: rn, rt: rt,
             rm: Int(hw1.bitField16(3, 0)), shiftAmount: Int(hw1.bitField16(5, 4))
         ))
     }
@@ -620,6 +620,21 @@ enum ThumbDecoder {
                 isLoad: true, isByte: !isHalfword, isHalfword: isHalfword, isSigned: true, rn: rn, rt: rt,
                 preIndexed: true, addOffset: true, writeback: false,
                 offset: UInt32(hw1.bitField16(11, 0))
+            ))
+        }
+        if !hw1.bit16(11), hw1.bitField16(11, 6) == 0 {
+            // Register-offset form (`Rm LSL imm2`), the signed-load
+            // sibling of `decode32LoadStoreSingle`'s own register-offset
+            // branch — verified against a real `ldrsb.w r8, [r1, r0]`
+            // word, traced back from a real early-boot kernel halt.
+            // `LDRSH` (register-offset, `isHalfword`) isn't decoded, no
+            // real word has confirmed it yet.
+            guard !isHalfword else {
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+            }
+            return .loadStoreRegister(ThumbLoadStoreRegisterInstruction(
+                isLoad: true, isByte: true, isHalfword: false, isSigned: true, rn: rn, rt: rt,
+                rm: Int(hw1.bitField16(3, 0)), shiftAmount: Int(hw1.bitField16(5, 4))
             ))
         }
         guard hw1.bit16(11) else {
@@ -659,20 +674,27 @@ enum ThumbDecoder {
         // instead of ever reaching the extend-family switch below — a
         // real early-boot kernel halt on a real `uxth.w r8, fp` word
         // traced this back this session). The real discriminator is
-        // `hw1` bits[7:4]: `0` for register-controlled shift, `0b1000`
-        // for the extend/`CLZ` family, `0b1010` for `RBIT` (checked
-        // separately below). Confirmed against real words for all four:
-        // `lsl.w` (bits[7:4]==0b0000), `uxtb.w`/`uxth.w`
-        // (bits[7:4]==0b0101/0b0001), `rbit` (bits[7:4]==0b1001), `clz`
+        // `hw1` bits[7:4] alone: `0` for register-controlled shift,
+        // `0b1000` for the extend/`CLZ` family, `0b1010` for `RBIT`
+        // (checked separately below) — `hw0` bits[7:6] is *not* part of
+        // the discriminator (a second bug, also found this session via a
+        // real `ror.w r1, r2, r1` word: its `hw0` bits[7:6] is `0b01`,
+        // not the `lsl.w`-derived `0b00` an earlier version of this
+        // guard required, even though it's unambiguously the same
+        // register-controlled-shift family by `hw1`'s marker). Within
+        // that family, the `ShiftType` lives at `hw0` bits[7:5] (also
+        // corrected this session — `lsl.w`'s and `ror.w`'s words only
+        // disagree there, since `lsl.w`'s bits[7:4] being all-zero made
+        // the previous, wrong bits[5:4] extraction coincidentally return
+        // the right answer for that one instruction). Confirmed against
+        // real words for all four: `lsl.w`/`ror.w` (`hw0`
+        // bits[7:5]==0b000/0b011), `uxtb.w`/`uxth.w` (`hw0`
+        // bits[7:4]==0b0101/0b0001), `rbit` (bits[7:4]==0b1001), `clz`
         // (bits[7:4]==0b1011). `SXTH.W`/`SXTB.W`, `REV`/`REV16`/`REVSH`
         // aren't decoded — no real word has confirmed their exact bits
         // yet.
-        if hw0.bitField16(7, 6) == 0b00, hw1.bitField16(7, 4) == 0 {
-            // Register-controlled shift: bits[7:6]==00, bits[5:4] is
-            // the `ShiftType` (matching its raw values directly).
-            // Verified against a real `lsl.w r2, r5, r2` word from the
-            // actual kernel.
-            guard hw1.bitField16(15, 12) == 0b1111, hw1.bitField16(7, 4) == 0, let shiftType = ShiftType(rawValue: UInt8(hw0.bitField16(5, 4))) else {
+        if hw1.bitField16(7, 4) == 0 {
+            guard hw1.bitField16(15, 12) == 0b1111, let shiftType = ShiftType(rawValue: UInt8(hw0.bitField16(7, 5))) else {
                 return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             }
             return .shiftRegister(ThumbShiftRegisterInstruction(
@@ -710,6 +732,15 @@ enum ThumbDecoder {
             return .extendWide(ThumbExtendWideInstruction(
                 kind: .unsignedHalfword, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
             ))
+        case 0b0011 where hw0.bitField16(3, 0) == 0b1111:
+            // UXTB16: verified against a real `uxtb16 r3, r3` word from
+            // the actual kernel, traced back from a real early-boot
+            // kernel halt — same no-accumulate/rotate field layout as
+            // `UXTB.W`/`UXTH.W` above, just a different (dual-byte)
+            // `kind`.
+            return .extendWide(ThumbExtendWideInstruction(
+                kind: .unsignedByte16, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
+            ))
         case 0b1011:
             return .clz(ThumbClzInstruction(rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0))))
         default:
@@ -724,6 +755,11 @@ enum ThumbDecoder {
         switch hw0.bitField16(7, 4) {
         case 0b1010 where hw1.bitField16(7, 4) == 0:
             return .umull(ThumbUmullInstruction(
+                rdLo: Int(hw1.bitField16(15, 12)), rdHi: Int(hw1.bitField16(11, 8)),
+                rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
+            ))
+        case 0b1000 where hw1.bitField16(7, 4) == 0:
+            return .smull(ThumbSmullInstruction(
                 rdLo: Int(hw1.bitField16(15, 12)), rdHi: Int(hw1.bitField16(11, 8)),
                 rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
             ))

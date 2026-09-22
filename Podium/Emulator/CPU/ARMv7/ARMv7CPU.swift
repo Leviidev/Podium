@@ -365,6 +365,31 @@ final class ARMv7CPU: CPU {
         case .vectorRoundingShiftLeft(let instr):
             executeVectorRoundingShiftLeft(instr)
 
+        case .bitwiseExclusiveOr(let instr):
+            executeBitwiseExclusiveOr(instr)
+
+        case .bitwiseOr(let instr):
+            executeBitwiseOr(instr)
+
+        case .integerAdd(let instr):
+            executeIntegerAdd(instr)
+
+        case .vectorExtract(let instr):
+            executeVectorExtract(instr)
+
+        case .vectorShiftImmediate(let instr):
+            executeVectorShiftImmediate(instr)
+
+        case .elementLoadStore(let instr):
+            executeElementLoadStore(instr)
+
+        case .reverseElements(let instr):
+            executeReverseElements(instr)
+
+        case .extensionRegisterLoadStoreMultiple(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeExtensionRegisterLoadStoreMultiple(instr)
+
         case .unsupported:
             lastError = .unsupportedInstruction(rawWord: rawWord, address: instructionAddress)
 
@@ -630,6 +655,198 @@ final class ARMv7CPU: CPU {
             result |= (shifted & laneMask) << offset
         }
         neon[instr.vd] = result
+    }
+
+    /// `VLD1`/`VST1` (multiple single elements). See
+    /// `ElementLoadStoreInstruction`'s doc comment: each `D` register
+    /// transfers as its 8 raw bytes in address order (the low/high-word
+    /// split matches `LDRD`/`STRD`'s convention), with no deinterleave.
+    private func executeElementLoadStore(_ instr: ElementLoadStoreInstruction) {
+        let base = operandValue(for: instr.rn)
+        var address = base
+        do {
+            for offset in 0..<instr.registerCount {
+                let lowPhysicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
+                let highPhysicalAddress = try translatedAddress(address &+ 4, access: instr.isLoad ? .read : .write)
+                let register = instr.firstRegister + offset
+                if instr.isLoad {
+                    let low = try memory.readWord32(at: lowPhysicalAddress)
+                    let high = try memory.readWord32(at: highPhysicalAddress)
+                    neon[register] = UInt64(low) | (UInt64(high) << 32)
+                } else {
+                    let value = neon[register]
+                    try memory.writeWord32(UInt32(truncatingIfNeeded: value), at: lowPhysicalAddress)
+                    try memory.writeWord32(UInt32(truncatingIfNeeded: value >> 32), at: highPhysicalAddress)
+                }
+                address = address &+ 8
+            }
+        } catch let memoryError as MemoryAccessError {
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
+            return
+        } catch {
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
+            return
+        }
+
+        switch instr.writeback {
+        case .none: break
+        case .byTransferSize: registers[instr.rn] = base &+ UInt32(instr.registerCount) * 8
+        case .register(let rm): registers[instr.rn] = base &+ operandValue(for: rm)
+        }
+    }
+
+    /// `VREV16`/`VREV32`/`VREV64`: reverses `elementBits`-wide elements
+    /// within each `groupSize`-wide group, mechanically per ARM DDI
+    /// 0406C A8.8.291–293 — see `VREVInstruction`'s doc comment.
+    private func executeReverseElements(_ instr: VREVInstruction) {
+        let groupBits: Int
+        switch instr.groupSize {
+        case .bits64: groupBits = 64
+        case .bits32: groupBits = 32
+        case .bits16: groupBits = 16
+        }
+        let elementBits = instr.elementBits
+        let elementsPerGroup = groupBits / elementBits
+        let groupsPerLane = 64 / groupBits
+        let elementMask: UInt64 = elementBits == 64 ? .max : (UInt64(1) << elementBits) - 1
+
+        let dCount = instr.isQuad ? 2 : 1
+        let dd = instr.isQuad ? instr.vd * 2 : instr.vd
+        let dm = instr.isQuad ? instr.vm * 2 : instr.vm
+        for lane in 0..<dCount {
+            let source = neon[dm + lane]
+            var result: UInt64 = 0
+            for group in 0..<groupsPerLane {
+                for element in 0..<elementsPerGroup {
+                    let sourceShift = group * groupBits + element * elementBits
+                    let destinationElement = elementsPerGroup - 1 - element
+                    let destinationShift = group * groupBits + destinationElement * elementBits
+                    let value = (source >> sourceShift) & elementMask
+                    result |= value << destinationShift
+                }
+            }
+            neon[dd + lane] = result
+        }
+    }
+
+    private func executeBitwiseExclusiveOr(_ instr: VEORInstruction) {
+        if instr.isQuad {
+            let dn = instr.vn * 2
+            let dm = instr.vm * 2
+            let dd = instr.vd * 2
+            neon[dd] = neon[dn] ^ neon[dm]
+            neon[dd + 1] = neon[dn + 1] ^ neon[dm + 1]
+        } else {
+            neon[instr.vd] = neon[instr.vn] ^ neon[instr.vm]
+        }
+    }
+
+    private func executeBitwiseOr(_ instr: VORRInstruction) {
+        if instr.isQuad {
+            let dn = instr.vn * 2
+            let dm = instr.vm * 2
+            let dd = instr.vd * 2
+            neon[dd] = neon[dn] | neon[dm]
+            neon[dd + 1] = neon[dn + 1] | neon[dm + 1]
+        } else {
+            neon[instr.vd] = neon[instr.vn] | neon[instr.vm]
+        }
+    }
+
+    private func executeIntegerAdd(_ instr: VADDInstruction) {
+        let laneBits: Int
+        switch instr.size {
+        case .bits8: laneBits = 8
+        case .bits16: laneBits = 16
+        case .bits32: laneBits = 32
+        case .bits64: laneBits = 64
+        }
+        let laneCount = 64 / laneBits
+        let laneMask: UInt64 = laneBits == 64 ? .max : (UInt64(1) << laneBits) - 1
+
+        let dCount = instr.isQuad ? 2 : 1
+        let dd = instr.isQuad ? instr.vd * 2 : instr.vd
+        let dn = instr.isQuad ? instr.vn * 2 : instr.vn
+        let dm = instr.isQuad ? instr.vm * 2 : instr.vm
+        for lane in 0..<dCount {
+            let a = neon[dn + lane]
+            let b = neon[dm + lane]
+            var result: UInt64 = 0
+            for element in 0..<laneCount {
+                let offset = element * laneBits
+                let sum = ((a >> offset) &+ (b >> offset)) & laneMask
+                result |= sum << offset
+            }
+            neon[dd + lane] = result
+        }
+    }
+
+    /// `VEXT`: extracts consecutive bytes starting at `byteOffset` from
+    /// the logical concatenation of `Vn` (low) then `Vm` (high) — see
+    /// `VEXTInstruction`'s doc comment.
+    private func executeVectorExtract(_ instr: VEXTInstruction) {
+        func bytes(of value: UInt64) -> [UInt8] {
+            (0..<8).map { UInt8(truncatingIfNeeded: value >> (8 * $0)) }
+        }
+        func value(from slice: ArraySlice<UInt8>) -> UInt64 {
+            var result: UInt64 = 0
+            for (index, byte) in slice.enumerated() {
+                result |= UInt64(byte) << (8 * index)
+            }
+            return result
+        }
+
+        let dCount = instr.isQuad ? 2 : 1
+        let dn = instr.isQuad ? instr.vn * 2 : instr.vn
+        let dm = instr.isQuad ? instr.vm * 2 : instr.vm
+        let dd = instr.isQuad ? instr.vd * 2 : instr.vd
+
+        var nBytes: [UInt8] = []
+        var mBytes: [UInt8] = []
+        for lane in 0..<dCount {
+            nBytes += bytes(of: neon[dn + lane])
+            mBytes += bytes(of: neon[dm + lane])
+        }
+        let concatenated = nBytes + mBytes
+        let resultBytes = Array(concatenated[instr.byteOffset..<(instr.byteOffset + dCount * 8)])
+        for lane in 0..<dCount {
+            neon[dd + lane] = value(from: resultBytes[(lane * 8)..<(lane * 8 + 8)])
+        }
+    }
+
+    /// `VSHL`/`VSHR` (immediate) — see
+    /// `VectorShiftImmediateInstruction`'s doc comment.
+    private func executeVectorShiftImmediate(_ instr: VectorShiftImmediateInstruction) {
+        let laneMask: UInt64 = instr.elementBits == 64 ? .max : (UInt64(1) << instr.elementBits) - 1
+        let laneCount = 64 / instr.elementBits
+        let dCount = instr.isQuad ? 2 : 1
+        let dd = instr.isQuad ? instr.vd * 2 : instr.vd
+        let dm = instr.isQuad ? instr.vm * 2 : instr.vm
+
+        for lane in 0..<dCount {
+            let source = neon[dm + lane]
+            var result: UInt64 = 0
+            for element in 0..<laneCount {
+                let offset = element * instr.elementBits
+                let value = (source >> offset) & laneMask
+                let shifted: UInt64
+                switch instr.direction {
+                case .left:
+                    shifted = (value << instr.shiftAmount) & laneMask
+                case .right:
+                    if instr.unsigned {
+                        shifted = value >> instr.shiftAmount
+                    } else {
+                        let signBitSet = value & (UInt64(1) << (instr.elementBits - 1)) != 0
+                        let signExtended = signBitSet ? (value | ~laneMask) : value
+                        let shiftedSigned = Int64(bitPattern: signExtended) >> instr.shiftAmount
+                        shifted = UInt64(bitPattern: shiftedSigned) & laneMask
+                    }
+                }
+                result |= shifted << offset
+            }
+            neon[dd + lane] = result
+        }
     }
 
     /// `Shift()`'s rounding-shift-left helper (ARM DDI 0406C A8.8.316,
@@ -1086,5 +1303,44 @@ final class ARMv7CPU: CPU {
         } else {
             registers[instr.rn] = offsetAddress
         }
+    }
+
+    /// `VSTM`/`VLDM`/`VPUSH`/`VPOP` (double-precision). Each `D` register
+    /// transfers as two little-endian words at consecutive addresses —
+    /// the same low-word-then-high-word convention `LDRD`/`STRD` and
+    /// `LDREXD`/`STREXD` already use for a 64-bit value split across two
+    /// 32-bit slots. Writeback is unconditional (see the instruction's
+    /// doc comment: this family is only ever decoded with `W` set).
+    private func executeExtensionRegisterLoadStoreMultiple(_ instr: ExtensionRegisterLoadStoreMultipleInstruction) {
+        let base = operandValue(for: instr.rn)
+        let transferSize = UInt32(instr.registerCount) * 8
+        let startAddress = instr.addOffset ? base : base &- transferSize
+
+        var address = startAddress
+        do {
+            for offset in 0..<instr.registerCount {
+                let lowPhysicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
+                let highPhysicalAddress = try translatedAddress(address &+ 4, access: instr.isLoad ? .read : .write)
+                let register = instr.firstRegister + offset
+                if instr.isLoad {
+                    let low = try memory.readWord32(at: lowPhysicalAddress)
+                    let high = try memory.readWord32(at: highPhysicalAddress)
+                    neon[register] = UInt64(low) | (UInt64(high) << 32)
+                } else {
+                    let value = neon[register]
+                    try memory.writeWord32(UInt32(truncatingIfNeeded: value), at: lowPhysicalAddress)
+                    try memory.writeWord32(UInt32(truncatingIfNeeded: value >> 32), at: highPhysicalAddress)
+                }
+                address = address &+ 8
+            }
+        } catch let memoryError as MemoryAccessError {
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
+            return
+        } catch {
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
+            return
+        }
+
+        registers[instr.rn] = instr.addOffset ? base &+ transferSize : base &- transferSize
     }
 }

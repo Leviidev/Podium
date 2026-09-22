@@ -192,11 +192,17 @@ struct ThumbShiftImmediateInstruction: Equatable {
 /// `SXTH`/`SXTB`/`UXTH`/`UXTB`: sign- or zero-extend the bottom
 /// halfword/byte of `Rm` into `Rd` (no rotation — the rotated-source
 /// form is a 32-bit Thumb-2 encoding this CPU doesn't decode).
+/// `unsignedByte16` (`UXTB16`, wide form only — see
+/// `ThumbExtendWideInstruction`'s doc comment) is a different, SIMD-style
+/// operation: it zero-extends *two* bytes independently rather than the
+/// bottom byte/halfword alone, so `executeThumbExtendWide` special-cases
+/// it instead of reusing the plain zero/sign-extend logic.
 enum ThumbExtendKind: UInt8 {
     case signedHalfword = 0b00
     case signedByte = 0b01
     case unsignedHalfword = 0b10
     case unsignedByte = 0b11
+    case unsignedByte16 = 0b100
 }
 
 struct ThumbExtendInstruction: Equatable {
@@ -249,17 +255,19 @@ struct ThumbRbitInstruction: Equatable {
     let rm: Int
 }
 
-/// `UXTB` (Thumb-2, 32-bit "wide" form — `SXTH`/`UXTH`/`SXTB` share
-/// this same `kind`-tagged struct architecturally but aren't decoded,
-/// see `decode32ExtendOrShift`'s doc comment for why only `UXTB`'s
-/// exact op value is confirmed): the `0xFA`-prefixed sibling of
+/// `UXTB`/`UXTH`/`UXTB16` (Thumb-2, 32-bit "wide" form — `SXTH`/`SXTB`
+/// share this same `kind`-tagged struct architecturally but aren't
+/// decoded, see `decode32ExtendOrShift`'s doc comment for exactly which
+/// op values are confirmed): the `0xFA`-prefixed sibling of
 /// `ThumbExtendInstruction`'s 16-bit forms — needed for high registers
 /// (`r8`-`r14`) the 16-bit encoding can't reach, and adds an optional
 /// `ROR` (by `rotate*8` bits) applied to `Rm` before extracting. Only
 /// the no-accumulate shape (`Rn == 1111`) is decoded — `Rn` otherwise
-/// selects `UXTAB` (add `Rm`'s extended value to `Rn`), not decoded
-/// since no real word has confirmed it. Verified against a real
-/// `uxtb.w r1, r10` word from the actual kernel.
+/// selects `UXTAB`/`UXTAB16` (add the extended value to `Rn`), not
+/// decoded since no real word has confirmed it. Verified against real
+/// `uxtb.w r1, r10`, `uxth.w r8, fp`, and `uxtb16 r3, r3` words from the
+/// actual kernel (the last one via `unsignedByte16`'s different,
+/// dual-byte semantics — see `ThumbExtendKind`'s doc comment).
 struct ThumbExtendWideInstruction: Equatable {
     let kind: ThumbExtendKind
     let rd: Int
@@ -450,21 +458,27 @@ struct ThumbLoadStoreWideInstruction: Equatable {
     let offset: UInt32
 }
 
-/// Thumb-2 `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH` (register) — the
-/// register-offset sibling of `ThumbLoadStoreWideInstruction`'s immediate
-/// forms, verified against a real `ldr.w r3, [r5, r0, lsl #3]` word (word
-/// form) and a real `strh.w r2, [r1, r3, lsl #2]` word (halfword form,
-/// both from the actual kernel). Always pre-indexed, always adds, never
-/// writes back (per ARM DDI 0406C A8.8.66/A8.8.204/A8.8.203: `index=TRUE,
-/// add=TRUE, wback=FALSE`), and the offset is always `Rm LSL imm2` — no
-/// other shift type is encodable here. `isByte`/`isHalfword` are mutually
-/// exclusive, same as `ThumbLoadStoreWideInstruction`; signed halfword
-/// register-offset loads (`LDRSH`) live in a separate `0xF9`-prefixed
-/// space and aren't decoded here.
+/// Thumb-2 `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH`/`LDRSB`/`LDRSH`
+/// (register) — the register-offset sibling of
+/// `ThumbLoadStoreWideInstruction`'s immediate forms, verified against a
+/// real `ldr.w r3, [r5, r0, lsl #3]` word (word form), a real
+/// `strh.w r2, [r1, r3, lsl #2]` word (halfword form), and a real
+/// `ldrsb.w r8, [r1, r0]` word (signed byte form, traced back from a real
+/// early-boot kernel halt — lives in the separate `0xF9`-prefixed signed-
+/// load space, unlike the plain forms above, but shares this same struct
+/// and executor since the only difference is sign-extension and there's
+/// no store form to keep mutually exclusive with `isSigned`). Always
+/// pre-indexed, always adds, never writes back (per ARM DDI 0406C
+/// A8.8.66/A8.8.204/A8.8.203: `index=TRUE, add=TRUE, wback=FALSE`), and
+/// the offset is always `Rm LSL imm2` — no other shift type is encodable
+/// here. `isByte`/`isHalfword` are mutually exclusive; `LDRSH` (signed
+/// halfword register-offset) isn't decoded, since no real word has
+/// confirmed it yet.
 struct ThumbLoadStoreRegisterInstruction: Equatable {
     let isLoad: Bool
     let isByte: Bool
     let isHalfword: Bool
+    let isSigned: Bool
     let rn: Int
     let rt: Int
     let rm: Int
@@ -498,6 +512,18 @@ struct ThumbBlockDataTransferInstruction: Equatable {
 /// Verified against a real `umull r5, r2, r0, r3` word from the actual
 /// kernel.
 struct ThumbUmullInstruction: Equatable {
+    let rdLo: Int
+    let rdHi: Int
+    let rn: Int
+    let rm: Int
+}
+
+/// `SMULL RdLo, RdHi, Rn, Rm`: 32×32→64-bit signed multiply, never flag-
+/// setting. Shares `ThumbUmullInstruction`'s `0xFB` outer prefix and
+/// field layout, disambiguated by hw0 bits[7:4] == `1000` (vs `UMULL`'s
+/// `1010`). Verified against a real `smull r1, r0, r0, fp` word from the
+/// actual kernel.
+struct ThumbSmullInstruction: Equatable {
     let rdLo: Int
     let rdHi: Int
     let rn: Int
@@ -692,6 +718,7 @@ enum ThumbInstruction: Equatable {
     case tableBranch(ThumbTableBranchInstruction)
     case loadStoreDual(ThumbLoadStoreDualInstruction)
     case umull(ThumbUmullInstruction)
+    case smull(ThumbSmullInstruction)
     case mla(ThumbMlaInstruction)
     case mul(ThumbMulInstruction)
     case vectorMoveImmediate(ThumbVectorMoveImmediateInstruction)

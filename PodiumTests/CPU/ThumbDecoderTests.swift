@@ -182,6 +182,18 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rotate, 0)
     }
 
+    func testDecodesUxtb16FromRealKernel() {
+        // uxtb16 r3, r3 — from the real kernel at 0x806f7408. Traced back
+        // from a real early-boot kernel halt.
+        guard case .extendWide(let instr) = ThumbDecoder.decode(0xfa3f, 0xf383) else {
+            return XCTFail("Expected extendWide")
+        }
+        XCTAssertEqual(instr.kind, .unsignedByte16)
+        XCTAssertEqual(instr.rd, 3)
+        XCTAssertEqual(instr.rm, 3)
+        XCTAssertEqual(instr.rotate, 0)
+    }
+
     func testDecodesUxthWideFromRealKernel() {
         // uxth.w r8, fp — from the real kernel at 0x802227f8.
         guard case .extendWide(let instr) = ThumbDecoder.decode(0xfa1f, 0xf88b) else {
@@ -209,6 +221,20 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rd, 2)
         XCTAssertEqual(instr.rn, 5)
         XCTAssertEqual(instr.rm, 2)
+    }
+
+    func testDecodesRorRegisterWideFromRealKernel() {
+        // ror.w r1, r2, r1 — from the real kernel at 0x8022f934. Traced
+        // back from a real early-boot kernel halt; disambiguates
+        // `ShiftType`'s real field position (`hw0` bits[7:5]) from
+        // `lsl.w`'s test above, whose bits are all-zero either way.
+        guard case .shiftRegister(let instr) = ThumbDecoder.decode(0xfa62, 0xf101) else {
+            return XCTFail("Expected shiftRegister")
+        }
+        XCTAssertEqual(instr.shiftType, .ror)
+        XCTAssertEqual(instr.rd, 1)
+        XCTAssertEqual(instr.rn, 2)
+        XCTAssertEqual(instr.rm, 1)
     }
 
     func testDecodesLdmiaFromRealKernel() {
@@ -662,6 +688,22 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.offset, 0)
     }
 
+    func testDecodesLdrsbWRegisterOffsetFromRealKernel() {
+        // ldrsb.w r8, [r1, r0] — from the real kernel at 0x80233422.
+        // Traced back from a real early-boot kernel halt.
+        guard case .loadStoreRegister(let instr) = ThumbDecoder.decode(0xf911, 0x8000) else {
+            return XCTFail("Expected loadStoreRegister")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertTrue(instr.isByte)
+        XCTAssertFalse(instr.isHalfword)
+        XCTAssertTrue(instr.isSigned)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.rt, 8)
+        XCTAssertEqual(instr.rm, 0)
+        XCTAssertEqual(instr.shiftAmount, 0)
+    }
+
     func testDecodesSubsImmediate3FromRealKernel() {
         // subs r4, r7, #4 — from the real kernel at 0x80287ed0.
         guard case .addSub(let instr) = ThumbDecoder.decode(0x1f3c, 0) else {
@@ -703,6 +745,19 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rdHi, 2)
         XCTAssertEqual(instr.rn, 0)
         XCTAssertEqual(instr.rm, 3)
+    }
+
+    func testDecodesSmullFromRealKernel() {
+        // smull r1, r0, r0, fp — from the real kernel, the instruction
+        // that halted the trace right after the NEON SHA-1-style round
+        // function this session's ARM-mode work unblocked.
+        guard case .smull(let instr) = ThumbDecoder.decode(0xfb80, 0x100b) else {
+            return XCTFail("Expected smull")
+        }
+        XCTAssertEqual(instr.rdLo, 1)
+        XCTAssertEqual(instr.rdHi, 0)
+        XCTAssertEqual(instr.rn, 0)
+        XCTAssertEqual(instr.rm, 11)
     }
 
     func testDecodesMlaFromRealKernel() {

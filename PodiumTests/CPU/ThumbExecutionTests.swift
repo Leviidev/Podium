@@ -585,6 +585,19 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[5], 11) // pre-indexed with writeback.
     }
 
+    func testLdrsbWRegisterOffsetSignExtendsRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xf911, 0x8000, // ldrsb.w r8, [r1, r0], real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[1] = 10
+        cpu.registers[0] = 5
+        try! (cpu.memory as! FlatPhysicalMemory).writeByte(0xFF, at: 15) // -1 as a signed byte.
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[8], 0xFFFF_FFFF)
+    }
+
     func testLdrshWideSignExtendsNegativeHalfwordRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xf9b6, 0x2000, // ldrsh.w r2, [r6], real word from the actual kernel
@@ -723,6 +736,20 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[2], 1) // RdHi
     }
 
+    func testSmullRealKernelWordComputesSigned64BitProduct() {
+        let cpu = makeThumbCPU(program: [
+            0xfb80, 0x100b, // smull r1, r0, r0, fp, real word from the actual kernel
+        ])
+        cpu.registers[0] = UInt32(bitPattern: -5) // 0xFFFFFFFB
+        cpu.registers[11] = 3
+        cpu.step()
+
+        // -5 * 3 = -15 = 0xFFFFFFFF_FFFFFFF1
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 0xFFFF_FFF1) // RdLo
+        XCTAssertEqual(cpu.registers[0], 0xFFFF_FFFF) // RdHi
+    }
+
     func testMulWideRealKernelWordComputesProduct() {
         let cpu = makeThumbCPU(program: [
             0xfb00, 0xf102, // mul r1, r0, r2, real word from the actual kernel
@@ -850,6 +877,22 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[2], 16) // 1 << 4
     }
 
+    /// Traced back from a real early-boot kernel halt: this real word
+    /// disambiguates `ShiftType`'s field position from `lsl.w`'s own
+    /// test above, whose bits happen to be all-zero either way — see
+    /// `decode32ExtendOrShift`'s doc comment.
+    func testRorRegisterWideRotatesByRegisterAmountRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xfa62, 0xf101, // ror.w r1, r2, r1, real word from the actual kernel
+        ])
+        cpu.registers[2] = 0x0000_0001
+        cpu.registers[1] = 4
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 0x1000_0000) // ROR(1, #4)
+    }
+
     func testUxtbWideZeroExtendsHighRegisterRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xfa5f, 0xf18a, // uxtb.w r1, r10, real word from the actual kernel
@@ -859,6 +902,18 @@ final class ThumbExecutionTests: XCTestCase {
 
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[1], 0xDD)
+    }
+
+    func testUxtb16ExtractsAndZeroExtendsTwoBytesRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xfa3f, 0xf383, // uxtb16 r3, r3, real word from the actual kernel
+        ])
+        cpu.registers[3] = 0xAABB_CCDD
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // byte0 (0xDD) -> low halfword, byte2 (0xBB) -> high halfword.
+        XCTAssertEqual(cpu.registers[3], 0x00BB_00DD)
     }
 
     func testUxthWideZeroExtendsHighRegisterRealKernelWord() {

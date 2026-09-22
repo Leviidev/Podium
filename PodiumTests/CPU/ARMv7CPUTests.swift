@@ -809,6 +809,139 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(try! (cpu.memory as! FlatPhysicalMemory).readWord32(at: 100), 0xDEAD_BEEF)
     }
 
+    func testVpushRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xED6D_0B20, // vpush {d16-d31} -- real word from the actual kernel
+        ], memorySize: 512)
+        cpu.registers[13] = 256 // SP
+        cpu.neon[16] = 0x1111_1111_2222_2222
+        cpu.neon[31] = 0x3333_3333_4444_4444
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[13], 128) // 256 - 16 D-registers * 8 bytes
+        let memory = cpu.memory as! FlatPhysicalMemory
+        // D16 is the first register pushed, at the new (lowest) SP.
+        XCTAssertEqual(try! memory.readWord32(at: 128), 0x2222_2222) // low word
+        XCTAssertEqual(try! memory.readWord32(at: 132), 0x1111_1111) // high word
+        // D31 is the last register pushed, at new SP + 15*8.
+        XCTAssertEqual(try! memory.readWord32(at: 248), 0x4444_4444) // low word
+        XCTAssertEqual(try! memory.readWord32(at: 252), 0x3333_3333) // high word
+    }
+
+    func testVeorQuadRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xF34C_C1FC, // veor q14, q14, q14 -- real word from the actual kernel
+        ])
+        cpu.neon[28] = 0x1111_1111_2222_2222 // D28 (low half of Q14)
+        cpu.neon[29] = 0x3333_3333_4444_4444 // D29 (high half of Q14)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[28], 0) // Q14 ^ Q14 == 0, regardless of the operand's prior value.
+        XCTAssertEqual(cpu.neon[29], 0)
+    }
+
+    func testVld1MultipleWithByTransferSizeWritebackRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xF463_EAAD, // vld1.32 {d30,d31}, [r3:0x80]! -- real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[3] = 100
+        let memory = cpu.memory as! FlatPhysicalMemory
+        try! memory.writeWord32(0x1111_1111, at: 100) // D30 low
+        try! memory.writeWord32(0x2222_2222, at: 104) // D30 high
+        try! memory.writeWord32(0x3333_3333, at: 108) // D31 low
+        try! memory.writeWord32(0x4444_4444, at: 112) // D31 high
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[30], 0x2222_2222_1111_1111)
+        XCTAssertEqual(cpu.neon[31], 0x4444_4444_3333_3333)
+        XCTAssertEqual(cpu.registers[3], 116) // base + 2 D-registers * 8 bytes
+    }
+
+    func testVrev32QuadRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xF3B0_80E8, // vrev32.8 q4, q12 -- real word from the actual kernel
+        ])
+        cpu.neon[24] = 0x8877_6655_4433_2211 // D24 (low half of Q12)
+        cpu.neon[25] = 0x8877_6655_4433_2211 // D25 (high half of Q12)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Each 32-bit group's 4 bytes reverse order: 0x44332211 -> 0x11223344, 0x88776655 -> 0x55667788.
+        XCTAssertEqual(cpu.neon[8], 0x5566_7788_1122_3344) // D8 (low half of Q4)
+        XCTAssertEqual(cpu.neon[9], 0x5566_7788_1122_3344) // D9 (high half of Q4)
+    }
+
+    func testVaddI32QuadRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xF268_886E, // vadd.i32 q12, q4, q15 -- real word from the actual kernel
+        ])
+        cpu.neon[8] = 0x0000_0005_0000_0003 // D8 (low half of Q4): lanes 3, 5
+        cpu.neon[30] = 0x0000_0002_0000_0001 // D30 (low half of Q15): lanes 1, 2
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[24], 0x0000_0007_0000_0004) // D24 (low half of Q12): 3+1, 5+2
+    }
+
+    func testVorrQuadIdentityRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xF268_01F8, // vorr q8, q12, q12 -- real word from the actual kernel (VMOV idiom)
+        ])
+        cpu.neon[24] = 0x1111_1111_2222_2222 // D24 (low half of Q12)
+        cpu.neon[25] = 0x3333_3333_4444_4444 // D25 (high half of Q12)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[16], 0x1111_1111_2222_2222) // D16 (low half of Q8)
+        XCTAssertEqual(cpu.neon[17], 0x3333_3333_4444_4444) // D17 (high half of Q8)
+    }
+
+    func testVext64QuadRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xF2F8_0866, // vext.64 q8, q4, q11, #1 -- real word from the actual kernel
+        ])
+        cpu.neon[8] = 0x1111_1111_1111_1111 // D8 (low half of Q4)
+        cpu.neon[9] = 0x2222_2222_2222_2222 // D9 (high half of Q4)
+        cpu.neon[22] = 0x3333_3333_3333_3333 // D22 (low half of Q11)
+        cpu.neon[23] = 0x4444_4444_4444_4444 // D23 (high half of Q11)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // byteOffset=8 into the 32-byte concatenation [D8,D9,D22,D23] -> [D9, D22].
+        XCTAssertEqual(cpu.neon[16], 0x2222_2222_2222_2222) // D16 (low half of Q8)
+        XCTAssertEqual(cpu.neon[17], 0x3333_3333_3333_3333) // D17 (high half of Q8)
+    }
+
+    func testVshlI32ImmediateQuadRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xF2E1_8570, // vshl.i32 q12, q8, #1 -- real word from the actual kernel
+        ])
+        cpu.neon[16] = 0x0000_0002_0000_0001 // D16 (low half of Q8): lanes 1, 2
+        cpu.neon[17] = 0x0000_0003_8000_0000 // D17 (high half of Q8): lanes 0x80000000, 3
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Non-saturating left shift: 0x80000000 << 1 masked to 32 bits drops the overflow bit.
+        XCTAssertEqual(cpu.neon[24], 0x0000_0004_0000_0002) // D24 (low half of Q12)
+        XCTAssertEqual(cpu.neon[25], 0x0000_0006_0000_0000) // D25 (high half of Q12)
+    }
+
+    func testVshrU32ImmediateQuadRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xF3E1_0070, // vshr.u32 q8, q8, #0x1f -- real word from the actual kernel
+        ])
+        cpu.neon[16] = 0x0000_0002_0000_0001 // D16 (low half of Q8): lanes 1, 2
+        cpu.neon[17] = 0x0000_0003_8000_0000 // D17 (high half of Q8): lanes 0x80000000, 3
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[16], 0) // 1>>31, 2>>31 both 0
+        XCTAssertEqual(cpu.neon[17], 0x0000_0000_0000_0001) // 0x80000000>>31 = 1, 3>>31 = 0
+    }
+
     func testConditionalInstructionSkippedWhenConditionFails() {
         let cpu = makeCPU(program: [
             0xE3A0_0000, // MOV r0, #0  (also clears Z, since S==0 here it does NOT touch flags —

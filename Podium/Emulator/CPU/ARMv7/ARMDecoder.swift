@@ -399,6 +399,34 @@ enum ARMDecoder {
     /// CDP within this space); everything else in the coprocessor block
     /// (CDP, LDC/STC, MCRR/MRRC) stays `.unsupported`.
     private static func decodeCoprocessorBlock(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
+        // VSTM/VLDM/VPUSH/VPOP (double-precision extension registers):
+        // bits[27:25]==110 (fixed for this "extension register load/
+        // store" family, distinguishing it from MCR/MRC's bits[27:24]==
+        // 1110 below), bits[11:8]==0b1011 selects double-precision width
+        // (vs. 0b1010 for single, not decoded). W (bit21) distinguishes
+        // this "multiple" form from VSTR/VLDR's single-register form
+        // (which always has W==0) — see
+        // `ExtensionRegisterLoadStoreMultipleInstruction`'s doc comment.
+        if word.bitField(27, 25) == 0b110, word.bitField(11, 8) == 0b1011, word.bit(21) {
+            let p = word.bit(24)
+            let u = word.bit(23)
+            guard p != u else {
+                // P==U (both increment-after-without-writeback-shape or
+                // both decrement-before-without-U) isn't a valid VSTM/
+                // VLDM addressing mode.
+                return .unsupported(rawWord: word)
+            }
+            let d = word.bit(22) ? 1 << 4 : 0
+            return .extensionRegisterLoadStoreMultiple(ExtensionRegisterLoadStoreMultipleInstruction(
+                condition: condition,
+                isLoad: word.bit(20),
+                addOffset: u,
+                rn: Int(word.bitField(19, 16)),
+                firstRegister: d | Int(word.bitField(15, 12)),
+                registerCount: Int(word.bitField(7, 0)) / 2
+            ))
+        }
+
         guard word.bitField(27, 24) == 0b1110, word.bit(4) else {
             return .unsupported(rawWord: word)
         }
@@ -490,7 +518,68 @@ enum ARMDecoder {
         // table from memory. Only opc==0b0101 (VRSHL) and Q==0 (D-register
         // width) are decoded; every other opcode/width in this same shape
         // stays `.unsupported` until a real word confirms one is needed.
-        if word.bitField(31, 25) == 0b1111_001, word.bitField(11, 8) == 0b0101, !word.bit(6) {
+        // VLD1/VST1 (multiple single elements): bits[27:23]==0b01000 and
+        // bit20==0 (fixed for this "Advanced SIMD element or structure
+        // load/store" sub-family), bit21 selects load(1)/store(0). See
+        // `ElementLoadStoreInstruction`'s doc comment — verified against
+        // a real `vld1.32 {d30,d31}, [r3:0x80]!` word from the actual
+        // kernel.
+        if word.bitField(27, 23) == 0b01000, !word.bit(20) {
+            let registerCount: Int
+            switch word.bitField(11, 8) {
+            case 0b0111: registerCount = 1
+            case 0b1010: registerCount = 2
+            case 0b0110: registerCount = 3
+            case 0b0010: registerCount = 4
+            default: return .unsupported(rawWord: word)
+            }
+            let rm = word.bitField(3, 0)
+            let writeback: ElementLoadStoreInstruction.Writeback
+            switch rm {
+            case 0b1111: writeback = .none
+            case 0b1101: writeback = .byTransferSize
+            default: writeback = .register(Int(rm))
+            }
+            let d = word.bit(22) ? 1 << 4 : 0
+            return .elementLoadStore(ElementLoadStoreInstruction(
+                isLoad: word.bit(21),
+                rn: Int(word.bitField(19, 16)),
+                firstRegister: d | Int(word.bitField(15, 12)),
+                registerCount: registerCount,
+                writeback: writeback
+            ))
+        }
+
+        // VREV16/VREV32/VREV64: "two registers, miscellaneous" NEON
+        // space — bits[31:23]==0b111100111 (fixed prefix), bits[21:20]==
+        // 0b11 (fixed), bits[17:16]==0b00 (selects the VREV op-group
+        // specifically, as opposed to this space's many other opcodes —
+        // everything else in "two registers, miscellaneous" stays
+        // `.unsupported`), bits[11:9]==0b000 and bit4==0 (also fixed for
+        // this op-group). See `VREVInstruction`'s doc comment — verified
+        // against a real `vrev32.8 q4, q12` word from the actual kernel.
+        if word.bitField(31, 23) == 0b1_1110_0111, word.bitField(21, 20) == 0b11, word.bitField(17, 16) == 0b00,
+           word.bitField(11, 9) == 0b000, !word.bit(4) {
+            guard let groupSize = VREVInstruction.GroupSize(rawValue: UInt8(word.bitField(8, 7))) else {
+                return .unsupported(rawWord: word)
+            }
+            let sizeField = word.bitField(19, 18)
+            guard sizeField != 0b11 else {
+                return .unsupported(rawWord: word)
+            }
+            let isQuad = word.bit(6)
+            let dField = Int((word.bit(22) ? 1 << 4 : 0) | word.bitField(15, 12))
+            let mField = Int((word.bit(5) ? 1 << 4 : 0) | word.bitField(3, 0))
+            return .reverseElements(VREVInstruction(
+                groupSize: groupSize,
+                elementBits: 8 << Int(sizeField),
+                vd: isQuad ? dField >> 1 : dField,
+                vm: isQuad ? mField >> 1 : mField,
+                isQuad: isQuad
+            ))
+        }
+
+        if word.bitField(31, 25) == 0b1111_001, !word.bit(23), word.bitField(11, 8) == 0b0101, !word.bit(6) {
             guard let size = VRSHLInstruction.ElementSize(rawValue: UInt8(word.bitField(21, 20))) else {
                 return .unsupported(rawWord: word)
             }
@@ -498,6 +587,125 @@ enum ARMDecoder {
             let vm = Int((word.bit(5) ? 1 << 4 : 0) | word.bitField(3, 0))
             let vn = Int((word.bit(7) ? 1 << 4 : 0) | word.bitField(19, 16))
             return .vectorRoundingShiftLeft(VRSHLInstruction(unsigned: word.bit(24), size: size, vd: vd, vm: vm, vn: vn))
+        }
+
+        // VEOR/VORR: same "three registers of the same length" outer
+        // shape as VRSHL above, but from the "bitwise operations" sub-
+        // space (opc==0b0001) — see VEORInstruction's/VORRInstruction's
+        // doc comments. Q (bit6) selects 128-bit width, in which case the
+        // raw 5-bit D-style register fields address Q registers (D-pair
+        // index >> 1). U(bit24)+size(bits[21:20]) select which sibling:
+        // only VEOR (U=1,size=00) and VORR (U=0,size=10) are decoded so
+        // far, not VAND/VBIC/VORN/VBSL/VBIT/VBIF. bit23==0 (empirically
+        // confirmed fixed for the whole "three registers of the same
+        // length" family — every real word seen so far, VRSHL/VEOR/VADD
+        // alike, has it clear) disambiguates this from VEXT/the shift-
+        // immediate family below, which both fix that same bit at 1 —
+        // without this check, a real `vext.64 ...` word (imm4==0b1000)
+        // would misdecode as VADD, since imm4 and VADD's opc share the
+        // same bit position and can coincide.
+        if word.bitField(31, 25) == 0b1111_001, !word.bit(23), word.bitField(11, 8) == 0b0001 {
+            let isQuad = word.bit(6)
+            let dField = Int((word.bit(22) ? 1 << 4 : 0) | word.bitField(15, 12))
+            let nField = Int((word.bit(7) ? 1 << 4 : 0) | word.bitField(19, 16))
+            let mField = Int((word.bit(5) ? 1 << 4 : 0) | word.bitField(3, 0))
+            let vd = isQuad ? dField >> 1 : dField
+            let vn = isQuad ? nField >> 1 : nField
+            let vm = isQuad ? mField >> 1 : mField
+            if word.bit(24), word.bitField(21, 20) == 0b00 {
+                return .bitwiseExclusiveOr(VEORInstruction(vd: vd, vn: vn, vm: vm, isQuad: isQuad))
+            }
+            if !word.bit(24), word.bitField(21, 20) == 0b10 {
+                return .bitwiseOr(VORRInstruction(vd: vd, vn: vn, vm: vm, isQuad: isQuad))
+            }
+            return .unsupported(rawWord: word)
+        }
+
+        // VADD.I<size>: same "three registers of the same length" outer
+        // shape, opc(bits[11:8])==0b1000 with U(bit24)==0 selects integer
+        // add (U==1 would be VSUB, not decoded) — see VADDInstruction's
+        // doc comment. Unlike VRSHL/VEOR/VORR above, Q (128-bit) width is
+        // supported here since the real halting word needs it. bit23==0
+        // required — see the VEOR/VORR comment above on why (this is the
+        // exact collision that motivated adding the check).
+        if word.bitField(31, 25) == 0b1111_001, !word.bit(23), word.bitField(11, 8) == 0b1000, !word.bit(24) {
+            guard let size = VADDInstruction.ElementSize(rawValue: UInt8(word.bitField(21, 20))) else {
+                return .unsupported(rawWord: word)
+            }
+            let isQuad = word.bit(6)
+            let dField = Int((word.bit(22) ? 1 << 4 : 0) | word.bitField(15, 12))
+            let nField = Int((word.bit(7) ? 1 << 4 : 0) | word.bitField(19, 16))
+            let mField = Int((word.bit(5) ? 1 << 4 : 0) | word.bitField(3, 0))
+            return .integerAdd(VADDInstruction(
+                size: size,
+                vd: isQuad ? dField >> 1 : dField,
+                vn: isQuad ? nField >> 1 : nField,
+                vm: isQuad ? mField >> 1 : mField,
+                isQuad: isQuad
+            ))
+        }
+
+        // VEXT: bits[31:24]==0b11110010 (fixed prefix, distinct from the
+        // "three registers of the same length" family above), bit23==1
+        // and bits[21:20]==0b11 (also fixed), bit4==0 disambiguates it
+        // from the "two registers and a shift amount" family below (which
+        // fixes that same bit at 1) even though both share this same
+        // bits[31:24]/bit23 prefix. See VEXTInstruction's doc comment.
+        if word.bitField(31, 24) == 0b1111_0010, word.bit(23), word.bitField(21, 20) == 0b11, !word.bit(4) {
+            let isQuad = word.bit(6)
+            let dField = Int((word.bit(22) ? 1 << 4 : 0) | word.bitField(15, 12))
+            let nField = Int((word.bit(7) ? 1 << 4 : 0) | word.bitField(19, 16))
+            let mField = Int((word.bit(5) ? 1 << 4 : 0) | word.bitField(3, 0))
+            return .vectorExtract(VEXTInstruction(
+                vd: isQuad ? dField >> 1 : dField,
+                vn: isQuad ? nField >> 1 : nField,
+                vm: isQuad ? mField >> 1 : mField,
+                isQuad: isQuad,
+                byteOffset: Int(word.bitField(11, 8))
+            ))
+        }
+
+        // VSHL/VSHR (immediate): "two registers and a shift amount" NEON
+        // space — bits[31:25]==0b1111001, bit23==1, bit4==1 (fixed; see
+        // VEXT's doc comment on the bit4 disambiguation). See
+        // VectorShiftImmediateInstruction's doc comment for the opc/imm6
+        // decoding.
+        if word.bitField(31, 25) == 0b1111_001, word.bit(23), word.bit(4) {
+            let opc = word.bitField(11, 8)
+            let unsigned = word.bit(24)
+            let direction: VectorShiftImmediateInstruction.Direction
+            if opc == 0b0101, !unsigned {
+                direction = .left
+            } else if opc == 0b0000 {
+                direction = .right
+            } else {
+                return .unsupported(rawWord: word)
+            }
+            let imm6 = Int(word.bitField(21, 16))
+            let elementBits: Int
+            if imm6 & 0b10_0000 != 0 {
+                elementBits = 32
+            } else if imm6 & 0b01_0000 != 0 {
+                elementBits = 16
+            } else if imm6 & 0b00_1000 != 0 {
+                elementBits = 8
+            } else {
+                // size==64 (the L-bit encoding) isn't decoded yet.
+                return .unsupported(rawWord: word)
+            }
+            let shiftAmount = direction == .left ? imm6 - elementBits : 2 * elementBits - imm6
+            let isQuad = word.bit(6)
+            let dField = Int((word.bit(22) ? 1 << 4 : 0) | word.bitField(15, 12))
+            let mField = Int((word.bit(5) ? 1 << 4 : 0) | word.bitField(3, 0))
+            return .vectorShiftImmediate(VectorShiftImmediateInstruction(
+                direction: direction,
+                unsigned: unsigned,
+                elementBits: elementBits,
+                shiftAmount: shiftAmount,
+                vd: isQuad ? dField >> 1 : dField,
+                vm: isQuad ? mField >> 1 : mField,
+                isQuad: isQuad
+            ))
         }
 
         return .unsupported(rawWord: word)

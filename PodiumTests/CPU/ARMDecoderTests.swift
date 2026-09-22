@@ -401,6 +401,146 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.vn, 5)
     }
 
+    func testDecodesVpushFromRealKernel() {
+        // vpush {d16-d31} — from the real kernel, hit right after the
+        // first-ever ARM-state (non-Thumb) unsupported-instruction halt
+        // this session (a VFP/NEON context-save prologue). P=1,U=0,D=1,
+        // W=1,L=0,Rn=13(SP),Vd=0,imm8=0x20.
+        guard case .extensionRegisterLoadStoreMultiple(let instr) = ARMDecoder.decode(0xED6D_0B20) else {
+            return XCTFail("Expected extensionRegisterLoadStoreMultiple")
+        }
+        XCTAssertFalse(instr.isLoad)
+        XCTAssertFalse(instr.addOffset)
+        XCTAssertEqual(instr.rn, 13)
+        XCTAssertEqual(instr.firstRegister, 16)
+        XCTAssertEqual(instr.registerCount, 16)
+    }
+
+    func testDecodesVeorFromRealKernel() {
+        // veor q14, q14, q14 — from the real kernel, a NEON register-
+        // zeroing idiom hit in the same VFP-context-save routine as the
+        // preceding vpush {d16-d31}.
+        guard case .bitwiseExclusiveOr(let instr) = ARMDecoder.decode(0xF34C_C1FC) else {
+            return XCTFail("Expected bitwiseExclusiveOr")
+        }
+        XCTAssertTrue(instr.isQuad)
+        XCTAssertEqual(instr.vd, 14)
+        XCTAssertEqual(instr.vn, 14)
+        XCTAssertEqual(instr.vm, 14)
+    }
+
+    func testDecodesVld1MultipleFromRealKernel() {
+        // vld1.32 {d30, d31}, [r3:0x80]! — from the real kernel, part of
+        // the same VFP-context routine as the preceding vpush/veor.
+        guard case .elementLoadStore(let instr) = ARMDecoder.decode(0xF463_EAAD) else {
+            return XCTFail("Expected elementLoadStore")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertEqual(instr.rn, 3)
+        XCTAssertEqual(instr.firstRegister, 30)
+        XCTAssertEqual(instr.registerCount, 2)
+        XCTAssertEqual(instr.writeback, .byTransferSize)
+    }
+
+    func testDecodesVrev32FromRealKernel() {
+        // vrev32.8 q4, q12 — from the real kernel, part of the same
+        // VFP-context routine as the preceding vpush/veor/vld1.
+        guard case .reverseElements(let instr) = ARMDecoder.decode(0xF3B0_80E8) else {
+            return XCTFail("Expected reverseElements")
+        }
+        XCTAssertEqual(instr.groupSize, .bits32)
+        XCTAssertEqual(instr.elementBits, 8)
+        XCTAssertTrue(instr.isQuad)
+        XCTAssertEqual(instr.vd, 4)
+        XCTAssertEqual(instr.vm, 12)
+    }
+
+    func testDecodesVaddI32QuadFromRealKernel() {
+        // vadd.i32 q12, q4, q15 — from the real kernel, part of the same
+        // NEON SHA-1-style round function as vpush/veor/vld1/vrev32.
+        guard case .integerAdd(let instr) = ARMDecoder.decode(0xF268_886E) else {
+            return XCTFail("Expected integerAdd")
+        }
+        XCTAssertEqual(instr.size, .bits32)
+        XCTAssertTrue(instr.isQuad)
+        XCTAssertEqual(instr.vd, 12)
+        XCTAssertEqual(instr.vn, 4)
+        XCTAssertEqual(instr.vm, 15)
+    }
+
+    func testDecodesVorrQuadFromRealKernel() {
+        // vorr q8, q12, q12 — from the real kernel, the VMOV-via-VORR
+        // idiom, in the same NEON round function.
+        guard case .bitwiseOr(let instr) = ARMDecoder.decode(0xF268_01F8) else {
+            return XCTFail("Expected bitwiseOr")
+        }
+        XCTAssertTrue(instr.isQuad)
+        XCTAssertEqual(instr.vd, 8)
+        XCTAssertEqual(instr.vn, 12)
+        XCTAssertEqual(instr.vm, 12)
+    }
+
+    func testDecodesVext64FromRealKernel() {
+        // vext.64 q8, q4, q11, #1 — from the real kernel, in the same
+        // NEON round function; also the word that motivated adding the
+        // bit23==0 guard to the "three registers of the same length"
+        // decode branches (its imm4==0b1000 would otherwise misdecode as
+        // VADD, since imm4 and VADD's opc field share the same bits).
+        guard case .vectorExtract(let instr) = ARMDecoder.decode(0xF2F8_0866) else {
+            return XCTFail("Expected vectorExtract")
+        }
+        XCTAssertTrue(instr.isQuad)
+        XCTAssertEqual(instr.vd, 8)
+        XCTAssertEqual(instr.vn, 4)
+        XCTAssertEqual(instr.vm, 11)
+        XCTAssertEqual(instr.byteOffset, 8) // ".64 #1" -> 1 element * 8 bytes
+    }
+
+    func testDecodesVext32FromRealKernel() {
+        // vext.32 q12, q9, q14, #1 — from the real kernel, confirming the
+        // byte-offset scales with element size (4 bytes here vs. 8 above)
+        // even though both display as "#1" in assembly.
+        guard case .vectorExtract(let instr) = ARMDecoder.decode(0xF2F2_84EC) else {
+            return XCTFail("Expected vectorExtract")
+        }
+        XCTAssertTrue(instr.isQuad)
+        XCTAssertEqual(instr.vd, 12)
+        XCTAssertEqual(instr.vn, 9)
+        XCTAssertEqual(instr.vm, 14)
+        XCTAssertEqual(instr.byteOffset, 4) // ".32 #1" -> 1 element * 4 bytes
+    }
+
+    func testDecodesVshlI32ImmediateFromRealKernel() {
+        // vshl.i32 q12, q8, #1 — from the real kernel, in the same NEON
+        // round function.
+        guard case .vectorShiftImmediate(let instr) = ARMDecoder.decode(0xF2E1_8570) else {
+            return XCTFail("Expected vectorShiftImmediate")
+        }
+        XCTAssertEqual(instr.direction, .left)
+        XCTAssertFalse(instr.unsigned)
+        XCTAssertEqual(instr.elementBits, 32)
+        XCTAssertEqual(instr.shiftAmount, 1)
+        XCTAssertTrue(instr.isQuad)
+        XCTAssertEqual(instr.vd, 12)
+        XCTAssertEqual(instr.vm, 8)
+    }
+
+    func testDecodesVshrU32ImmediateFromRealKernel() {
+        // vshr.u32 q8, q8, #0x1f — from the real kernel, sharing the same
+        // imm6 size-decoding logic as the VSHL test above (imm6=33 in
+        // both cases, but the shift-amount formula differs by direction).
+        guard case .vectorShiftImmediate(let instr) = ARMDecoder.decode(0xF3E1_0070) else {
+            return XCTFail("Expected vectorShiftImmediate")
+        }
+        XCTAssertEqual(instr.direction, .right)
+        XCTAssertTrue(instr.unsigned)
+        XCTAssertEqual(instr.elementBits, 32)
+        XCTAssertEqual(instr.shiftAmount, 31)
+        XCTAssertTrue(instr.isQuad)
+        XCTAssertEqual(instr.vd, 8)
+        XCTAssertEqual(instr.vm, 8)
+    }
+
     func testDecodesIsbFromRealKernel() {
         // isb sy, from the real kernel at 0x8008609c.
         guard case .memoryBarrier = ARMDecoder.decode(0xF57F_F06F) else {
