@@ -24,10 +24,12 @@ enum CPUError: Error, Equatable {
 /// for `stepThumb()`/`ThumbDecoder`/`ThumbInstruction` — reached via a
 /// genuine interworking `BX`/`BLX`, not a separate, disconnected mode.
 ///
-/// What this does *not* do yet, honestly: IRQ/FIQ interrupts (the `I`/`F`
-/// CPSR mask bits `CPS` sets are tracked, but nothing actually raises one
-/// for them to gate) and Prefetch Abort/Undefined-Instruction exception
-/// entry (an instruction-fetch fault or an unsupported/undefined
+/// IRQ/FIQ are real: the platform's interrupt controller drives
+/// `irqAsserted`/`fiqAsserted`, and the run loop takes the exception
+/// between instructions when unmasked (see `serviceDevicesAndInterrupts`).
+/// Devices keep time from `virtualTime`, not the host clock. What this
+/// does *not* do yet, honestly: Prefetch Abort/Undefined-Instruction
+/// exception entry (an instruction-fetch fault or an unsupported/undefined
 /// instruction still halts `lastError`-style). Data Abort *is* real now —
 /// see `raiseDataAbort` — dispatching into the guest's own vector table
 /// with real SP/LR/SPSR banking (`switchProcessorMode`) exactly like real
@@ -74,6 +76,10 @@ final class ARMv7CPU: CPU {
     /// unlikely to land back exactly on it at a sampled boundary).
     var breakpoints: Set<UInt32> = []
     private(set) var hitBreakpoint: UInt32?
+    /// Real guest instructions retired so far. Differs from `run(maxUnits:)`'s
+    /// unit count once the JIT is involved, since one compiled block is one
+    /// unit but many instructions — this is the honest progress/speed figure.
+    private(set) var retiredInstructionCount: UInt64 = 0
 
     let jit: JITEngine?
 
@@ -96,6 +102,8 @@ final class ARMv7CPU: CPU {
     static let svcModeBits: UInt32 = 0b10011
     static let systemModeBits: UInt32 = 0b11111
     static let abortModeBits: UInt32 = 0b10111
+    static let irqModeBits: UInt32 = 0b10010
+    static let fiqModeBits: UInt32 = 0b10001
 
     /// SP/LR banked per processor mode (ARM DDI 0406C B1.3.3) — User and
     /// System share one bank (key `userModeBits`), the other five modes
@@ -131,6 +139,109 @@ final class ARMv7CPU: CPU {
         bankedLR[oldKey] = registers.lr
         registers.sp = bankedSP[newKey] ?? 0
         registers.lr = bankedLR[newKey] ?? 0
+
+        // FIQ mode additionally banks r8-r12 (every other mode shares one
+        // copy of them).
+        let leavingFIQ = oldKey == Self.fiqModeBits
+        let enteringFIQ = newKey == Self.fiqModeBits
+        if leavingFIQ != enteringFIQ {
+            for index in 0..<5 {
+                let register = 8 + index
+                if enteringFIQ {
+                    sharedR8toR12[index] = registers[register]
+                    registers[register] = fiqR8toR12[index]
+                } else {
+                    fiqR8toR12[index] = registers[register]
+                    registers[register] = sharedR8toR12[index]
+                }
+            }
+        }
+    }
+
+    private var fiqR8toR12 = [UInt32](repeating: 0, count: 5)
+    private var sharedR8toR12 = [UInt32](repeating: 0, count: 5)
+
+    // MARK: - Interrupts and device time
+
+    /// The IRQ/FIQ input pins, driven by the platform's interrupt
+    /// controller. Level-sensitive: asserted for as long as a source is
+    /// pending, exactly like the real CPU's nIRQ/nFIQ inputs.
+    var irqAsserted = false
+    var fiqAsserted = false
+
+    /// Instructions' worth of time skipped while idle in WFI — see
+    /// `waitForInterrupt()`.
+    private(set) var idleInstructionsSkipped: UInt64 = 0
+
+    /// Deterministic virtual time, in instructions: the platform's
+    /// devices derive their clocks from this (retired instructions plus
+    /// skipped idle time), not from the host's wall clock, so every run
+    /// — JIT or interpreter — sees identical device timing.
+    var virtualTime: UInt64 { retiredInstructionCount &+ idleInstructionsSkipped }
+
+    /// When the platform next needs to update device state (e.g. a timer
+    /// expiring), in `virtualTime` units, and who to tell. Checked before
+    /// every unit; a JIT block is never allowed to run past it, so an
+    /// event fires at exactly the same instruction boundary as it would
+    /// under the interpreter.
+    var nextDeviceEventAt: UInt64 = .max
+    weak var deviceEventHandler: DeviceEventHandler?
+
+    /// Brings devices up to date and takes a pending, unmasked interrupt,
+    /// if any — once per unit, i.e. between instructions. Interrupts are
+    /// held off while a Thumb IT block is active: real hardware can take
+    /// one mid-block by saving ITSTATE in SPSR, but deferring by at most
+    /// three instructions is indistinguishable to the guest and keeps
+    /// ITSTATE out of exception entry/return entirely.
+    @inline(__always)
+    private func serviceDevicesAndInterrupts() {
+        if virtualTime >= nextDeviceEventAt {
+            deviceEventHandler?.deviceEventDue(at: virtualTime)
+        }
+        guard itState == 0 else { return }
+        if fiqAsserted && !cpsr.fiqDisabled {
+            takeInterrupt(isFIQ: true)
+        } else if irqAsserted && !cpsr.irqDisabled {
+            takeInterrupt(isFIQ: false)
+        }
+    }
+
+    /// IRQ/FIQ exception entry (ARM DDI 0406C B1.8.10/B1.8.11): the
+    /// preferred return address is the next instruction not yet executed
+    /// (`registers.pc`, since this runs between instructions), and
+    /// `LR_irq`/`LR_fiq` is that plus 4 in both ARM and Thumb state — the
+    /// handler returns with `SUBS PC, LR, #4`. I (and for FIQ, F) are
+    /// masked, A is masked, and execution continues in ARM state at the
+    /// IRQ (+0x18) or FIQ (+0x1C) vector.
+    private func takeInterrupt(isFIQ: Bool) {
+        let savedCPSR = cpsr.rawValue
+        let newModeBits = isFIQ ? Self.fiqModeBits : Self.irqModeBits
+        let returnAddress = registers.pc
+
+        switchProcessorMode(from: savedCPSR & Self.modeBitsMask, to: newModeBits)
+        setSavedProgramStatus(savedCPSR, forModeBits: newModeBits)
+
+        registers.lr = returnAddress &+ 4
+        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask) | newModeBits
+        cpsr.thumbState = false
+        cpsr.irqDisabled = true
+        cpsr.rawValue |= Self.asyncAbortDisabledBit
+        if isFIQ { cpsr.fiqDisabled = true }
+
+        registers.pc = exceptionVectorBaseAddress &+ (isFIQ ? 0x1C : 0x18)
+    }
+
+    private static let asyncAbortDisabledBit: UInt32 = 1 << 8
+
+    /// WFI: nothing happens until an interrupt is asserted (masked or
+    /// not — WFI wakes on the pin, ARM DDI 0406C B1.8.13). With nothing
+    /// pending, virtual time jumps straight to the next device event, so
+    /// an idle guest costs no host time at all. With no event scheduled
+    /// either, nothing could ever wake the CPU; time stays put and the
+    /// guest simply re-executes its idle loop.
+    func waitForInterrupt() {
+        guard !irqAsserted, !fiqAsserted, nextDeviceEventAt != .max, nextDeviceEventAt > virtualTime else { return }
+        idleInstructionsSkipped &+= nextDeviceEventAt - virtualTime
     }
 
     func savedProgramStatus(forModeBits modeBits: UInt32) -> UInt32? {
@@ -227,6 +338,7 @@ final class ARMv7CPU: CPU {
     func run() {
         isRunning = true
         while isRunning && lastError == nil {
+            serviceDevicesAndInterrupts()
             runOneUnit()
         }
     }
@@ -244,6 +356,7 @@ final class ARMv7CPU: CPU {
         hitBreakpoint = nil
         var unitsRun = 0
         while isRunning && lastError == nil && unitsRun < maxUnits {
+            serviceDevicesAndInterrupts()
             if !breakpoints.isEmpty, breakpoints.contains(registers.pc) {
                 hitBreakpoint = registers.pc
                 break
@@ -290,7 +403,8 @@ final class ARMv7CPU: CPU {
         // IT block that the JIT executed anyway). Falling back to the
         // interpreter for the (at most 4) instructions an IT block can
         // cover is a small, bounded cost next to getting this wrong.
-        if let jit, itState == 0, let block = jit.block(at: registers.pc, thumbState: cpsr.thumbState, memory: memory) {
+        if let jit, itState == 0, let block = jit.block(at: registers.pc, thumbState: cpsr.thumbState, memory: memory),
+           virtualTime &+ UInt64(block.instructionCount) <= nextDeviceEventAt {
             // The fast-path region (if any) covering the *current* pc —
             // queried fresh each unit rather than cached, since which
             // region (or whether one exists at all) can only be answered
@@ -308,7 +422,9 @@ final class ARMv7CPU: CPU {
                 let startPC = registers.pc
                 let fastPath = memory.fastPathRegion(for: registers.pc)
                 completed = registers.withUnsafeMutableStorage { regPtr in
-                    block.run(registers: regPtr, ramHostPointer: fastPath?.pointer, ramGuestBase: fastPath?.regionBaseAddress ?? 0, ramGuestLength: UInt32(fastPath?.regionLength ?? 0))
+                    withUnsafeMutablePointer(to: &cpsr.rawValue) { cpsrPtr in
+                        block.run(registers: regPtr, ramHostPointer: fastPath?.pointer, ramGuestBase: fastPath?.regionBaseAddress ?? 0, ramGuestLength: UInt32(fastPath?.regionLength ?? 0), cpsr: cpsrPtr)
+                    }
                 }
                 // See `JITEngine.reportMemoryBlockOutcome`'s doc comment: a
                 // block whose load/store address is chronically outside
@@ -318,10 +434,13 @@ final class ARMv7CPU: CPU {
                 jit.reportMemoryBlockOutcome(at: startPC, thumbState: cpsr.thumbState, madeProgress: completed > 0)
             } else {
                 completed = registers.withUnsafeMutableStorage { regPtr in
-                    block.run(registers: regPtr)
+                    withUnsafeMutablePointer(to: &cpsr.rawValue) { cpsrPtr in
+                        block.run(registers: regPtr, cpsr: cpsrPtr)
+                    }
                 }
             }
             registers.pc = registers.pc &+ UInt32(block.byteLength(afterCompleting: completed))
+            retiredInstructionCount &+= UInt64(completed)
             // A load/store's runtime address can fall outside the offered
             // fast-path region (or no region was offered at all) even
             // though the *instruction* was JIT-eligible — see
@@ -334,9 +453,11 @@ final class ARMv7CPU: CPU {
             // same cache hit, and bail at the same address again.
             if completed == 0 {
                 step()
+                retiredInstructionCount &+= 1
             }
         } else {
             step()
+            retiredInstructionCount &+= 1
         }
     }
 
@@ -434,6 +555,9 @@ final class ARMv7CPU: CPU {
         case .memoryBarrier:
             // A real no-op: see ARMInstruction.memoryBarrier's doc comment.
             break
+
+        case .clearExclusive:
+            exclusiveMonitorAddress = nil
 
         case .vectorRoundingShiftLeft(let instr):
             executeVectorRoundingShiftLeft(instr)
@@ -584,7 +708,7 @@ final class ARMv7CPU: CPU {
     /// in place, which happens if the MMU isn't even on yet (no real
     /// vector table can exist to jump to before the guest has set one up).
     func raiseDataAbort(_ error: MemoryAccessError, faultAddress: UInt32) -> Bool {
-        guard case .translationFault(let virtualAddress, let reason) = error else { return false }
+        guard case .translationFault(let virtualAddress, let reason, let isWrite) = error else { return false }
         guard mmuEnabled else { return false }
 
         let savedCPSR = cpsr.rawValue
@@ -602,28 +726,27 @@ final class ARMv7CPU: CPU {
         // these to decide what faulted and why, exactly as it would read
         // real hardware's fault registers.
         cp15.write(coprocessor: 15, opc1: 0, crn: 6, crm: 0, opc2: 0, value: virtualAddress)
-        cp15.write(coprocessor: 15, opc1: 0, crn: 5, crm: 0, opc2: 0, value: Self.dataFaultStatus(for: reason))
+        cp15.write(coprocessor: 15, opc1: 0, crn: 5, crm: 0, opc2: 0, value: Self.dataFaultStatus(for: reason) | (isWrite ? Self.dfsrWriteNotReadBit : 0))
 
         registers.pc = exceptionVectorBaseAddress &+ 0x10
         return true
     }
 
-    /// Translates Podium's own honest, human-readable fault classification
-    /// (see `ARMv7MMU.translate`'s `reason` strings) into the real DFSR
-    /// status-field encodings the guest's abort handler actually checks
-    /// (ARM DDI 0406C Table B3-23, short-descriptor format) — domain
-    /// defaults to 0 since Podium doesn't currently surface which domain
-    /// faulted.
-    private static func dataFaultStatus(for reason: String) -> UInt32 {
-        let isPage = reason.contains("page") || reason.contains("second-level")
-        if reason.contains("permission") {
-            return isPage ? 0b01111 : 0b01101
+    /// Maps a `TranslationFaultReason` to the real DFSR status-field
+    /// encoding the guest's data-abort handler reads (ARM DDI 0406C Table
+    /// B3-23, short-descriptor format). Domain is reported as 0, since
+    /// Podium doesn't surface which domain faulted.
+    private static func dataFaultStatus(for reason: TranslationFaultReason) -> UInt32 {
+        switch reason {
+        case .sectionTranslation: return 0b00101
+        case .pageTranslation: return 0b00111
+        case .domainFault(let isPage): return isPage ? 0b01011 : 0b01001
+        case .permissionFault(let isPage): return isPage ? 0b01111 : 0b01101
         }
-        if reason.contains("domain") {
-            return isPage ? 0b01011 : 0b01001
-        }
-        return isPage ? 0b00111 : 0b00101
     }
+
+    /// DFSR.WnR: the aborting access was a write.
+    private static let dfsrWriteNotReadBit: UInt32 = 1 << 11
 
     // Not `private`: Thumb-2's coprocessor instructions reuse this exact
     // same field layout and semantics (see `ARMv7CPU+Thumb.swift`'s
@@ -976,22 +1099,58 @@ final class ARMv7CPU: CPU {
         registers[instr.rd] = (registers[instr.rn] >> instr.lsb) & mask
     }
 
+    /// See `MultiplyInstruction`'s doc comment.
     private func executeMultiply(_ instr: MultiplyInstruction) {
-        registers[instr.rd] = registers[instr.rm] &* registers[instr.rs]
+        let m = registers[instr.rm]
+        let s = registers[instr.rs]
+
+        guard instr.kind.isLong else {
+            let product = m &* s
+            let result: UInt32
+            switch instr.kind {
+            case .mla: result = product &+ registers[instr.ra]
+            case .mls: result = registers[instr.ra] &- product
+            default: result = product
+            }
+            registers[instr.rd] = result
+            if instr.setFlags {
+                cpsr.negative = result.bit(31)
+                cpsr.zero = result == 0
+            }
+            return
+        }
+
+        let accumulator = UInt64(registers[instr.rd]) << 32 | UInt64(registers[instr.ra])
+        let unsignedProduct = UInt64(m) &* UInt64(s)
+        let signedProduct = UInt64(bitPattern: Int64(Int32(bitPattern: m)) &* Int64(Int32(bitPattern: s)))
+        let result: UInt64
+        switch instr.kind {
+        case .umull: result = unsignedProduct
+        case .umlal: result = unsignedProduct &+ accumulator
+        case .smull: result = signedProduct
+        case .smlal: result = signedProduct &+ accumulator
+        default: result = unsignedProduct &+ UInt64(registers[instr.rd]) &+ UInt64(registers[instr.ra]) // UMAAL
+        }
+        registers[instr.ra] = UInt32(truncatingIfNeeded: result)
+        registers[instr.rd] = UInt32(truncatingIfNeeded: result >> 32)
+        if instr.setFlags {
+            cpsr.negative = result >> 63 == 1
+            cpsr.zero = result == 0
+        }
     }
 
     private func executeClz(_ instr: ClzInstruction) {
         registers[instr.rd] = UInt32(registers[instr.rm].leadingZeroBitCount)
     }
 
-    /// `LDREX`: an ordinary word load. Tagging the address for a later
-    /// `STREX` to check isn't modeled yet — no real word has confirmed
-    /// `STREX`, so there is nothing yet that would read that tag.
+    /// `LDREX`: a word load that also opens the local exclusive monitor
+    /// on `address` — see `exclusiveMonitorAddress`.
     private func executeLoadExclusive(_ instr: LoadExclusiveInstruction) {
         let address = operandValue(for: instr.rn)
         do {
             let physicalAddress = try translatedAddress(address, access: .read)
             registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+            exclusiveMonitorAddress = address
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
         } catch {
@@ -1010,6 +1169,7 @@ final class ARMv7CPU: CPU {
             let highPhysicalAddress = try translatedAddress(address &+ 4, access: .read)
             registers[instr.rt] = try memory.readWord32(at: lowPhysicalAddress)
             registers[instr.rt + 1] = try memory.readWord32(at: highPhysicalAddress)
+            exclusiveMonitorAddress = address
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
         } catch {
@@ -1017,11 +1177,14 @@ final class ARMv7CPU: CPU {
         }
     }
 
-    /// See `StoreExclusiveInstruction`'s doc comment for why
-    /// unconditional success is correct, not a simplification, in this
-    /// single-threaded emulator.
+    /// See `exclusiveMonitorAddress`: stores and reports 0 only if the
+    /// monitor is still open on this address, otherwise reports 1.
     private func executeStoreExclusive(_ instr: StoreExclusiveInstruction) {
         let address = operandValue(for: instr.rn)
+        guard takeExclusiveMonitor(for: address) else {
+            registers[instr.rd] = 1
+            return
+        }
         do {
             let physicalAddress = try translatedAddress(address, access: .write)
             try memory.writeWord32(registers[instr.rt], at: physicalAddress)
@@ -1036,6 +1199,10 @@ final class ARMv7CPU: CPU {
     /// See `StoreExclusiveDoubleInstruction`'s doc comment.
     private func executeStoreExclusiveDouble(_ instr: StoreExclusiveDoubleInstruction) {
         let address = operandValue(for: instr.rn)
+        guard takeExclusiveMonitor(for: address) else {
+            registers[instr.rd] = 1
+            return
+        }
         do {
             let lowPhysicalAddress = try translatedAddress(address, access: .write)
             let highPhysicalAddress = try translatedAddress(address &+ 4, access: .write)
@@ -1047,6 +1214,21 @@ final class ARMv7CPU: CPU {
         } catch {
             if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
         }
+    }
+
+    /// The local exclusive monitor (ARM DDI 0406C A3.4.1): `LDREX` opens
+    /// it on an address, and `STREX` succeeds — storing and writing 0 —
+    /// only if it's still open on that same address, closing it either
+    /// way. `CLREX` closes it. This matters now that interrupts exist: an
+    /// interrupt handler doing its own `LDREX`/`STREX` (and XNU's `CLREX`
+    /// on exception entry) must make the interrupted thread's pending
+    /// `STREX` fail so it retries, instead of silently overwriting the
+    /// handler's update.
+    var exclusiveMonitorAddress: UInt32?
+
+    private func takeExclusiveMonitor(for address: UInt32) -> Bool {
+        defer { exclusiveMonitorAddress = nil }
+        return exclusiveMonitorAddress == address
     }
 
     func operandValue(for register: Int) -> UInt32 {

@@ -157,4 +157,51 @@ final class ARMv7MMUTests: XCTestCase {
         let highPA = try ARMv7MMU.translate(virtualAddress: 0xC000_0004, access: .read, cp15: cp15, memory: memory)
         XCTAssertEqual(highPA, 0xC000_0004)
     }
+
+    private func fault(_ body: () throws -> UInt32) -> (reason: TranslationFaultReason, isWrite: Bool)? {
+        do {
+            _ = try body()
+            return nil
+        } catch MemoryAccessError.translationFault(_, let reason, let isWrite) {
+            return (reason, isWrite)
+        } catch {
+            return nil
+        }
+    }
+
+    func testSectionPermissionFaultReportsSectionLevelAndWrite() throws {
+        let (memory, cp15) = makeMemoryAndCP15()
+        try memory.writeWord32(0x0050_8402, at: 0x4014) // APX=1, AP=01: privileged read-only section
+        let result = fault { try ARMv7MMU.translate(virtualAddress: 0x0050_0000, access: .write, cp15: cp15, memory: memory) }
+        XCTAssertEqual(result?.reason, .permissionFault(isPage: false))
+        XCTAssertEqual(result?.isWrite, true)
+    }
+
+    func testSmallPagePermissionFaultReportsPageLevel() throws {
+        let (memory, cp15) = makeMemoryAndCP15()
+        try memory.writeWord32(0x0000_8001, at: 0x4020) // first-level: page table at 0x8000
+        try memory.writeWord32(0x0090_0212, at: 0x8000) // small page, APX=1 AP=01: read-only
+        XCTAssertNoThrow(try ARMv7MMU.translate(virtualAddress: 0x0080_0000, access: .read, cp15: cp15, memory: memory))
+        let result = fault { try ARMv7MMU.translate(virtualAddress: 0x0080_0000, access: .write, cp15: cp15, memory: memory) }
+        XCTAssertEqual(result?.reason, .permissionFault(isPage: true))
+        XCTAssertEqual(result?.isWrite, true)
+    }
+
+    /// A missing second-level entry under a no-access domain is a page
+    /// *translation* fault: translation faults outrank domain faults.
+    func testMissingPageUnderNoAccessDomainIsTranslationNotDomainFault() throws {
+        let (memory, cp15) = makeMemoryAndCP15()
+        try memory.writeWord32(0x0000_8021, at: 0x4020) // page table at 0x8000, domain 1 (no access in DACR)
+        let result = fault { try ARMv7MMU.translate(virtualAddress: 0x0080_0000, access: .read, cp15: cp15, memory: memory) }
+        XCTAssertEqual(result?.reason, .pageTranslation)
+        XCTAssertEqual(result?.isWrite, false)
+    }
+
+    func testPresentPageUnderNoAccessDomainIsPageDomainFault() throws {
+        let (memory, cp15) = makeMemoryAndCP15()
+        try memory.writeWord32(0x0000_8021, at: 0x4020) // page table at 0x8000, domain 1 (no access in DACR)
+        try memory.writeWord32(0x0090_0032, at: 0x8000) // valid small page
+        let result = fault { try ARMv7MMU.translate(virtualAddress: 0x0080_0000, access: .read, cp15: cp15, memory: memory) }
+        XCTAssertEqual(result?.reason, .domainFault(isPage: true))
+    }
 }

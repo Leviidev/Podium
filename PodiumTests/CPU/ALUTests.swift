@@ -61,4 +61,40 @@ final class ALUTests: XCTestCase {
         let r = ALU.subtractWithCarry(5, 3, carryIn: true)
         XCTAssertEqual(r.value, ALU.subtract(5, 3).value)
     }
+
+    /// `CMP r0, #0` with r0 = 0x80000000 (this kernel's own base address):
+    /// INT_MIN - 0 is INT_MIN exactly, no overflow. Computing `a + ~b` and
+    /// then `+ carryIn` as two separate steps overflows downward then back
+    /// up, and OR-ing those two overflows wrongly reported V=1 — found by
+    /// lockstep-comparing the JIT (whose host `SUBS` got it right) against
+    /// this interpreter on the real kernel.
+    func testSubtractionWhoseTrueResultIsIntMinDoesNotOverflow() {
+        let r = ALU.subtract(0x8000_0000, 0)
+        XCTAssertEqual(r.value, 0x8000_0000)
+        XCTAssertTrue(r.carryOut, "no borrow")
+        XCTAssertFalse(r.overflow)
+
+        let r2 = ALU.subtract(0x8000_0005, 5)
+        XCTAssertEqual(r2.value, 0x8000_0000)
+        XCTAssertFalse(r2.overflow)
+    }
+
+    func testSubtractionPastIntMinOverflows() {
+        let r = ALU.subtract(0x8000_0000, 1)
+        XCTAssertEqual(r.value, 0x7FFF_FFFF)
+        XCTAssertTrue(r.carryOut)
+        XCTAssertTrue(r.overflow)
+    }
+
+    func testAddWithCarryIntoIntMaxBoundary() {
+        let overflowing = ALU.addWithCarry(0x7FFF_FFFF, 0, carryIn: true)
+        XCTAssertEqual(overflowing.value, 0x8000_0000)
+        XCTAssertTrue(overflowing.overflow)
+        XCTAssertFalse(overflowing.carryOut)
+
+        let unsignedWrapOnlyViaCarry = ALU.addWithCarry(0xFFFF_FFFF, 0, carryIn: true)
+        XCTAssertEqual(unsignedWrapOnlyViaCarry.value, 0)
+        XCTAssertTrue(unsignedWrapOnlyViaCarry.carryOut)
+        XCTAssertFalse(unsignedWrapOnlyViaCarry.overflow)
+    }
 }

@@ -27,7 +27,8 @@ final class JITExecutionTests: XCTestCase {
         }
 
         var registers = [UInt32](repeating: 0, count: 16)
-        registers.withUnsafeMutableBufferPointer { block.run(registers: $0.baseAddress!) }
+        var cpsr: UInt32 = 0
+        registers.withUnsafeMutableBufferPointer { block.run(registers: $0.baseAddress!, cpsr: &cpsr) }
 
         XCTAssertEqual(registers[0], 5)
         XCTAssertEqual(registers[1], 3)
@@ -41,7 +42,8 @@ final class JITExecutionTests: XCTestCase {
         }
 
         var registers = [UInt32](repeating: 0, count: 16)
-        registers.withUnsafeMutableBufferPointer { block.run(registers: $0.baseAddress!) }
+        var cpsr: UInt32 = 0
+        registers.withUnsafeMutableBufferPointer { block.run(registers: $0.baseAddress!, cpsr: &cpsr) }
 
         XCTAssertEqual(registers[2], 6)
     }
@@ -56,7 +58,8 @@ final class JITExecutionTests: XCTestCase {
         }
 
         var registers = [UInt32](repeating: 0, count: 16)
-        registers.withUnsafeMutableBufferPointer { block.run(registers: $0.baseAddress!) }
+        var cpsr: UInt32 = 0
+        registers.withUnsafeMutableBufferPointer { block.run(registers: $0.baseAddress!, cpsr: &cpsr) }
 
         XCTAssertEqual(registers[5], 0xABCD)
     }
@@ -91,34 +94,33 @@ final class JITExecutionTests: XCTestCase {
         let jitEngine = JITEngine()
         let jitCPU = ARMv7CPU(memory: jitMemory, jit: jitEngine)
         jitCPU.reset()
-        jitCPU.run()
+        // Stop after exactly the program's instructions (a JIT unit can
+        // retire several at once), not at the first error past its end.
+        while jitCPU.retiredInstructionCount < UInt64(program.count) && jitCPU.lastError == nil {
+            jitCPU.run(maxUnits: 1)
+        }
 
         guard jitEngine.stats.compiledBlockCount > 0 else {
             throw XCTSkip("JIT produced no compiled blocks in this environment (mprotect PROT_EXEC unavailable).")
         }
 
         XCTAssertNil(jitCPU.lastError)
+        XCTAssertEqual(jitCPU.retiredInstructionCount, UInt64(program.count))
         for register in 0..<4 {
             XCTAssertEqual(jitCPU.registers[register], interpreterCPU.registers[register], "register \(register) diverged between JIT and interpreter")
         }
         XCTAssertEqual(jitCPU.registers.pc, interpreterCPU.registers.pc)
     }
 
-    /// `JITEngine`/`JITTranslator` only ever decode/compile ARM-state
-    /// `DataProcessingInstruction`s (see `JITEngine.discoverEligibleRun`'s
-    /// doc comment) — `ARMv7CPU.runOneUnit()` must never even attempt the
-    /// JIT while the CPU is actually in Thumb state, or it would
-    /// misinterpret real Thumb instruction bytes as a completely
-    /// different ARM-state word. This was a latent bug masked by
-    /// `ExecutableMemoryAllocator` always failing (every attempt fell
-    /// back to the interpreter regardless); fixed alongside that
-    /// allocator fix, since fixing allocation alone would otherwise have
-    /// turned this into a live silent-miscompilation risk. Uses the exact
-    /// same word (`0xE3A00005`, "MOV r0, #5") the other tests in this
-    /// file prove *is* genuinely JIT-eligible in ARM state, so this only
-    /// passes if the Thumb-state check is what's stopping it, not some
-    /// unrelated ineligibility.
-    func testJITNeverAttemptedWhileCPUIsInThumbState() throws {
+    /// Bytes that are a JIT-eligible ARM-state instruction must never be
+    /// compiled *as ARM* while the CPU is in Thumb state — the ARM-only
+    /// JIT once did exactly that (a latent bug masked by executable-memory
+    /// allocation always failing at the time). Uses the same word
+    /// (`0xE3A00005`, "MOV r0, #5") the other tests here prove is
+    /// JIT-eligible in ARM state; in Thumb state its first halfword is
+    /// `MOVS r5, r0`, which the Thumb JIT doesn't compile, so no block may
+    /// exist and r0 must not become 5.
+    func testARMBytesNeverCompiledAsARMWhileCPUIsInThumbState() throws {
         let memory = FlatPhysicalMemory(length: 16)
         try memory.writeWord32(0xE3A0_0005, at: 0)
 
@@ -128,6 +130,8 @@ final class JITExecutionTests: XCTestCase {
         cpu.cpsr.thumbState = true
         _ = cpu.run(maxUnits: 1)
 
-        XCTAssertEqual(jitEngine.stats, JITEngine.Stats())
+        XCTAssertEqual(jitEngine.stats.compiledBlockCount, 0)
+        XCTAssertNotEqual(cpu.registers[0], 5)
+        XCTAssertEqual(cpu.retiredInstructionCount, 1)
     }
 }

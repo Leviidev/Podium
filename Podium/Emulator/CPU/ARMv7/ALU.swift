@@ -15,19 +15,24 @@ enum ALU {
         let overflow: Bool
     }
 
+    /// ARM's `AddWithCarry()` pseudocode (DDI 0406C A2.2.1), computed at
+    /// full width in one step: C is "the unsigned sum doesn't fit in 32
+    /// bits", V is "the signed sum doesn't fit in 32 bits". Adding `b` and
+    /// the carry-in as two separate 32-bit steps and OR-ing each step's
+    /// overflow is *wrong* for V: when `a + b` overflows downward and the
+    /// carry-in brings it back into range, both steps report overflow even
+    /// though the true result fits — e.g. `CMP r0, #0` with r0 = 0x80000000
+    /// set V, flipping every signed branch after it.
     static func addWithCarry(_ a: UInt32, _ b: UInt32, carryIn: Bool) -> AddResult {
-        let (unsignedPartial, unsignedOverflow1) = a.addingReportingOverflow(b)
-        let (unsignedTotal, unsignedOverflow2) = unsignedPartial.addingReportingOverflow(carryIn ? 1 : 0)
-
-        let signedA = Int32(bitPattern: a)
-        let signedB = Int32(bitPattern: b)
-        let (signedPartial, signedOverflow1) = signedA.addingReportingOverflow(signedB)
-        let (_, signedOverflow2) = signedPartial.addingReportingOverflow(carryIn ? 1 : 0)
+        let carry: UInt64 = carryIn ? 1 : 0
+        let unsignedSum = UInt64(a) + UInt64(b) + carry
+        let signedSum = Int64(Int32(bitPattern: a)) + Int64(Int32(bitPattern: b)) + Int64(carry)
+        let value = UInt32(truncatingIfNeeded: unsignedSum)
 
         return AddResult(
-            value: unsignedTotal,
-            carryOut: unsignedOverflow1 || unsignedOverflow2,
-            overflow: signedOverflow1 || signedOverflow2
+            value: value,
+            carryOut: unsignedSum > UInt64(UInt32.max),
+            overflow: signedSum != Int64(Int32(bitPattern: value))
         )
     }
 

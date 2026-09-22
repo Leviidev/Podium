@@ -90,7 +90,7 @@ final class ARMv7CPUTests: XCTestCase {
     func testUnsupportedInstructionHaltsRunHonestly() {
         let cpu = makeCPU(program: [
             0xE3A0_0005, // MOV r0, #5 -- executes fine
-            0xE020_0090, // MLA encoding (multiply-accumulate) -- not implemented
+            0xE100_1091, // swp r1, r1, [r0] -- not implemented
             0xE3A0_00FF, // would set r0 to 0xFF if ever reached
         ])
         cpu.run()
@@ -99,7 +99,7 @@ final class ARMv7CPUTests: XCTestCase {
         guard case .unsupportedInstruction(let rawWord, let address) = cpu.lastError else {
             return XCTFail("Expected .unsupportedInstruction, got \(String(describing: cpu.lastError))")
         }
-        XCTAssertEqual(rawWord, 0xE020_0090)
+        XCTAssertEqual(rawWord, 0xE100_1091)
         XCTAssertEqual(address, 4)
     }
 
@@ -781,6 +781,7 @@ final class ARMv7CPUTests: XCTestCase {
 
     func testStrexdStoresDoublewordAndSignalsSuccessRealKernelWord() {
         let cpu = makeCPU(program: [
+            0xE1B2_4F9F, // ldrexd r4, r5, [r2] -- opens the exclusive monitor
             0xE1A2_3F98, // strexd r3, r8, sb, [r2] -- real word from the actual kernel
         ])
         cpu.registers[2] = 100
@@ -788,25 +789,62 @@ final class ARMv7CPUTests: XCTestCase {
         cpu.registers[9] = 0x2222_2222
         cpu.registers[3] = 0xFFFF_FFFF // Poison, to prove it gets overwritten with 0.
         cpu.step()
+        cpu.step()
 
         XCTAssertNil(cpu.lastError)
-        XCTAssertEqual(cpu.registers[3], 0) // Always succeeds — see StoreExclusiveDoubleInstruction's doc comment.
+        XCTAssertEqual(cpu.registers[3], 0)
         XCTAssertEqual(try! (cpu.memory as! FlatPhysicalMemory).readWord32(at: 100), 0x1111_1111)
         XCTAssertEqual(try! (cpu.memory as! FlatPhysicalMemory).readWord32(at: 104), 0x2222_2222)
     }
 
     func testStrexStoresAndSignalsSuccessRealKernelWord() {
         let cpu = makeCPU(program: [
+            0xE19C_1F9F, // ldrex r1, [ip] -- opens the exclusive monitor
             0xE18C_3F90, // strex r3, r0, [ip] -- real word from the actual kernel
         ])
         cpu.registers[12] = 100
         cpu.registers[0] = 0xDEAD_BEEF
         cpu.registers[3] = 0xFFFF_FFFF // Poison, to prove it gets overwritten with 0.
         cpu.step()
+        cpu.step()
 
         XCTAssertNil(cpu.lastError)
-        XCTAssertEqual(cpu.registers[3], 0) // Always succeeds — see StoreExclusiveInstruction's doc comment.
+        XCTAssertEqual(cpu.registers[3], 0)
         XCTAssertEqual(try! (cpu.memory as! FlatPhysicalMemory).readWord32(at: 100), 0xDEAD_BEEF)
+    }
+
+    /// With no `LDREX` first, the monitor is closed: `STREX` must report
+    /// failure and leave memory alone.
+    func testStrexWithoutLdrexFailsAndDoesNotStore() {
+        let cpu = makeCPU(program: [
+            0xE18C_3F90, // strex r3, r0, [ip]
+        ])
+        cpu.registers[12] = 100
+        cpu.registers[0] = 0xDEAD_BEEF
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[3], 1)
+        XCTAssertEqual(try! (cpu.memory as! FlatPhysicalMemory).readWord32(at: 100), 0)
+    }
+
+    /// `CLREX` between the pair (what XNU does on exception entry) makes
+    /// the interrupted sequence's `STREX` fail, so it retries.
+    func testClrexBetweenLdrexAndStrexMakesStrexFail() {
+        let cpu = makeCPU(program: [
+            0xE19C_1F9F, // ldrex r1, [ip]
+            0xF57F_F01F, // clrex -- real word from the actual kernel's abort handler
+            0xE18C_3F90, // strex r3, r0, [ip]
+        ])
+        cpu.registers[12] = 100
+        cpu.registers[0] = 0xDEAD_BEEF
+        cpu.step()
+        cpu.step()
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[3], 1)
+        XCTAssertEqual(try! (cpu.memory as! FlatPhysicalMemory).readWord32(at: 100), 0)
     }
 
     func testVpushRealKernelWord() {
@@ -954,5 +992,97 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[0], 0, "MOVEQ should have been skipped since Z was clear")
         XCTAssertEqual(cpu.registers.pc, 8, "PC still advances past a skipped instruction")
+    }
+
+    /// `umlal r4, ip, lr, r3` — the real kext word at 0x806EEF08 that
+    /// halted boot before the long multiplies were decoded.
+    func testUmlalAccumulatesUnsigned64BitProduct() {
+        let cpu = makeCPU(program: [0xE0AC_439E])
+        cpu.registers[14] = 0xFFFF_FFFF
+        cpu.registers[3] = 2
+        cpu.registers[12] = 0x0000_0001 // RdHi
+        cpu.registers[4] = 0x0000_0003 // RdLo
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        // 0xFFFFFFFF * 2 = 0x1_FFFFFFFE; + 0x1_00000003 = 0x3_00000001
+        XCTAssertEqual(cpu.registers[12], 3)
+        XCTAssertEqual(cpu.registers[4], 1)
+    }
+
+    func testSmullProducesSigned64BitProduct() {
+        let cpu = makeCPU(program: [0xE0C1_0392]) // smull r0, r1, r2, r3
+        cpu.registers[2] = UInt32(bitPattern: -3)
+        cpu.registers[3] = 7
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], UInt32(bitPattern: -21))
+        XCTAssertEqual(cpu.registers[1], 0xFFFF_FFFF)
+    }
+
+    func testMlaAndMls() {
+        let mla = makeCPU(program: [0xE023_2190]) // mla r3, r0, r1, r2
+        mla.registers[0] = 6
+        mla.registers[1] = 7
+        mla.registers[2] = 100
+        mla.step()
+        XCTAssertEqual(mla.registers[3], 142)
+
+        let mls = makeCPU(program: [0xE063_2190]) // mls r3, r0, r1, r2
+        mls.registers[0] = 6
+        mls.registers[1] = 7
+        mls.registers[2] = 100
+        mls.step()
+        XCTAssertEqual(mls.registers[3], 58)
+    }
+
+    func testMulsSetsNZAndLeavesCV() {
+        let cpu = makeCPU(program: [0xE010_0291]) // muls r0, r1, r2
+        cpu.registers[1] = 0x8000_0000
+        cpu.registers[2] = 1
+        cpu.cpsr.carry = true
+        cpu.cpsr.overflow = true
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0x8000_0000)
+        XCTAssertTrue(cpu.cpsr.negative)
+        XCTAssertFalse(cpu.cpsr.zero)
+        XCTAssertTrue(cpu.cpsr.carry)
+        XCTAssertTrue(cpu.cpsr.overflow)
+    }
+
+    func testUmaalAddsBothHalvesToProduct() {
+        let cpu = makeCPU(program: [0xE041_0392]) // umaal r0, r1, r2, r3
+        cpu.registers[2] = 0xFFFF_FFFF
+        cpu.registers[3] = 0xFFFF_FFFF
+        cpu.registers[0] = 0xFFFF_FFFF
+        cpu.registers[1] = 0xFFFF_FFFF
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        // (2^32-1)^2 + 2(2^32-1) = 2^64 - 1: the maximum, with no overflow.
+        XCTAssertEqual(cpu.registers[0], 0xFFFF_FFFF)
+        XCTAssertEqual(cpu.registers[1], 0xFFFF_FFFF)
+    }
+
+    /// A write to an unmapped address must report DFSR.WnR (bit 11), or
+    /// the guest's abort handler treats it as a read fault and a
+    /// copy-on-write page would be mapped read-only again forever.
+    func testDataAbortOnWriteSetsDFSRWriteNotReadBit() {
+        let cpu = makeCPU(program: [
+            0xEE02_0F10, // MCR p15, #0, r0, c2, c0, #0  (TTBR0 = r0)
+            0xEE03_2F10, // MCR p15, #0, r2, c3, c0, #0  (DACR = r2)
+            0xE580_1000, // STR r1, [r0]                 (table[0]: identity section for this code)
+            0xEE01_3F10, // MCR p15, #0, r3, c1, c0, #0  (SCTLR = r3, enables the MMU)
+            0xE585_4000, // STR r4, [r5]                 -- r5 has no first-level entry
+        ], memorySize: 0x8000)
+        cpu.loadInitialRegisters([
+            0x0000_4000, 0xC02, 1, 1, 0, 0x0070_0000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+
+        for _ in 0..<5 { cpu.step() }
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers.pc, 0x10, "should be at the Data Abort vector")
+        XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 5, crm: 0, opc2: 0), 0b00101 | (1 << 11))
+        XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 6, crm: 0, opc2: 0), 0x0070_0000)
     }
 }

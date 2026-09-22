@@ -22,7 +22,7 @@ final class ThumbJITLoadStoreTests: XCTestCase {
         guard case .loadStoreImmediate(let instr) = ThumbDecoder.decode(0x8D60, 0) else {
             return XCTFail("Expected loadStoreImmediate")
         }
-        guard let block = ThumbJITTranslator.translate([.loadStoreImmediate(instr)]) else {
+        guard let block = ThumbJITTranslator.translate([(.loadStoreImmediate(instr), 2)]) else {
             throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
 
@@ -30,8 +30,9 @@ final class ThumbJITLoadStoreTests: XCTestCase {
             ram.storeBytes(of: UInt16(0xBEEF).littleEndian, toByteOffset: 42, as: UInt16.self)
             var registers = [UInt32](repeating: 0xFFFF_FFFF, count: 16)
             registers[4] = ramGuestBase
+            var cpsr: UInt32 = 0
             let completed = registers.withUnsafeMutableBufferPointer { regPtr in
-                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize))
+                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize), cpsr: &cpsr)
             }
             XCTAssertEqual(completed, 1)
             XCTAssertEqual(registers[0], 0xBEEF, "halfword load must zero-extend, not sign-extend")
@@ -41,7 +42,7 @@ final class ThumbJITLoadStoreTests: XCTestCase {
     func testCompiledWordLoadAndStoreRoundTrip() throws {
         let store = ThumbLoadStoreImmediateInstruction(isLoad: false, size: .word, rn: 1, rt: 2, offset: 16)
         let load = ThumbLoadStoreImmediateInstruction(isLoad: true, size: .word, rn: 1, rt: 3, offset: 16)
-        guard let block = ThumbJITTranslator.translate([.loadStoreImmediate(store), .loadStoreImmediate(load)]) else {
+        guard let block = ThumbJITTranslator.translate([(.loadStoreImmediate(store), 2), (.loadStoreImmediate(load), 2)]) else {
             throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
 
@@ -49,8 +50,9 @@ final class ThumbJITLoadStoreTests: XCTestCase {
             var registers = [UInt32](repeating: 0, count: 16)
             registers[1] = ramGuestBase + 0x40
             registers[2] = 0xC0FFEE42
+            var cpsr: UInt32 = 0
             let completed = registers.withUnsafeMutableBufferPointer { regPtr in
-                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize))
+                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize), cpsr: &cpsr)
             }
             XCTAssertEqual(completed, 2)
             XCTAssertEqual(registers[3], 0xC0FFEE42, "value stored then reloaded through the fast path must round-trip exactly")
@@ -59,7 +61,7 @@ final class ThumbJITLoadStoreTests: XCTestCase {
 
     func testCompiledByteLoadZeroExtends() throws {
         let instr = ThumbLoadStoreImmediateInstruction(isLoad: true, size: .byte, rn: 1, rt: 2, offset: 5)
-        guard let block = ThumbJITTranslator.translate([.loadStoreImmediate(instr)]) else {
+        guard let block = ThumbJITTranslator.translate([(.loadStoreImmediate(instr), 2)]) else {
             throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
 
@@ -67,8 +69,9 @@ final class ThumbJITLoadStoreTests: XCTestCase {
             ram.storeBytes(of: UInt8(0xFE), toByteOffset: 5, as: UInt8.self)
             var registers = [UInt32](repeating: 0xFFFF_FFFF, count: 16)
             registers[1] = ramGuestBase
+            var cpsr: UInt32 = 0
             _ = registers.withUnsafeMutableBufferPointer { regPtr in
-                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize))
+                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize), cpsr: &cpsr)
             }
             XCTAssertEqual(registers[2], 0xFE)
         }
@@ -82,7 +85,7 @@ final class ThumbJITLoadStoreTests: XCTestCase {
     /// triggers an immediate single interpreted step.
     func testOutOfBoundsAddressBailsWithoutTouchingMemoryOrRegisters() throws {
         let instr = ThumbLoadStoreImmediateInstruction(isLoad: true, size: .word, rn: 1, rt: 2, offset: 0)
-        guard let block = ThumbJITTranslator.translate([.loadStoreImmediate(instr)]) else {
+        guard let block = ThumbJITTranslator.translate([(.loadStoreImmediate(instr), 2)]) else {
             throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
 
@@ -90,8 +93,9 @@ final class ThumbJITLoadStoreTests: XCTestCase {
             var registers = [UInt32](repeating: 0, count: 16)
             registers[1] = ramGuestBase + UInt32(ramSize) // exactly one past the end
             registers[2] = 0xDEAD_BEEF
+            var cpsr: UInt32 = 0
             let completed = registers.withUnsafeMutableBufferPointer { regPtr in
-                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize))
+                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize), cpsr: &cpsr)
             }
             XCTAssertEqual(completed, 0)
             XCTAssertEqual(registers[2], 0xDEAD_BEEF, "register array must be untouched when the block bails immediately")
@@ -105,14 +109,15 @@ final class ThumbJITLoadStoreTests: XCTestCase {
     /// own doc comment.
     func testNoFastPathRegionBailsImmediately() throws {
         let instr = ThumbLoadStoreImmediateInstruction(isLoad: true, size: .word, rn: 1, rt: 2, offset: 0)
-        guard let block = ThumbJITTranslator.translate([.loadStoreImmediate(instr)]) else {
+        guard let block = ThumbJITTranslator.translate([(.loadStoreImmediate(instr), 2)]) else {
             throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
 
         var registers = [UInt32](repeating: 0, count: 16)
         registers[1] = 0x1000
+        var cpsr: UInt32 = 0
         let completed = registers.withUnsafeMutableBufferPointer { regPtr in
-            block.run(registers: regPtr.baseAddress!, ramHostPointer: nil, ramGuestBase: 0, ramGuestLength: 0)
+            block.run(registers: regPtr.baseAddress!, ramHostPointer: nil, ramGuestBase: 0, ramGuestLength: 0, cpsr: &cpsr)
         }
         XCTAssertEqual(completed, 0)
     }
@@ -128,7 +133,7 @@ final class ThumbJITLoadStoreTests: XCTestCase {
             return XCTFail("Expected dataProcessingShiftedRegister")
         }
         let loadInstr = ThumbLoadStoreImmediateInstruction(isLoad: true, size: .word, rn: 1, rt: 5, offset: 0)
-        guard let block = ThumbJITTranslator.translate([.dataProcessingShiftedRegister(subInstr), .loadStoreImmediate(loadInstr)]) else {
+        guard let block = ThumbJITTranslator.translate([(.dataProcessingShiftedRegister(subInstr), 4), (.loadStoreImmediate(loadInstr), 2)]) else {
             throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
 
@@ -137,8 +142,9 @@ final class ThumbJITLoadStoreTests: XCTestCase {
             var registers = [UInt32](repeating: 0, count: 16)
             registers[3] = ramGuestBase + 0x70 + 3
             registers[9] = 3
+            var cpsr: UInt32 = 0
             let completed = registers.withUnsafeMutableBufferPointer { regPtr in
-                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize))
+                block.run(registers: regPtr.baseAddress!, ramHostPointer: ram, ramGuestBase: ramGuestBase, ramGuestLength: UInt32(ramSize), cpsr: &cpsr)
             }
             XCTAssertEqual(completed, 2)
             XCTAssertEqual(registers[1], ramGuestBase + 0x70)

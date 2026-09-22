@@ -203,6 +203,9 @@ enum ThumbExtendKind: UInt8 {
     case unsignedHalfword = 0b10
     case unsignedByte = 0b11
     case unsignedByte16 = 0b100
+    /// `SXTB16`/`SXTAB16`: sign-extends bytes 0 and 2 independently into
+    /// the two halfwords (wide form only).
+    case signedByte16 = 0b101
 }
 
 struct ThumbExtendInstruction: Equatable {
@@ -255,24 +258,28 @@ struct ThumbRbitInstruction: Equatable {
     let rm: Int
 }
 
-/// `UXTB`/`UXTH`/`UXTB16` (Thumb-2, 32-bit "wide" form — `SXTH`/`SXTB`
-/// share this same `kind`-tagged struct architecturally but aren't
-/// decoded, see `decode32ExtendOrShift`'s doc comment for exactly which
-/// op values are confirmed): the `0xFA`-prefixed sibling of
-/// `ThumbExtendInstruction`'s 16-bit forms — needed for high registers
-/// (`r8`-`r14`) the 16-bit encoding can't reach, and adds an optional
-/// `ROR` (by `rotate*8` bits) applied to `Rm` before extracting. Only
-/// the no-accumulate shape (`Rn == 1111`) is decoded — `Rn` otherwise
-/// selects `UXTAB`/`UXTAB16` (add the extended value to `Rn`), not
-/// decoded since no real word has confirmed it. Verified against real
-/// `uxtb.w r1, r10`, `uxth.w r8, fp`, and `uxtb16 r3, r3` words from the
-/// actual kernel (the last one via `unsignedByte16`'s different,
-/// dual-byte semantics — see `ThumbExtendKind`'s doc comment).
+/// The Thumb-2 extend family (ARM DDI 0406C A6.3.15, `hw0` op1 `0000`-
+/// `0101`, `hw1` bits[7:6] `10`): `SXTH`/`UXTH`/`SXTB16`/`UXTB16`/`SXTB`/
+/// `UXTB`, with `Rm` first rotated right by `rotate*8` bits. With `rn`
+/// set (the encoding's `Rn != 1111`), the extended value is added to
+/// `Rn` instead — `SXTAH`/`UXTAH`/`SXTAB16`/`UXTAB16`/`SXTAB`/`UXTAB`
+/// (the 16-bit-lane forms add each halfword separately). Verified
+/// against real `uxtb.w r1, r10`, `uxth.w r8, fp`, `uxtb16 r3, r3` and
+/// `uxtab r1, r5, r1` words from the actual kernel.
 struct ThumbExtendWideInstruction: Equatable {
     let kind: ThumbExtendKind
     let rd: Int
     let rm: Int
     let rotate: Int
+    let rn: Int?
+
+    init(kind: ThumbExtendKind, rd: Int, rm: Int, rotate: Int, rn: Int? = nil) {
+        self.kind = kind
+        self.rd = rd
+        self.rm = rm
+        self.rotate = rotate
+        self.rn = rn
+    }
 }
 
 /// `IT`: begins a 1-4 instruction conditional-execution block. See
@@ -659,6 +666,14 @@ struct ThumbLoadStoreDualInstruction: Equatable {
     let offset: UInt32
 }
 
+enum ThumbHint: UInt16, Equatable {
+    case nop = 0
+    case yield = 1
+    case waitForEvent = 2
+    case waitForInterrupt = 3
+    case sendEvent = 4
+}
+
 struct ThumbTableBranchInstruction: Equatable {
     let rn: Int
     let rm: Int
@@ -702,6 +717,11 @@ enum ThumbInstruction: Equatable {
     /// `hw0==0xF3BF`, verified against a real `dsb sy` word from the
     /// actual kernel.
     case memoryBarrier
+    /// `CLREX` (Thumb-2, `F3BF 8F2F`) — see `ARMInstruction.clearExclusive`.
+    case clearExclusive
+    /// The 16-bit hints sharing `IT`'s encoding space with a zero mask
+    /// (ARM DDI 0406C A6.2.5): `NOP`/`YIELD`/`WFE`/`WFI`/`SEV`.
+    case hint(ThumbHint)
     case it(ThumbItInstruction)
     case movWide(ThumbMovWideInstruction)
     case bitFieldExtract(ThumbBitFieldExtractInstruction)

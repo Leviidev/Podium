@@ -7,15 +7,19 @@ import Foundation
 /// `JITTranslator`/`ThumbJITTranslator` for the calling convention every
 /// generated block follows.
 final class CompiledBlock {
-    /// `(registers, ramHostPointer, ramGuestBase, ramGuestLength) ->
-    /// instructionsCompleted`. `ramHostPointer` may be null (no fast-path
-    /// region available at all); `ramGuestLength == 0` has the same
-    /// effect — every load/store's range check fails immediately — so
-    /// generated code only ever needs one check, not a separate
-    /// null-pointer guard. A block with no load/store instructions
-    /// ignores all three memory arguments and always returns
-    /// `instructionCount`.
-    typealias EntryPoint = @convention(c) (UnsafeMutablePointer<UInt32>, UnsafeMutableRawPointer?, UInt32, UInt32) -> Int32
+    /// `(registers, ramHostPointer, ramGuestBase, accessBound, cpsr) ->
+    /// instructionsCompleted`, i.e. `x0`–`x4`. `ramHostPointer` may be null
+    /// (no fast-path region at all); `accessBound == 0` has the same effect
+    /// — every load/store's range check fails immediately — so generated
+    /// code only ever needs one check, not a separate null-pointer guard.
+    /// `accessBound` is *not* the region's length: generated code checks
+    /// only the access's start offset (`addr - ramGuestBase < accessBound`),
+    /// so `run` passes the number of offsets at which even a 4-byte access
+    /// still ends inside the region. `cpsr` is the guest CPSR word; a block
+    /// loads its NZCV into the host flags on entry and merges them back on
+    /// every exit. A block with no load/store instructions ignores the
+    /// three memory arguments and always returns `instructionCount`.
+    typealias EntryPoint = @convention(c) (UnsafeMutablePointer<UInt32>, UnsafeMutableRawPointer?, UInt32, UInt32, UnsafeMutablePointer<UInt32>) -> Int32
 
     let instructionCount: Int
     /// How far the guest `pc` advances if the block runs to completion —
@@ -82,15 +86,17 @@ final class CompiledBlock {
     /// whole block ran; anything less means a load/store's guest address
     /// fell outside `[ramGuestBase, ramGuestBase + ramGuestLength)` and
     /// the block stopped there (see `byteLength(afterCompleting:)`).
-    func run(registers: UnsafeMutablePointer<UInt32>, ramHostPointer: UnsafeMutableRawPointer?, ramGuestBase: UInt32, ramGuestLength: UInt32) -> Int {
-        Int(entryPoint(registers, ramHostPointer, ramGuestBase, ramGuestLength))
+    func run(registers: UnsafeMutablePointer<UInt32>, ramHostPointer: UnsafeMutableRawPointer?, ramGuestBase: UInt32, ramGuestLength: UInt32, cpsr: UnsafeMutablePointer<UInt32>) -> Int {
+        let widestAccess: UInt32 = 4
+        let accessBound = ramHostPointer == nil || ramGuestLength < widestAccess ? 0 : ramGuestLength - (widestAccess - 1)
+        return Int(entryPoint(registers, ramHostPointer, ramGuestBase, accessBound, cpsr))
     }
 
     /// Convenience for a block known to have no load/store instructions
     /// (or when the caller has no fast-path region to offer) — equivalent
     /// to calling the full form with no memory access available.
     @discardableResult
-    func run(registers: UnsafeMutablePointer<UInt32>) -> Int {
-        run(registers: registers, ramHostPointer: nil, ramGuestBase: 0, ramGuestLength: 0)
+    func run(registers: UnsafeMutablePointer<UInt32>, cpsr: UnsafeMutablePointer<UInt32>) -> Int {
+        run(registers: registers, ramHostPointer: nil, ramGuestBase: 0, ramGuestLength: 0, cpsr: cpsr)
     }
 }

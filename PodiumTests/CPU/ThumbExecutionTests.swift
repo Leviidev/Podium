@@ -989,4 +989,53 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[0], 100 + 0x4D4)
     }
+
+    /// `uxtab r1, r5, r1` — the real kernel word at 0x800940F6 that halted
+    /// boot before the accumulating extend forms were decoded.
+    func testUxtabAddsZeroExtendedByteToRn() {
+        let cpu = makeThumbCPU(program: [0xFA55, 0xF181])
+        cpu.registers[1] = 0xDEAD_BEF0
+        cpu.registers[5] = 0x1000
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 0x1000 + 0xF0)
+    }
+
+    /// `uxtb.w r0, r1, ror #8` — a nonzero rotation, which the decoder
+    /// used to reject by requiring hw1 bits[7:4] == 1000 exactly.
+    func testUxtbWideHonorsRotation() {
+        let cpu = makeThumbCPU(program: [0xFA5F, 0xF091])
+        cpu.registers[1] = 0x1234_5678
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0x56)
+    }
+
+    /// `sxtah r1, r4, r2, ror #16`: sign-extends the rotated low halfword.
+    func testSxtahSignExtendsRotatedHalfwordAndAdds() {
+        let cpu = makeThumbCPU(program: [0xFA04, 0xF1A2])
+        cpu.registers[2] = 0xFFFE_0000 // after ror #16: low halfword 0xFFFE (-2)
+        cpu.registers[4] = 10
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 8)
+    }
+
+    /// `uxtab16`/`sxtab16 r3, r2, r4`: bytes 0 and 2 extended to 16 bits
+    /// and added to each halfword of Rn separately, wrapping per lane.
+    func testDualLaneExtendAndAdd() {
+        let unsignedCPU = makeThumbCPU(program: [0xFA32, 0xF384])
+        unsignedCPU.registers[2] = 0x0001_FFFF
+        unsignedCPU.registers[4] = 0x0080_0002
+        unsignedCPU.step()
+        XCTAssertNil(unsignedCPU.lastError)
+        XCTAssertEqual(unsignedCPU.registers[3], 0x0081_0001)
+
+        let signedCPU = makeThumbCPU(program: [0xFA22, 0xF384])
+        signedCPU.registers[2] = 0x0001_FFFF
+        signedCPU.registers[4] = 0x0080_0002
+        signedCPU.step()
+        XCTAssertNil(signedCPU.lastError)
+        XCTAssertEqual(signedCPU.registers[3], 0xFF81_0001)
+    }
 }

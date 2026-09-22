@@ -306,29 +306,43 @@ struct ClzInstruction: Equatable {
     let rm: Int
 }
 
-/// `LDREX Rt, [Rn]`: an ordinary word load architecturally paired with
-/// tagging the address for exclusive access, checked by a later
-/// `STREX` (see `StoreExclusiveInstruction`'s doc comment for why that
-/// check is unconditional success here rather than a modeled tag).
-/// Lives in
+/// `LDREX Rt, [Rn]`: a word load that also opens the local exclusive
+/// monitor on `[Rn]` for a later `STREX` to check (see
+/// `ARMv7CPU.exclusiveMonitorAddress`). Lives in
 /// the "synchronization primitives" space, sharing the multiply/extra-
 /// load-store gate's `!I && bit7 && bit4` shape with `SH == 0` (the
 /// other three `SH` values are the halfword/signed-byte transfers
 /// already decoded there); disambiguated by the full bits[27:20]/
 /// [11:8]/[3:0] pattern, verified against a real `ldrex r0, [ip]` word
 /// from the actual kernel.
-/// `MUL Rd, Rm, Rs`: `Rd = Rm * Rs`, low 32 bits only. Lives in the
-/// multiply/extra-load-store space this decoder already carves
-/// `LDREX`/`STREX` out of (bits[27:22]==0, `SH`==00, bit7==1, bit4==1)
-/// — disambiguated from those by requiring bits[15:12]==0 (`MUL`'s
-/// fixed zero field, where `LDREX`/`STREX` instead have a real
-/// bits[27:20] opcode). `MLA` (the accumulate form, `A`==1) and the
-/// `S`-bit (flag-setting) aren't decoded — no real word has confirmed
-/// either yet. Verified against a real `mul r0, r3, r4` word from the
-/// actual kernel. Doesn't affect flags.
+/// ARM-state multiply and multiply-accumulate (ARM DDI 0406C A5.2.5):
+/// bits[27:24] == 0000 and bits[7:4] == 1001, with the operation in
+/// bits[23:20] — the same `!I && bit7 && bit4 && SH == 00` space the
+/// synchronization primitives (`LDREX`/`STREX`) share, told apart by
+/// bits[27:24]. The 32-bit forms write `rd`; the long (64-bit) forms
+/// write `rd` as RdHi and `ra` as RdLo, which are also their accumulator
+/// for `UMLAL`/`SMLAL`/`UMAAL`. With `setFlags`, N and Z come from the
+/// (32- or 64-bit) result and C/V are left alone (ARMv6 and later).
+/// Verified against real `mul r0, r3, r4` and `umlal r4, ip, lr, r3`
+/// words from the actual kernel.
 struct MultiplyInstruction: Equatable {
+    enum Kind: Equatable {
+        case mul, mla, mls
+        case umull, umlal, smull, smlal, umaal
+
+        var isLong: Bool {
+            switch self {
+            case .mul, .mla, .mls: return false
+            case .umull, .umlal, .smull, .smlal, .umaal: return true
+            }
+        }
+    }
+
     let condition: ARMCondition
+    let kind: Kind
+    let setFlags: Bool
     let rd: Int
+    let ra: Int
     let rm: Int
     let rs: Int
 }
@@ -342,8 +356,8 @@ struct LoadExclusiveInstruction: Equatable {
 /// `LDREXD Rt, Rt2, [Rn]`: loads a 64-bit value into the register pair
 /// `Rt:Rt2` (`Rt2 == Rt+1`, always — real hardware requires `Rt` even and
 /// rejects an odd `Rt` as unpredictable, so `Rt2` isn't a separately
-/// decoded field). Shares `LoadExclusiveInstruction`'s "exclusive tag
-/// not modeled" rationale. Verified against a real `ldrexd r4, r5, [r2]`
+/// decoded field). Opens the exclusive monitor exactly like
+/// `LoadExclusiveInstruction`. Verified against a real `ldrexd r4, r5, [r2]`
 /// word from the actual kernel — distinguished from plain `LDREX` by
 /// bit[21] of the opcode (`0b101` vs `0b100` in bits[23:21]).
 struct LoadExclusiveDoubleInstruction: Equatable {
@@ -353,12 +367,10 @@ struct LoadExclusiveDoubleInstruction: Equatable {
 }
 
 /// `STREX Rd, Rt, [Rn]`: stores `Rt` to `[Rn]` and sets `Rd` to the
-/// exclusive-access status (`0` success, `1` fail). This emulator runs
-/// a single interpreter thread with no concurrent agent that could
-/// ever invalidate the exclusive tag `LDREX` would set between the two
-/// instructions, so unconditional success is the architecturally
-/// correct outcome here, not a shortcut — there is nothing to fail
-/// against. Verified against a real `strex r3, r0, [ip]` word from the
+/// exclusive-access status (`0` success, `1` fail). It succeeds only if
+/// the monitor a prior `LDREX` opened on `[Rn]` is still open — an
+/// interrupt handler's own exclusive access or `CLREX` in between closes
+/// it, and the store then doesn't happen. Verified against a real `strex r3, r0, [ip]` word from the
 /// actual kernel, sharing `LoadExclusiveInstruction`'s decode gate.
 struct StoreExclusiveInstruction: Equatable {
     let condition: ARMCondition
@@ -369,9 +381,8 @@ struct StoreExclusiveInstruction: Equatable {
 
 /// `STREXD Rd, Rt, Rt2, [Rn]`: stores the register pair `Rt:Rt2`
 /// (`Rt2 == Rt+1`, always — same constraint as `LDREXD`) as a 64-bit
-/// value to `[Rn]` and sets `Rd` to the exclusive-access status. Shares
-/// `StoreExclusiveInstruction`'s "unconditional success is correct, not
-/// a shortcut" rationale. Verified against a real
+/// value to `[Rn]` and sets `Rd` to the exclusive-access status, with
+/// the same monitor check as `StoreExclusiveInstruction`. Verified against a real
 /// `strexd r3, r8, sb, [r2]` word from the actual kernel — distinguished
 /// from plain `STREX` by bit[21] of the opcode, the same as
 /// `LoadExclusiveDoubleInstruction` vs `LoadExclusiveInstruction`.
@@ -667,6 +678,9 @@ enum ARMInstruction: Equatable {
     /// this CPU, correctly implementing any of these *is* treating them
     /// as a no-op, not a missing feature.
     case memoryBarrier
+    /// `CLREX`: clears the local exclusive monitor, so a pending
+    /// `STREX` fails. XNU runs it on exception entry.
+    case clearExclusive
     case vectorRoundingShiftLeft(VRSHLInstruction)
     case bitwiseExclusiveOr(VEORInstruction)
     case bitwiseOr(VORRInstruction)

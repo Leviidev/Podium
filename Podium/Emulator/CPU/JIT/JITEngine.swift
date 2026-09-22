@@ -191,11 +191,12 @@ final class JITEngine {
     }
 
     /// Same physical-address caveat as `discoverEligibleARMRun`. Thumb
-    /// instructions are variable-width (2 or 4 bytes), so the cursor
-    /// advances by each decoded instruction's own real length, not a
-    /// fixed stride.
-    private func discoverEligibleThumbRun(startingAt address: UInt32, memory: MemoryBus) -> [ThumbInstruction] {
-        var instructions: [ThumbInstruction] = []
+    /// instructions are variable-width (2 or 4 bytes); the width comes
+    /// straight from the first halfword's encoding, the only authority on
+    /// it, and is carried along to the translator so the cursor and the
+    /// compiled block's `pc` advance agree with what was actually decoded.
+    private func discoverEligibleThumbRun(startingAt address: UInt32, memory: MemoryBus) -> [(instruction: ThumbInstruction, byteLength: Int)] {
+        var instructions: [(instruction: ThumbInstruction, byteLength: Int)] = []
         var cursor = address
 
         while instructions.count < maxBlockLength {
@@ -212,8 +213,9 @@ final class JITEngine {
             let instruction = ThumbDecoder.decode(hw0, hw1)
             guard ThumbJITTranslator.isSupported(instruction) else { break }
 
-            instructions.append(instruction)
-            cursor = cursor &+ UInt32(ThumbJITTranslator.byteLength(of: instruction))
+            let byteLength = isWide ? 4 : 2
+            instructions.append((instruction, byteLength))
+            cursor = cursor &+ UInt32(byteLength)
         }
 
         return instructions

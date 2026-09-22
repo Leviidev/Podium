@@ -25,6 +25,9 @@ final class EmulatorCore {
     private(set) var memory: MemoryBus?
     private(set) var framebufferSource: FramebufferSource?
     private var segmentedBus: SegmentedMemoryBus?
+    /// The A4's modeled hardware (timer, interrupt controller). The CPU
+    /// only holds it weakly, so this is what keeps it alive.
+    private var platform: S5L8930XPlatform?
 
     let audioOutput: AudioOutput
     let networkInterface: NetworkInterface
@@ -222,6 +225,15 @@ final class EmulatorCore {
         // before any size-dependent layout below, since expanding
         // those properties to their real 8-byte encoding changes the
         // tree's total length.
+        // Devices with real behavior go on the bus first, so they take
+        // precedence over the plain-storage backing added below for the
+        // same peripheral windows.
+        let platform = S5L8930XPlatform(cpu: armCPU)
+        for region in platform.regions {
+            segmentedBus?.addRegion(region)
+        }
+        self.platform = platform
+
         if deviceTree != nil {
             DeviceTreePatcher.patchClockPlaceholders(&deviceTree!)
 

@@ -244,7 +244,10 @@ enum ThumbDecoder {
             case 0b1111: // IT, or a NOP-compatible hint when mask == 0.
                 let mask = hw0.bitField16(3, 0)
                 guard mask != 0 else {
-                    return .unsupported(rawHalfword: hw0, secondHalfword: nil)
+                    guard let hint = ThumbHint(rawValue: UInt16(hw0.bitField16(7, 4))) else {
+                        return .unsupported(rawHalfword: hw0, secondHalfword: nil)
+                    }
+                    return .hint(hint)
                 }
                 return .it(ThumbItInstruction(firstCondition: UInt8(hw0.bitField16(7, 4)), mask: UInt8(mask)))
             case 0b1010:
@@ -717,30 +720,22 @@ enum ThumbDecoder {
         if hw0.bitField16(7, 4) == 0b1001, hw1.bitField16(7, 4) == 0b1010 {
             return .rbit(ThumbRbitInstruction(rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0))))
         }
+        // Extend family: op1 (hw0 bits[7:4]) 0000-0101, hw1 bits[7:6] == 10
+        // with bits[5:4] the rotation. `Rn == 1111` is the plain extend;
+        // any other `Rn` is the accumulating form.
+        let op1 = hw0.bitField16(7, 4)
+        if op1 <= 0b0101, hw1.bitField16(7, 6) == 0b10 {
+            let kinds: [ThumbExtendKind] = [.signedHalfword, .unsignedHalfword, .signedByte16, .unsignedByte16, .signedByte, .unsignedByte]
+            let rn = Int(hw0.bitField16(3, 0))
+            return .extendWide(ThumbExtendWideInstruction(
+                kind: kinds[Int(op1)], rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)),
+                rotate: Int(hw1.bitField16(5, 4)), rn: rn == Registers.pcIndex ? nil : rn
+            ))
+        }
         guard hw1.bitField16(7, 4) == 0b1000 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
-        switch hw0.bitField16(7, 4) {
-        case 0b0101 where hw0.bitField16(3, 0) == 0b1111:
-            return .extendWide(ThumbExtendWideInstruction(
-                kind: .unsignedByte, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
-            ))
-        case 0b0001 where hw0.bitField16(3, 0) == 0b1111:
-            // UXTH.W: verified against a real `uxth.w r8, fp` word from
-            // the actual kernel — same no-accumulate/rotate field layout
-            // as `UXTB.W` above, just a different `kind`.
-            return .extendWide(ThumbExtendWideInstruction(
-                kind: .unsignedHalfword, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
-            ))
-        case 0b0011 where hw0.bitField16(3, 0) == 0b1111:
-            // UXTB16: verified against a real `uxtb16 r3, r3` word from
-            // the actual kernel, traced back from a real early-boot
-            // kernel halt — same no-accumulate/rotate field layout as
-            // `UXTB.W`/`UXTH.W` above, just a different (dual-byte)
-            // `kind`.
-            return .extendWide(ThumbExtendWideInstruction(
-                kind: .unsignedByte16, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0)), rotate: Int(hw1.bitField16(5, 4))
-            ))
+        switch op1 {
         case 0b1011:
             return .clz(ThumbClzInstruction(rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0))))
         default:
@@ -921,6 +916,9 @@ enum ThumbDecoder {
                 // `dsb sy` word from the actual kernel.
                 if hw0 == 0xF3BF, hw1.bitField16(15, 8) == 0x8F, (0b0100...0b0110).contains(hw1.bitField16(7, 4)) {
                     return .memoryBarrier
+                }
+                if hw0 == 0xF3BF, hw1 == 0x8F2F {
+                    return .clearExclusive
                 }
                 return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             }

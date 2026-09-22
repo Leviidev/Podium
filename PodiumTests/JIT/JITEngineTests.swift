@@ -61,7 +61,8 @@ final class JITEngineTests: XCTestCase {
         XCTAssertEqual(engine.stats.compiledBlockCount, 1, "the Thumb-state miss must not be satisfied by the cached ARM block")
 
         var armRegisters = [UInt32](repeating: 0, count: 16)
-        armRegisters.withUnsafeMutableBufferPointer { armBlock.run(registers: $0.baseAddress!) }
+        var cpsr: UInt32 = 0
+        armRegisters.withUnsafeMutableBufferPointer { armBlock.run(registers: $0.baseAddress!, cpsr: &cpsr) }
         XCTAssertEqual(armRegisters[0], 5, "ARM-state block should still be MOV r0, #5")
     }
 

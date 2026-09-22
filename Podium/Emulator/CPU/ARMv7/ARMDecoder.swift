@@ -16,13 +16,13 @@ import Foundation
 /// load/store" instructions (`LDRH`/`STRH`/`LDRSB`/`LDRSH`) and their
 /// `LDRD`/`STRD` sibling sharing that same space (see
 /// `LoadStoreDualInstruction`'s doc comment for the L-bit quirk that
-/// distinguishes them), `LDREX`/`STREX`, `MUL`, block data transfer
+/// distinguishes them), `LDREX`/`STREX`/`CLREX`, the multiply family
+/// (`MUL`/`MLA`/`MLS`/`UMULL`/`UMLAL`/`SMULL`/`SMLAL`/`UMAAL`), block data transfer
 /// (`LDM`/`STM`, ordinary form only), `MRS`/`MSR` (CPSR only), `MCR`/
 /// `MRC`, `CPS`, `PLD` (immediate), `CLZ`, `UQSUB8`/`REV`/`BFI`/`BFC`/
 /// `UBFX` (decoded from ARMv6's much larger "media instructions" space
 /// — see `decodeMediaInstructions`'s doc comment), and the `DSB`/`DMB`/
-/// `ISB` barriers. Everything else — `MLA` and the rest of multiply,
-/// the `S`-bit block-transfer form, the rest of the media-instructions
+/// `ISB` barriers. Everything else — the `S`-bit block-transfer form, the rest of the media-instructions
 /// space (including `REV`'s own `REV16`/`REVSH` siblings), SPSR access,
 /// most of the coprocessor and unconditional-instruction-extension
 /// spaces, SWI — decodes to `.unsupported` rather than being
@@ -124,14 +124,25 @@ enum ARMDecoder {
                         rt: Int(word.bitField(3, 0)), rn: Int(word.bitField(19, 16))
                     ))
                 }
-                if word.bitField(27, 22) == 0, !word.bit(21), word.bitField(15, 12) == 0 {
-                    // MUL (see MultiplyInstruction's doc comment). A
-                    // (bit21) selects MLA, not decoded here.
+                if word.bitField(27, 24) == 0, word.bitField(7, 4) == 0b1001 {
+                    // See MultiplyInstruction's doc comment.
+                    let op = word.bitField(23, 20)
+                    let kind: MultiplyInstruction.Kind
+                    switch op {
+                    case 0b0000, 0b0001: kind = .mul
+                    case 0b0010, 0b0011: kind = .mla
+                    case 0b0100: kind = .umaal
+                    case 0b0110: kind = .mls
+                    case 0b1000, 0b1001: kind = .umull
+                    case 0b1010, 0b1011: kind = .umlal
+                    case 0b1100, 0b1101: kind = .smull
+                    case 0b1110, 0b1111: kind = .smlal
+                    default: return .undefined(rawWord: word)
+                    }
                     return .multiply(MultiplyInstruction(
-                        condition: condition,
-                        rd: Int(word.bitField(19, 16)),
-                        rm: Int(word.bitField(3, 0)),
-                        rs: Int(word.bitField(11, 8))
+                        condition: condition, kind: kind, setFlags: op & 1 == 1 && kind != .umaal,
+                        rd: Int(word.bitField(19, 16)), ra: Int(word.bitField(15, 12)),
+                        rm: Int(word.bitField(3, 0)), rs: Int(word.bitField(11, 8))
                     ))
                 }
                 return .unsupported(rawWord: word)
@@ -503,6 +514,9 @@ enum ARMDecoder {
         // "option", typically 0b1111 = SY) aren't checked at all.
         if word.bitField(27, 8) == 0x5_7FF0 {
             let barrierKind = word.bitField(7, 4)
+            if barrierKind == 0b0001, word.bitField(3, 0) == 0xF {
+                return .clearExclusive
+            }
             guard (0b0100...0b0110).contains(barrierKind) else {
                 return .unsupported(rawWord: word)
             }

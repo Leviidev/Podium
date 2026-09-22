@@ -205,6 +205,12 @@ extension ARMv7CPU {
         case .memoryBarrier:
             // A real no-op: see ThumbInstruction.memoryBarrier's doc comment.
             break
+        case .clearExclusive:
+            exclusiveMonitorAddress = nil
+        case .hint(let hint):
+            // WFE/SEV only matter between cores; on this single core, WFE
+            // returning at once is architecturally allowed (spurious wake).
+            if hint == .waitForInterrupt { waitForInterrupt() }
         case .conditionalBranch, .it, .compareBranch, .branchWide:
             preconditionFailure("handled in stepThumb before reaching executeThumb")
         case .unsupported(let raw, let second):
@@ -362,14 +368,12 @@ extension ARMv7CPU {
             registers[instr.rd] = value & 0xFFFF
         case .unsignedByte:
             registers[instr.rd] = value & 0xFF
-        case .unsignedByte16:
-            // UXTB16 has no Thumb16 encoding; the 16-bit decoder never produces this kind.
-            preconditionFailure("UXTB16 has no Thumb16 encoding")
+        case .unsignedByte16, .signedByte16:
+            // The 16-bit-lane forms have no Thumb16 encoding; the 16-bit decoder never produces them.
+            preconditionFailure("SXTB16/UXTB16 have no Thumb16 encoding")
         }
     }
 
-    /// `SXTH.W`/`UXTH.W`/`SXTB.W`/`UXTB.W`: like `executeThumbExtend`
-    /// but with `Rm` first rotated right by `rotate*8` bits.
     /// `LSL`/`LSR`/`ASR`/`ROR` (register-controlled): doesn't affect
     /// flags — see `ThumbShiftRegisterInstruction`'s doc comment for
     /// why.
@@ -396,25 +400,32 @@ extension ARMv7CPU {
         registers[instr.rd] = result
     }
 
+    /// See `ThumbExtendWideInstruction`'s doc comment.
     private func executeThumbExtendWide(_ instr: ThumbExtendWideInstruction) {
-        let rotateBits = instr.rotate * 8
-        let rotated = rotateBits == 0
-            ? registers[instr.rm]
-            : (registers[instr.rm] >> rotateBits) | (registers[instr.rm] << (32 - rotateBits))
+        let rotateBits = UInt32(instr.rotate * 8)
+        let source = registers[instr.rm]
+        let rotated = rotateBits == 0 ? source : (source >> rotateBits) | (source << (32 - rotateBits))
+        let addend = instr.rn.map { registers[$0] } ?? 0
+
         switch instr.kind {
         case .signedHalfword:
-            registers[instr.rd] = UInt32(bitPattern: Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: rotated))))
+            registers[instr.rd] = addend &+ UInt32(bitPattern: Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: rotated))))
         case .signedByte:
-            registers[instr.rd] = UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: rotated))))
+            registers[instr.rd] = addend &+ UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: rotated))))
         case .unsignedHalfword:
-            registers[instr.rd] = rotated & 0xFFFF
+            registers[instr.rd] = addend &+ (rotated & 0xFFFF)
         case .unsignedByte:
-            registers[instr.rd] = rotated & 0xFF
-        case .unsignedByte16:
-            // UXTB16 (ARM DDI 0406C A8.8.274): zero-extends byte 0 and
-            // byte 2 of the rotated value independently into the low
-            // and high halfwords of Rd.
-            registers[instr.rd] = (rotated & 0xFF) | (((rotated >> 16) & 0xFF) << 16)
+            registers[instr.rd] = addend &+ (rotated & 0xFF)
+        case .unsignedByte16, .signedByte16:
+            // Bytes 0 and 2 of the rotated value, each extended to 16 bits
+            // and added to the matching halfword of Rn independently
+            // (ARM DDI 0406C A8.8.271/A8.8.224).
+            func lane(_ byte: UInt32) -> UInt16 {
+                instr.kind == .signedByte16 ? UInt16(bitPattern: Int16(Int8(bitPattern: UInt8(truncatingIfNeeded: byte)))) : UInt16(byte & 0xFF)
+            }
+            let low = UInt16(truncatingIfNeeded: addend) &+ lane(rotated)
+            let high = UInt16(truncatingIfNeeded: addend >> 16) &+ lane(rotated >> 16)
+            registers[instr.rd] = UInt32(low) | (UInt32(high) << 16)
         }
     }
 

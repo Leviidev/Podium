@@ -94,14 +94,23 @@ enum ThumbJITTranslator {
     }
 
     /// Compiles `instructions` (a straight-line run, in order) into a
-    /// `CompiledBlock`. Returns `nil` if any instruction isn't
-    /// JIT-eligible or if executable memory couldn't be allocated/written
-    /// — both ordinary, expected outcomes the caller falls back to
-    /// interpretation for.
-    static func translate(_ instructions: [ThumbInstruction]) -> CompiledBlock? {
+    /// `CompiledBlock`. Each instruction's `byteLength` must be its real
+    /// encoded width as read from guest memory (2 or 4) — the decoder,
+    /// not this translator, is the authority on that, since a single
+    /// `ThumbInstruction` case doesn't by itself say which width it came
+    /// from, and a wrong stride here means the next "instruction" is
+    /// decoded starting mid-way through a 32-bit one (a real bug: a
+    /// hard-coded per-case width table here once returned 4 for 16-bit
+    /// `MOVS`, so discovery decoded the second halfword of the following
+    /// `MOV.W` as an unrelated `ADDS`). Returns `nil` if any instruction
+    /// isn't JIT-eligible or if executable memory couldn't be
+    /// allocated/written — both ordinary, expected outcomes the caller
+    /// falls back to interpretation for.
+    static func translate(_ instructions: [(instruction: ThumbInstruction, byteLength: Int)]) -> CompiledBlock? {
         guard !instructions.isEmpty else { return nil }
 
-        
+        // Guest NZCV lives in host NZCV for the whole block (loaded here,
+        // merged back into the guest CPSR by `epilogue` on every exit path).
         var words: [UInt32] = [
             ARM64Assembler.ldrWordUnsignedOffset(rt: 12, rn: 4, byteOffset: 0),
             ARM64Assembler.movz32(rd: 13, imm16: 0xF000, shiftBy16: true),
@@ -109,13 +118,12 @@ enum ThumbJITTranslator {
             ARM64Assembler.msr_nzcv(xt: 12)
         ]
 
-        var instructionByteLengths: [Int] = []
         var containsMemoryAccess = false
-        for (index, instruction) in instructions.enumerated() {
-            guard let generated = emit(instruction, completedInstructionsIfBail: index) else { return nil }
-            words.append(contentsOf: generated.code)
-            instructionByteLengths.append(generated.byteLength)
-            if case .loadStoreImmediate = instruction { containsMemoryAccess = true }
+        for (index, candidate) in instructions.enumerated() {
+            precondition(candidate.byteLength == 2 || candidate.byteLength == 4, "Thumb instructions are 2 or 4 bytes")
+            guard let generated = emit(candidate.instruction, completedInstructionsIfBail: index) else { return nil }
+            words.append(contentsOf: generated)
+            if isMemoryAccess(candidate.instruction) { containsMemoryAccess = true }
         }
         // Reached only if every instruction's memory access (if any) was
         // in bounds — the whole block completed.
@@ -135,51 +143,45 @@ enum ThumbJITTranslator {
         }
 
         var cumulative = [0]
-        for length in instructionByteLengths {
-            cumulative.append(cumulative[cumulative.count - 1] + length)
+        for candidate in instructions {
+            cumulative.append(cumulative[cumulative.count - 1] + candidate.byteLength)
         }
         return CompiledBlock(memory: memory, byteCount: byteCount, instructionCount: instructions.count, cumulativeByteLengths: cumulative, containsMemoryAccess: containsMemoryAccess)
     }
 
-    /// Real Thumb instruction byte length for `instruction`, regardless
-    /// of JIT eligibility — used by the caller's discovery loop to
-    /// advance its memory cursor even past ineligible instructions it's
-    /// only peeking at to decide where a block ends.
-    static func byteLength(of instruction: ThumbInstruction) -> Int {
+    /// Whether `instruction`'s generated code reads the fast-path region
+    /// (`x1`/`w2`/`w3`). The caller only offers a region to blocks that
+    /// say they need one, so a memory instruction missing from this list
+    /// silently bails on every execution.
+    private static func isMemoryAccess(_ instruction: ThumbInstruction) -> Bool {
         switch instruction {
-        case .hiRegister, .loadStoreImmediate:
-            return 2
+        case .loadStoreImmediate, .loadStoreRegisterOffset:
+            return true
         default:
-            // Every other case this translator's `emit` can ever accept
-            // (`dataProcessingShiftedRegister`, `dataProcessingImmediate`)
-            // is a Thumb-2 wide (32-bit) encoding; anything not in
-            // `emit`'s supported set is never asked about its length by
-            // `discoverEligibleRun` (which stops discovery at the first
-            // ineligible instruction without needing to skip past it).
-            return 4
+            return false
         }
     }
 
-    private static func emit(_ instruction: ThumbInstruction, completedInstructionsIfBail: Int) -> (code: [UInt32], byteLength: Int)? {
+    private static func emit(_ instruction: ThumbInstruction, completedInstructionsIfBail: Int) -> [UInt32]? {
         switch instruction {
         case .dataProcessingShiftedRegister(let instr):
-            return emitDataProcessingShiftedRegister(instr).map { ($0, 4) }
+            return emitDataProcessingShiftedRegister(instr)
         case .dataProcessingImmediate(let instr):
-            return emitDataProcessingImmediate(instr).map { ($0, 4) }
+            return emitDataProcessingImmediate(instr)
         case .hiRegister(let instr):
-            return emitHiRegister(instr).map { ($0, 2) }
-                case .loadStoreImmediate(let instr):
-            return emitLoadStoreImmediate(instr, completedInstructionsIfBail: completedInstructionsIfBail).map { ($0, 2) }
+            return emitHiRegister(instr)
+        case .loadStoreImmediate(let instr):
+            return emitLoadStoreImmediate(instr, completedInstructionsIfBail: completedInstructionsIfBail)
         case .loadStoreRegisterOffset(let instr):
-            return emitLoadStoreRegisterOffset(instr, completedInstructionsIfBail: completedInstructionsIfBail).map { ($0, 2) }
+            return emitLoadStoreRegisterOffset(instr, completedInstructionsIfBail: completedInstructionsIfBail)
         case .movWide(let instr):
-            return emitMovWide(instr).map { ($0, 4) }
+            return emitMovWide(instr)
         case .addSub(let instr):
-            return emitAddSub(instr).map { ($0, 2) }
+            return emitAddSub(instr)
         case .immediate(let instr):
-            return emitImmediate(instr).map { ($0, 2) }
+            return emitImmediate(instr)
         case .alu(let instr):
-            return emitAlu(instr).map { ($0, 2) }
+            return emitAlu(instr)
         default:
             return nil
         }

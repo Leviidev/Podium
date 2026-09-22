@@ -59,34 +59,32 @@ enum ARMv7MMU {
         let firstLevelAddress = tableBase &+ (firstLevelIndex << 2)
 
         let firstLevelDescriptor = try memory.readWord32(at: firstLevelAddress)
+        let isWrite = access == .write
         switch firstLevelDescriptor.bitField(1, 0) {
         case 0b00, 0b11:
-            throw MemoryAccessError.translationFault(
-                virtualAddress: virtualAddress,
-                reason: "section translation fault: first-level descriptor 0x\(firstLevelDescriptor.hexString8) at 0x\(firstLevelAddress.hexString8) is not present"
-            )
+            throw MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: .sectionTranslation, isWrite: isWrite)
 
         case 0b01:
-            let domain = Int(firstLevelDescriptor.bitField(8, 5))
-            let requiresPermissionCheck = try checkDomain(domain, cp15: cp15, virtualAddress: virtualAddress)
-
+            // The second-level entry is fetched and checked before the
+            // domain: a translation fault takes priority over a domain
+            // fault (ARM DDI 0406C B3.12.3).
             let secondLevelTableBase = firstLevelDescriptor & 0xFFFF_FC00
             let secondLevelIndex = virtualAddress.bitField(19, 12)
             let secondLevelAddress = secondLevelTableBase &+ (secondLevelIndex << 2)
             let secondLevelDescriptor = try memory.readWord32(at: secondLevelAddress)
 
             if secondLevelDescriptor.bitField(1, 0) == 0b00 {
-                throw MemoryAccessError.translationFault(
-                    virtualAddress: virtualAddress,
-                    reason: "page translation fault: second-level descriptor 0x\(secondLevelDescriptor.hexString8) at 0x\(secondLevelAddress.hexString8) is not present"
-                )
+                throw MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: .pageTranslation, isWrite: isWrite)
             }
+
+            let domain = Int(firstLevelDescriptor.bitField(8, 5))
+            let requiresPermissionCheck = try checkDomain(domain, isPage: true, cp15: cp15, virtualAddress: virtualAddress, isWrite: isWrite)
 
             let isLargePage = secondLevelDescriptor.bitField(1, 0) == 0b01
             if requiresPermissionCheck {
                 let ap = pageAccessPermission(secondLevelDescriptor)
                 let executeNever = isLargePage ? secondLevelDescriptor.bit(15) : secondLevelDescriptor.bit(0)
-                try checkPermission(ap, access: access, executeNever: executeNever, virtualAddress: virtualAddress)
+                try checkPermission(ap, access: access, executeNever: executeNever, isPage: true, virtualAddress: virtualAddress)
             }
 
             return isLargePage
@@ -95,12 +93,12 @@ enum ARMv7MMU {
 
         default: // 0b10: section or supersection.
             let domain = Int(firstLevelDescriptor.bitField(8, 5))
-            let requiresPermissionCheck = try checkDomain(domain, cp15: cp15, virtualAddress: virtualAddress)
+            let requiresPermissionCheck = try checkDomain(domain, isPage: false, cp15: cp15, virtualAddress: virtualAddress, isWrite: isWrite)
 
             if requiresPermissionCheck {
                 let ap = sectionAccessPermission(firstLevelDescriptor)
                 let executeNever = firstLevelDescriptor.bit(4)
-                try checkPermission(ap, access: access, executeNever: executeNever, virtualAddress: virtualAddress)
+                try checkPermission(ap, access: access, executeNever: executeNever, isPage: false, virtualAddress: virtualAddress)
             }
 
             if firstLevelDescriptor.bit(18) {
@@ -133,7 +131,7 @@ enum ARMv7MMU {
     /// whether the caller still needs to run the AP/XN permission check
     /// (true for client, since manager returning normally isn't enough on
     /// its own to skip it).
-    private static func checkDomain(_ domain: Int, cp15: CP15State, virtualAddress: UInt32) throws -> Bool {
+    private static func checkDomain(_ domain: Int, isPage: Bool, cp15: CP15State, virtualAddress: UInt32, isWrite: Bool) throws -> Bool {
         let dacr = read(cp15, dacrKey)
         let mode = (dacr >> (domain * 2)) & 0b11
         switch mode {
@@ -142,10 +140,7 @@ enum ARMv7MMU {
         case 0b01:
             return true // Client: caller still performs the AP/XN permission check.
         default:
-            throw MemoryAccessError.translationFault(
-                virtualAddress: virtualAddress,
-                reason: "domain \(domain) fault (DACR field 0b\(String(mode, radix: 2)))"
-            )
+            throw MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: .domainFault(isPage: isPage), isWrite: isWrite)
         }
     }
 
@@ -157,16 +152,17 @@ enum ARMv7MMU {
     /// grants at least privileged read, so the only remaining checks are
     /// "read-only" AP values rejecting a write, and the XN bit rejecting
     /// an execute.
-    private static func checkPermission(_ ap: UInt8, access: Access, executeNever: Bool, virtualAddress: UInt32) throws {
+    private static func checkPermission(_ ap: UInt8, access: Access, executeNever: Bool, isPage: Bool, virtualAddress: UInt32) throws {
+        let fault = MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: .permissionFault(isPage: isPage), isWrite: access == .write)
         if ap == 0b000 || ap == 0b100 {
-            throw MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: "permission fault: AP 0b\(String(ap, radix: 2)) grants no access")
+            throw fault
         }
         if access == .execute && executeNever {
-            throw MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: "permission fault: XN forbids execute")
+            throw fault
         }
         let readOnly = ap == 0b101 || ap == 0b110 || ap == 0b111
         if access == .write && readOnly {
-            throw MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: "permission fault: AP 0b\(String(ap, radix: 2)) is read-only")
+            throw fault
         }
     }
 
