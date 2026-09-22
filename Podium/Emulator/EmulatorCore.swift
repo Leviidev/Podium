@@ -59,15 +59,17 @@ final class EmulatorCore {
     static let framebufferPhysicalAddress: UInt32 = physicalMemoryBaseAddress &+ UInt32(physicalMemorySize) &- framebufferSize
 
     /// Caps a single boot attempt so unsupported guest code halts the
-    /// attempt instead of either running forever or never giving the JIT
-    /// path (which only engages inside `run`, not single `step`s) a
-    /// chance to actually compile anything. Raised well past the ~200K
-    /// instructions real early-boot code needs — the interpreter has run
-    /// this same kernel clean through 50M+ instructions in
-    /// `_ManualRealFirmwareVerification` — so a real device's JIT gets a
-    /// genuine chance to reach further into boot, not just past the
-    /// first few kernel-init instruction groups.
-    private static let maxBootUnits = 20_000_000
+    /// attempt instead of running forever with no way to observe where it
+    /// got to. Set far past what's been reached so far — a standalone
+    /// macOS trace of this same kernel (see `.standalone_trace/` at the
+    /// repo root, not part of the app target) has run clean past 2
+    /// billion instructions without hitting an unsupported/undefined
+    /// instruction — so a real device (whose JIT-compiled path should run
+    /// this meaningfully faster than that trace's interpreter) gets real
+    /// room to find out how much further boot actually goes before this
+    /// budget, rather than reporting a misleading "step budget reached"
+    /// long before the interesting part of boot.
+    private static let maxBootUnits = 50_000_000_000
 
     private static let logCapacity = 200
 
@@ -301,6 +303,13 @@ final class EmulatorCore {
         let panicEntryAddress: UInt32 = 0x8001_7c10
         let chunkSize = 200_000
         let stepBudget = Self.maxBootUnits
+        // With `maxBootUnits` raised into the billions, a single boot
+        // attempt can run for a long time with nothing to show for it in
+        // the log until it finally halts — this periodic line lets
+        // progress be checked (e.g. by pulling the persisted log file off
+        // the device mid-run) without waiting for that.
+        let progressLogInterval = 50_000_000
+        var unitsSinceProgressLog = 0
         var unitsRun = 0
         var hitPanic = false
         while unitsRun < stepBudget {
@@ -308,6 +317,11 @@ final class EmulatorCore {
                 armCPU.run(maxUnits: min(chunkSize, stepBudget - unitsRun))
             }.value
             unitsRun += ran
+            unitsSinceProgressLog += ran
+            if unitsSinceProgressLog >= progressLogInterval {
+                unitsSinceProgressLog = 0
+                appendLog("Still running: \(unitsRun) instruction groups so far, PC now 0x\(armCPU.registers.pc.hexString8).")
+            }
             if armCPU.registers.pc == panicEntryAddress {
                 hitPanic = true
                 break
