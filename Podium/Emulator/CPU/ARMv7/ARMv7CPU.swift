@@ -259,25 +259,20 @@ final class ARMv7CPU: CPU {
     }
 
     private func runOneUnit() {
-        // `JITEngine`/`JITTranslator` only ever decode/compile ARM-state
-        // `DataProcessingInstruction`s — `discoverEligibleRun` calls
-        // `ARMDecoder.decode`, the ARM-state decoder, unconditionally.
-        // Without this Thumb-state guard, whenever the CPU is actually in
-        // Thumb state (the overwhelming majority of this kernel's real
-        // code), the JIT would misinterpret the raw 4 bytes at `pc` as an
-        // ARM-state word and — if they happened to decode as an eligible
-        // sequence — compile and execute completely different, wrong
-        // logic than the real Thumb instructions there. Before the
-        // `ExecutableMemoryAllocator` fix (see its own doc comment), this
-        // was latent rather than live: allocation always failed on the
-        // first attempt and disabled the JIT for the rest of the run, so
-        // `jit.block` always returned `nil` and every instruction, Thumb
-        // or ARM, went through the (correct) interpreter regardless of
-        // this gap. Now that allocation actually succeeds, this check is
-        // load-bearing.
-        if !cpsr.thumbState, let jit, let block = jit.block(at: registers.pc, memory: memory) {
+        // `JITEngine` picks the right decoder/translator internally based
+        // on `thumbState` (ARM-state `DataProcessingInstruction`s via
+        // `JITTranslator`, Thumb-state instructions via
+        // `ThumbJITTranslator`) and keys its cache on both address *and*
+        // state — passing the wrong state here would make it silently
+        // misinterpret real instruction bytes as the other ISA's encoding
+        // (a real, previously-latent risk; see `JITEngine`'s own history
+        // for why this state check matters). `block.totalByteLength`, not
+        // `4 * block.instructionCount`, is what actually advances `pc`
+        // correctly — Thumb instructions are 2 or 4 bytes each, not a
+        // fixed 4.
+        if let jit, let block = jit.block(at: registers.pc, thumbState: cpsr.thumbState, memory: memory) {
             registers.withUnsafeMutableStorage { block.run(registers: $0) }
-            registers.pc = registers.pc &+ UInt32(4 * block.instructionCount)
+            registers.pc = registers.pc &+ UInt32(block.totalByteLength)
         } else {
             step()
         }

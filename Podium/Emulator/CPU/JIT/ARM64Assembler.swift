@@ -8,11 +8,14 @@ import Foundation
 /// naturally from the host's own 32-bit operations.
 ///
 /// Scope is deliberately narrow: enough to move an immediate into a
-/// register, copy a register, add/subtract two registers, and load/store
-/// a 32-bit word at a small unsigned offset from a base pointer — which
-/// is exactly what `JITTranslator` needs to operate on the guest register
-/// file through a pointer passed in `x0`. Nothing here does control flow;
-/// generated blocks are always straight-line code ending in `ret`.
+/// register, copy a register, combine two registers with the basic
+/// logical/arithmetic ops (`AND`/`BIC`/`ORR`/`EOR`/`ADD`/`SUB`/`MVN`,
+/// always unshifted — every caller here only ever needs shift==0), and
+/// load/store a 32-bit word at a small unsigned offset from a base
+/// pointer — which is exactly what `JITTranslator`/`ThumbJITTranslator`
+/// need to operate on the guest register file through a pointer passed
+/// in `x0`. Nothing here does control flow; generated blocks are always
+/// straight-line code ending in `ret`.
 enum ARM64Assembler {
     /// `MOVZ Wd, #imm16` — imm16 must fit in 16 bits unsigned.
     static func movz32(rd: Int, imm16: UInt16) -> UInt32 {
@@ -32,6 +35,31 @@ enum ARM64Assembler {
     /// `SUB Wd, Wn, Wm` (shifted register, no shift).
     static func sub32(rd: Int, rn: Int, rm: Int) -> UInt32 {
         0x4B00_0000 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rd)
+    }
+
+    /// `AND Wd, Wn, Wm` (shifted register, no shift).
+    static func and32(rd: Int, rn: Int, rm: Int) -> UInt32 {
+        0x0A00_0000 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rd)
+    }
+
+    /// `BIC Wd, Wn, Wm` (`Wn AND NOT Wm`, shifted register, no shift).
+    static func bic32(rd: Int, rn: Int, rm: Int) -> UInt32 {
+        0x0A20_0000 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rd)
+    }
+
+    /// `ORR Wd, Wn, Wm` (shifted register, no shift).
+    static func orr32(rd: Int, rn: Int, rm: Int) -> UInt32 {
+        0x2A00_0000 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rd)
+    }
+
+    /// `EOR Wd, Wn, Wm` (shifted register, no shift).
+    static func eor32(rd: Int, rn: Int, rm: Int) -> UInt32 {
+        0x4A00_0000 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rd)
+    }
+
+    /// `MVN Wd, Wm` (the standard alias for `ORN Wd, WZR, Wm`).
+    static func mvn32(rd: Int, rm: Int) -> UInt32 {
+        0x2A20_03E0 | (reg(rm) << 16) | reg(rd)
     }
 
     /// `LDR Wt, [Xn, #byteOffset]` — unsigned offset form; `byteOffset`

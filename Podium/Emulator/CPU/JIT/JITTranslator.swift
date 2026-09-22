@@ -5,13 +5,13 @@ import Foundation
 ///
 /// Scope, deliberately: unconditional (`AL`), non-flag-setting (`S==0`)
 /// MOV (immediate ≤ 16 bits, or a plain unshifted register copy), ADD,
-/// and SUB (both register-register, unshifted). Nothing touches r15.
-/// Everything else this decoder can produce — conditional execution,
-/// flag setting, wider immediates, shifted operands, branches, memory
-/// access — falls back to the interpreter. That's a narrow slice of the
-/// interpreter's own coverage, which is itself a narrow slice of ARMv7;
-/// extending it means adding another case to `emit`, not redesigning
-/// anything here.
+/// SUB, AND, ORR, EOR, BIC, and MVN (all register-register, unshifted).
+/// Nothing touches r15. Everything else this decoder can produce —
+/// conditional execution, flag setting, wider immediates, shifted
+/// operands, branches, memory access — falls back to the interpreter.
+/// That's a narrow slice of the interpreter's own coverage, which is
+/// itself a narrow slice of ARMv7; extending it means adding another
+/// case to `emit`, not redesigning anything here.
 ///
 /// Every generated block follows one calling convention: given a pointer
 /// to the 16-word guest register array (`x0`), read/modify/write through
@@ -79,6 +79,10 @@ enum JITTranslator {
             return emitMov(instruction)
         case .add, .sub:
             return emitAddOrSub(instruction)
+        case .and, .orr, .eor, .bic:
+            return emitLogical(instruction)
+        case .mvn:
+            return emitMvn(instruction)
         default:
             return nil
         }
@@ -115,6 +119,47 @@ enum JITTranslator {
             ARM64Assembler.ldrWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instruction.rn)),
             ARM64Assembler.ldrWordUnsignedOffset(rt: Scratch.b, rn: 0, byteOffset: byteOffset(rm)),
             combine(Scratch.a, Scratch.a, Scratch.b),
+            ARM64Assembler.strWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instruction.rd)),
+        ]
+    }
+
+    /// `AND`/`ORR`/`EOR`/`BIC`, unshifted register operand2 only (same
+    /// restriction as `emitAddOrSub`).
+    private static func emitLogical(_ instruction: DataProcessingInstruction) -> [UInt32]? {
+        guard case .shiftedRegister(let rm, let shiftType, let shiftAmount) = instruction.operand2,
+              shiftType == .lsl, shiftAmount == 0, rm != Registers.pcIndex else {
+            return nil
+        }
+
+        let combine: (Int, Int, Int) -> UInt32
+        switch instruction.op {
+        case .and: combine = ARM64Assembler.and32
+        case .orr: combine = ARM64Assembler.orr32
+        case .eor: combine = ARM64Assembler.eor32
+        case .bic: combine = ARM64Assembler.bic32
+        default: return nil
+        }
+
+        return [
+            ARM64Assembler.ldrWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instruction.rn)),
+            ARM64Assembler.ldrWordUnsignedOffset(rt: Scratch.b, rn: 0, byteOffset: byteOffset(rm)),
+            combine(Scratch.a, Scratch.a, Scratch.b),
+            ARM64Assembler.strWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instruction.rd)),
+        ]
+    }
+
+    /// `MVN Rd, Rm` (unshifted register operand2 only). `Rn` is unused by
+    /// `MVN` (it's a unary op) so, unlike `emitLogical`, there's no `Rn`
+    /// read here.
+    private static func emitMvn(_ instruction: DataProcessingInstruction) -> [UInt32]? {
+        guard case .shiftedRegister(let rm, let shiftType, let shiftAmount) = instruction.operand2,
+              shiftType == .lsl, shiftAmount == 0, rm != Registers.pcIndex else {
+            return nil
+        }
+
+        return [
+            ARM64Assembler.ldrWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(rm)),
+            ARM64Assembler.mvn32(rd: Scratch.a, rm: Scratch.a),
             ARM64Assembler.strWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instruction.rd)),
         ]
     }
