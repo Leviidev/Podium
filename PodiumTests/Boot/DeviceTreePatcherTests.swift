@@ -63,12 +63,12 @@ final class DeviceTreePatcherTests: XCTestCase {
         DeviceTreePatcher.patchClockPlaceholders(&tree)
 
         let expected: [String: UInt64] = [
-            "bus-frequency": 0,
-            "peripheral-frequency": 0,
-            "memory-frequency": 0,
+            "bus-frequency": 200_000_000,
+            "peripheral-frequency": 100_000_000,
+            "memory-frequency": 200_000_000,
             "timebase-frequency": 24_000_000,
-            "clock-frequency": 0,
-            "fixed-frequency": 0,
+            "clock-frequency": 800_000_000,
+            "fixed-frequency": 24_000_000,
         ]
         for (name, expectedValue) in expected {
             guard let offset = valueOffset(of: name, in: tree) else {

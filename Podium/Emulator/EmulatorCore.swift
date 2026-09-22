@@ -237,6 +237,7 @@ final class EmulatorCore {
         if deviceTree != nil {
             DeviceTreePatcher.patchClockPlaceholders(&deviceTree!)
             DeviceTreePatcher.patchNVRAMProxyData(&deviceTree!)
+            DeviceTreePatcher.patchClockFrequencies(&deviceTree!)
 
             // Real SoC peripheral registers this specific firmware's
             // device tree declares (see `DeviceTreeMemoryMap`'s doc

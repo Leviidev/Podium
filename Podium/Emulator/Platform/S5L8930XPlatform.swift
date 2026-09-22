@@ -7,8 +7,8 @@ protocol DeviceEventHandler: AnyObject {
 
 /// The A4 (S5L8930X) SoC hardware that has real behavior, as opposed to
 /// the plain storage `DeviceTreeMemoryMap` backs every other peripheral
-/// with: the system timer and the interrupt controller, wired to the
-/// CPU's IRQ/FIQ pins and to its virtual clock.
+/// with: the system timer, the power manager and the interrupt
+/// controller, wired to the CPU's IRQ/FIQ pins and to its virtual clock.
 ///
 /// Time is virtual: the timebase counter advances one tick per
 /// `instructionsPerTimebaseTick` retired instructions (plus whatever WFI
@@ -30,6 +30,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
     private unowned let cpu: ARMv7CPU
     private(set) var interruptController: PL192InterruptController!
     private(set) var timer: S5L8930XTimer!
+    let powerManager = S5L8930XPowerManager()
 
     init(cpu: ARMv7CPU) {
         self.cpu = cpu
@@ -51,8 +52,11 @@ final class S5L8930XPlatform: DeviceEventHandler {
     /// peripheral backing for the same addresses (`SegmentedMemoryBus`
     /// hands each access to the first region that accepts it).
     var regions: [MemoryBus] {
+        // Order matters: the timer sits inside the PMGR window, so its
+        // region must come first to claim its own registers.
         let windows: [(MMIODevice, UInt32, UInt32)] = [
             (timer, Self.pmgrBase + S5L8930XTimer.windowOffsetInPMGR, S5L8930XTimer.windowLength),
+            (powerManager, Self.pmgrBase, S5L8930XPowerManager.windowLength),
             (interruptController, Self.vicBase, PL192InterruptController.windowLength),
         ]
         return windows.flatMap { device, base, length in

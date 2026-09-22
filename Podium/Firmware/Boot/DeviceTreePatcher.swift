@@ -1,18 +1,19 @@
 import Foundation
 
-/// Patches specific zero-valued clock properties in the device tree
-/// template this app ships (extracted as-is from the IPSW, never
-/// touched by a real iBoot) so the real kernel's early platform-expert
-/// code doesn't crash on them.
+/// Fills in device-tree properties that iBoot populates on a real device
+/// and the kernel can't boot without: the CPU clock properties, the
+/// arm-io clock table, the NVRAM image, and the `pram` region.
 ///
 /// **What this is, and isn't:** the shipped `DeviceTree.n81ap.img3` is
 /// the *unpopulated* build artifact — on real hardware, iBoot patches
-/// in device-specific data (serial numbers, ECIDs, and several clock
-/// properties) before ever handing control to the kernel. Podium has
-/// no real device to read most of those values from, so this patcher
-/// does not invent them. It exists only because the real kernel's own
-/// compiled code has a genuine quirk for this small set of clock
-/// properties: when a property's value isn't exactly 8 bytes, the code
+/// in device-specific data (serial numbers, ECIDs, clock rates, the
+/// NVRAM contents) before ever handing control to the kernel. Podium has
+/// no real device to read those from, so it leaves identity data
+/// (serials, ECIDs) alone and fills only what the kernel demonstrably
+/// needs, each property's doc comment saying which values are verified
+/// and which are plausible stand-ins. For the CPU clock properties, the
+/// real kernel's own compiled code also has a genuine quirk: when a
+/// property's value isn't exactly 8 bytes, the code
 /// reads it once as a 32-bit value and, separately, inside an `IT`
 /// block, only reads a *second* word if the property "is" 8 bytes —
 /// except that check is corrupted by an unrelated side effect: Thumb's
@@ -33,16 +34,19 @@ import Foundation
 /// So this patcher *expands* each of these properties from a 4-byte
 /// value to an 8-byte one (growing the tree and shifting everything
 /// after it, exactly like a real property of that size always did) —
-/// not overwriting bytes in place. `timebase-frequency` is set to a
-/// real, independently-verifiable value (24 MHz — confirmed via public
-/// `ioreg -l` dumps showing this exact property/value on multiple
-/// generations of real Apple ARM hardware, including modern Apple
-/// Silicon Macs, all the way back through this SoC generation's
-/// contemporaries). The remaining properties (bus/peripheral/memory/
-/// clock/fixed-frequency) don't have a verified public value for this
-/// exact SoC, so they're zero-extended rather than guessed at — this
-/// keeps the redundant read from crashing without dressing up an
-/// invented number as real hardware data.
+/// not overwriting bytes in place, and fills in values the kernel then
+/// copies into `gPEClockFrequencyInfo`:
+/// - `timebase-frequency` and `fixed-frequency`: 24 MHz. The timebase is
+///   verified via public `ioreg -l` dumps across Apple ARM generations;
+///   the fixed clock is verified by the kernel itself — the watchdog
+///   driver (`clock-ids = <4>`, entry 4 of the arm-io clock table, which
+///   is `fix_frequency_hz`) panics with "clock speed … does not match
+///   absolute time" unless it equals the timebase exactly.
+/// - `clock-frequency` (CPU) 800 MHz, `bus-frequency` and
+///   `memory-frequency` 200 MHz, `peripheral-frequency` 100 MHz: the A4's
+///   usual rates, plausible rather than verified for this exact device.
+///   They're nonzero on purpose — drivers divide by these, and a zero
+///   left in place just moves the failure somewhere harder to trace.
 enum DeviceTreePatcher {
     private static let nodeHeaderSize = 8
     private static let propertyNameSize = 32
@@ -64,12 +68,12 @@ enum DeviceTreePatcher {
 
     private static let targets: [(path: [String], properties: [String: UInt64])] = [
         (["cpus", "cpu0"], [
-            "bus-frequency": 0,
-            "peripheral-frequency": 0,
-            "memory-frequency": 0,
+            "bus-frequency": 200_000_000,
+            "peripheral-frequency": 100_000_000,
+            "memory-frequency": 200_000_000,
             "timebase-frequency": realTimebaseFrequencyHz,
-            "clock-frequency": 0,
-            "fixed-frequency": 0,
+            "clock-frequency": 800_000_000,
+            "fixed-frequency": realTimebaseFrequencyHz,
         ]),
     ]
 
@@ -150,6 +154,22 @@ enum DeviceTreePatcher {
     }
 
     static let defaultNVRAMVariables: [(name: String, value: String)] = [("auto-boot", "true")]
+
+    /// Fills `/arm-io/clock-frequencies` (`UInt32` slots, shipped all
+    /// zero — iBoot writes the real rates on a device). The S5L8930X
+    /// arm-io driver turns this into its table for device clock IDs
+    /// `0x100` and up (IDs below that come from `gPEClockFrequencyInfo` —
+    /// see `patchClockPlaceholders`). The real per-clock rates aren't
+    /// publicly documented, so every slot gets the 24 MHz reference clock
+    /// this SoC is known to run from: nonzero, which keeps drivers' divider
+    /// math from failing outright, without inventing distinct numbers.
+    static func patchClockFrequencies(_ deviceTree: inout Data) {
+        guard let location = findProperties(in: deviceTree, path: ["arm-io"], propertyNames: ["clock-frequencies"]).first,
+              location.currentLength % 4 == 0 else { return }
+        for slot in 0..<(location.currentLength / 4) {
+            deviceTree.writeUInt32LE(UInt32(realTimebaseFrequencyHz), at: location.valueOffset + slot * 4)
+        }
+    }
 
     /// A CHRP-style NVRAM image as `IODTNVRAM::initNVRAMImage` reads it:
     /// 16-byte partition headers (signature, checksum, length in 16-byte
