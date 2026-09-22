@@ -21,7 +21,7 @@ final class JITExecutionTests: XCTestCase {
     }
 
     func testCompiledAdditionMatchesHandComputedResult() throws {
-        let instructions = [mov(rd: 0, imm: 5), mov(rd: 1, imm: 3), addOrSub(.add, rd: 2, rn: 0, rm: 1)]
+        let instructions = [mov(rd: 0, imm: 5), mov(rd: 1, imm: 3), addOrSub(.add, rd: 2, rn: 0, rm: 1)].map { ARMJITEligibleInstruction.dataProcessing($0) }
         guard let block = JITTranslator.translate(instructions) else {
             throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
@@ -35,7 +35,7 @@ final class JITExecutionTests: XCTestCase {
     }
 
     func testCompiledSubtractionMatchesHandComputedResult() throws {
-        let instructions = [mov(rd: 0, imm: 10), mov(rd: 1, imm: 4), addOrSub(.sub, rd: 2, rn: 0, rm: 1)]
+        let instructions = [mov(rd: 0, imm: 10), mov(rd: 1, imm: 4), addOrSub(.sub, rd: 2, rn: 0, rm: 1)].map { ARMJITEligibleInstruction.dataProcessing($0) }
         guard let block = JITTranslator.translate(instructions) else {
             throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
@@ -47,9 +47,9 @@ final class JITExecutionTests: XCTestCase {
     }
 
     func testCompiledRegisterMovIsAPlainCopy() throws {
-        let instructions = [
-            mov(rd: 0, imm: 0xABCD),
-            DataProcessingInstruction(condition: .always, op: .mov, setFlags: false, rn: 0, rd: 5, operand2: .shiftedRegister(rm: 0, shiftType: .lsl, shiftAmount: 0)),
+        let instructions: [ARMJITEligibleInstruction] = [
+            .dataProcessing(mov(rd: 0, imm: 0xABCD)),
+            .dataProcessing(DataProcessingInstruction(condition: .always, op: .mov, setFlags: false, rn: 0, rd: 5, operand2: .shiftedRegister(rm: 0, shiftType: .lsl, shiftAmount: 0))),
         ]
         guard let block = JITTranslator.translate(instructions) else {
             throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")

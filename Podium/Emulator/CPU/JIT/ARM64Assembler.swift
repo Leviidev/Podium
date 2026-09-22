@@ -22,6 +22,15 @@ enum ARM64Assembler {
         0x5280_0000 | (UInt32(imm16) << 5) | reg(rd)
     }
 
+    /// `MOVK Wd, #imm16{, LSL #16}` — merges `imm16` into the upper or
+    /// lower halfword of `Wd`, leaving the other half untouched. Paired
+    /// with `movz32` (lower half first, `shiftBy16: false`, then this
+    /// with `shiftBy16: true`) to materialize an arbitrary 32-bit
+    /// immediate into a scratch register in two instructions.
+    static func movk32(rd: Int, imm16: UInt16, shiftBy16: Bool) -> UInt32 {
+        0x7280_0000 | (shiftBy16 ? 1 << 21 : 0) | (UInt32(imm16) << 5) | reg(rd)
+    }
+
     /// `MOV Wd, Wm` (the standard alias for `ORR Wd, WZR, Wm`).
     static func movRegister32(rd: Int, rm: Int) -> UInt32 {
         0x2A00_03E0 | (reg(rm) << 16) | reg(rd)

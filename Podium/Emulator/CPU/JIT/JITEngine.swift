@@ -46,6 +46,28 @@ final class JITEngine {
     private var cache: [UInt32: CompiledBlock?] = [:]
     private let maxBlockLength: Int
 
+    // Tracks, per cache key, how many *consecutive* times in a row a
+    // memory-accessing block has bailed on its very first instruction
+    // (`completed == 0` — see `ARMv7CPU.runOneUnit()`). A block whose
+    // load/store address is outside the offered fast-path region every
+    // single time it's reached (a real case found this session: ARM-state
+    // code, e.g. a bcopy/memcpy-style routine, whose target address is
+    // often outside RAM — a peripheral or low-SRAM destination) makes
+    // strictly *negative* progress on every hit: the caller still pays
+    // the full JIT call overhead (region lookup, register marshaling,
+    // native call) and then *also* has to run a real interpreted `step()`
+    // for the same instruction, since `completed == 0` means the block
+    // did nothing. Compiling that address was worse than never touching
+    // it — measured as a real regression (0.98x to 0.60x of interpreter
+    // speed) when ARM-state load/store JIT coverage was added. Any hit
+    // that makes progress (`completed > 0`) resets the counter to 0; only
+    // a genuinely chronic bailer accumulates `maxConsecutiveBailsBeforeEviction`
+    // in a row and gets its cache entry permanently replaced with a
+    // confirmed-ineligible marker, so the interpreter takes over there for
+    // the rest of the run with no further JIT overhead at all.
+    private var consecutiveBailCounts: [UInt32: Int] = [:]
+    private static let maxConsecutiveBailsBeforeEviction = 4
+
     init(maxBlockLength: Int = 32) {
         self.maxBlockLength = maxBlockLength
     }
@@ -92,6 +114,29 @@ final class JITEngine {
         return compiled
     }
 
+    /// Called by `ARMv7CPU.runOneUnit()` after every execution of a
+    /// memory-accessing block, reporting whether that call advanced `pc`
+    /// at all. See this type's doc comment on `consecutiveBailCounts` for
+    /// why a block that never makes progress needs to be evicted rather
+    /// than compiled once and trusted forever.
+    func reportMemoryBlockOutcome(at address: UInt32, thumbState: Bool, madeProgress: Bool) {
+        let key = Self.cacheKey(address: address, thumbState: thumbState)
+        if madeProgress {
+            if consecutiveBailCounts[key] != nil {
+                consecutiveBailCounts.removeValue(forKey: key)
+            }
+            return
+        }
+
+        let count = (consecutiveBailCounts[key] ?? 0) + 1
+        if count >= Self.maxConsecutiveBailsBeforeEviction {
+            cache[key] = .some(nil)
+            consecutiveBailCounts.removeValue(forKey: key)
+        } else {
+            consecutiveBailCounts[key] = count
+        }
+    }
+
     private func compileARM(startingAt address: UInt32, memory: MemoryBus) -> CompiledBlock? {
         let candidates = discoverEligibleARMRun(startingAt: address, memory: memory)
         guard !candidates.isEmpty else { return nil }
@@ -125,17 +170,20 @@ final class JITEngine {
     /// kernel's early boot; a future caller running after the guest
     /// enables a non-identity mapping would need this reworked to route
     /// through the CPU's own translation instead.
-    private func discoverEligibleARMRun(startingAt address: UInt32, memory: MemoryBus) -> [DataProcessingInstruction] {
-        var instructions: [DataProcessingInstruction] = []
+    private func discoverEligibleARMRun(startingAt address: UInt32, memory: MemoryBus) -> [ARMJITEligibleInstruction] {
+        var instructions: [ARMJITEligibleInstruction] = []
         var cursor = address
 
         while instructions.count < maxBlockLength {
             guard let word = try? memory.readWord32(at: cursor) else { break }
-            guard case .dataProcessing(let instruction) = ARMDecoder.decode(word),
-                  JITTranslator.isSupported(instruction) else {
-                break
+            switch ARMDecoder.decode(word) {
+            case .dataProcessing(let instruction) where JITTranslator.isSupported(instruction):
+                instructions.append(.dataProcessing(instruction))
+            case .loadStore(let instruction) where JITTranslator.isSupported(instruction):
+                instructions.append(.loadStore(instruction))
+            default:
+                return instructions
             }
-            instructions.append(instruction)
             cursor = cursor &+ 4
         }
 

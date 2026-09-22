@@ -1,29 +1,40 @@
 import Foundation
 
 /// Translates already-decoded, JIT-eligible `DataProcessingInstruction`s
-/// into a `CompiledBlock` of real AArch64 machine code.
+/// and `LoadStoreInstruction`s into a `CompiledBlock` of real AArch64
+/// machine code — the ARM-state sibling of `ThumbJITTranslator`, which
+/// has the fuller explanation of the load/store bounds-check and
+/// partial-completion scheme this file reuses verbatim.
 ///
 /// Scope, deliberately: unconditional (`AL`), non-flag-setting (`S==0`)
 /// MOV (immediate ≤ 16 bits, or a plain unshifted register copy), ADD,
-/// SUB, AND, ORR, EOR, BIC, and MVN (all register-register, unshifted).
-/// Nothing touches r15. Everything else this decoder can produce —
-/// conditional execution, flag setting, wider immediates, shifted
-/// operands, branches, memory access — falls back to the interpreter.
-/// That's a narrow slice of the interpreter's own coverage, which is
-/// itself a narrow slice of ARMv7; extending it means adding another
-/// case to `emit`, not redesigning anything here.
+/// SUB, AND, ORR, EOR, BIC, and MVN (all register-register, unshifted);
+/// plus `LDR`/`STR`/`LDRB`/`STRB` with a pre-indexed, non-writeback
+/// immediate offset. Nothing touches r15. Everything else this decoder
+/// can produce — conditional execution, flag setting, wider immediates,
+/// shifted operands, branches, register-offset/writeback addressing —
+/// falls back to the interpreter. That's a narrow slice of the
+/// interpreter's own coverage, which is itself a narrow slice of ARMv7;
+/// extending it means adding another case to `emit`, not redesigning
+/// anything here.
 ///
-/// Every generated block follows one calling convention: given a pointer
-/// to the 16-word guest register array (`x0`), read/modify/write through
-/// that pointer using two scratch registers (`w1`, `w2`), touch nothing
-/// else, and `ret`. The caller (`JITEngine`/`ARMv7CPU`) is responsible
-/// for advancing the guest PC by `4 * instructionCount` afterward, since
-/// nothing in this instruction subset changes control flow.
+/// Calling convention (see `CompiledBlock.EntryPoint`): identical to
+/// `ThumbJITTranslator`'s — `x0` the guest register array, `x1`/`w2`/`w3`
+/// a fast-path memory region a load/store range-checks against, `w2`/`w3`
+/// reserved for the whole block so a register-only instruction elsewhere
+/// in the same block can't clobber them. That's why the scratch registers
+/// below are `w4`/`w5`, not `w1`/`w2` — ARM state didn't need to care
+/// about this before load/store existed here, since nothing read `w2`/
+/// `w3` at all, but a mixed block now can.
 enum JITTranslator {
     private enum Scratch {
-        static let a = 1
-        static let b = 2
+        static let a = 4
+        static let b = 5
     }
+
+    /// Extra scratch for load/store address-range checking — see
+    /// `ThumbJITTranslator`'s identically-purposed `relativeOffsetScratch`.
+    private static let relativeOffsetScratch = 6
 
     private static func byteOffset(_ registerIndex: Int) -> Int {
         registerIndex * 4
@@ -36,23 +47,36 @@ enum JITTranslator {
         emit(instruction) != nil
     }
 
-    /// Compiles `instructions` (a straight-line run, in order) into a
-    /// `CompiledBlock`. Returns `nil` if any instruction isn't
-    /// JIT-eligible or if executable memory couldn't be allocated/written
-    /// (most likely on iOS: no dynamic-codesigning right without a
-    /// debugger attached) — both are ordinary, expected outcomes the
-    /// caller falls back to interpretation for.
-    static func translate(_ instructions: [DataProcessingInstruction]) -> CompiledBlock? {
+    static func isSupported(_ instruction: LoadStoreInstruction) -> Bool {
+        emitLoadStore(instruction, completedInstructionsIfBail: 0) != nil
+    }
+
+    /// Compiles a straight-line run of `DataProcessingInstruction`s
+    /// and/or `LoadStoreInstruction`s (in order) into a `CompiledBlock`.
+    /// Returns `nil` if any instruction isn't JIT-eligible or if
+    /// executable memory couldn't be allocated/written (most likely on
+    /// iOS: no dynamic-codesigning right without a debugger attached) —
+    /// both are ordinary, expected outcomes the caller falls back to
+    /// interpretation for.
+    static func translate(_ instructions: [ARMJITEligibleInstruction]) -> CompiledBlock? {
         guard !instructions.isEmpty else { return nil }
 
         var words: [UInt32] = []
-        for instruction in instructions {
-            guard let generated = emit(instruction) else { return nil }
+        var containsMemoryAccess = false
+        for (index, instruction) in instructions.enumerated() {
+            let generated: [UInt32]?
+            switch instruction {
+            case .dataProcessing(let instr):
+                generated = emit(instr)
+            case .loadStore(let instr):
+                generated = emitLoadStore(instr, completedInstructionsIfBail: index)
+                if generated != nil { containsMemoryAccess = true }
+            }
+            guard let generated else { return nil }
             words.append(contentsOf: generated)
         }
-        // No instruction this translator emits can ever fail at runtime
-        // (no memory access, no bounds to check), so the block always
-        // completes in full — the epilogue just reports that.
+        // Reached only if every instruction's memory access (if any) was
+        // in bounds — the whole block completed.
         words.append(ARM64Assembler.movz32(rd: 0, imm16: UInt16(instructions.count)))
         words.append(ARM64Assembler.ret)
 
@@ -67,7 +91,12 @@ enum JITTranslator {
             return nil
         }
 
-        return CompiledBlock(memory: memory, byteCount: byteCount, instructionByteLengths: Array(repeating: 4, count: instructions.count))
+        // Every ARM-state instruction is a fixed 4 bytes.
+        return CompiledBlock(
+            memory: memory, byteCount: byteCount, instructionCount: instructions.count,
+            cumulativeByteLengths: (0...instructions.count).map { $0 * 4 },
+            containsMemoryAccess: containsMemoryAccess
+        )
     }
 
     private static func emit(_ instruction: DataProcessingInstruction) -> [UInt32]? {
@@ -167,4 +196,73 @@ enum JITTranslator {
             ARM64Assembler.strWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instruction.rd)),
         ]
     }
+
+    /// `LDR`/`STR`/`LDRB`/`STRB Rd, [Rn, #imm]` — pre-indexed, no
+    /// writeback, immediate offset only (register-offset and writeback
+    /// addressing modes aren't decoded here). Same bounds-check-then-
+    /// access-then-skip-the-bail-sequence shape as
+    /// `ThumbJITTranslator.emitLoadStoreImmediate` — see its doc comment
+    /// for the full reasoning; this is its ARM-state twin, differing only
+    /// in which guest instruction fields feed it (no halfword form exists
+    /// in ARM state's plain `LDR`/`STR`, unlike Thumb's).
+    private static func emitLoadStore(_ instruction: LoadStoreInstruction, completedInstructionsIfBail: Int) -> [UInt32]? {
+        guard instruction.condition == .always,
+              instruction.preIndexed, !instruction.writeback, instruction.addOffset,
+              instruction.rn != Registers.pcIndex, instruction.rd != Registers.pcIndex,
+              case .immediate(let offset) = instruction.offset, offset <= 0xFFF else {
+            return nil
+        }
+
+        let addr = Scratch.a
+        let rel = relativeOffsetScratch
+        let value = Scratch.a
+
+        var code: [UInt32] = [
+            ARM64Assembler.ldrWordUnsignedOffset(rt: addr, rn: 0, byteOffset: byteOffset(instruction.rn)),
+        ]
+        if offset != 0 {
+            code.append(ARM64Assembler.addImmediate32(rd: addr, rn: addr, imm12: offset))
+        }
+        code.append(ARM64Assembler.sub32(rd: rel, rn: addr, rm: 2)) // rel = addr - ramGuestBase(w2)
+        code.append(ARM64Assembler.cmp32(rn: rel, rm: 3)) // compare against ramGuestLength(w3)
+        code.append(ARM64Assembler.branchIfHS(instructionsForward: 4)) // out of bounds -> bail
+
+        if instruction.isByte {
+            if instruction.isLoad {
+                code.append(ARM64Assembler.ldrbRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+                code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instruction.rd)))
+            } else {
+                code.append(ARM64Assembler.ldrWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instruction.rd)))
+                code.append(ARM64Assembler.strbRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            }
+        } else {
+            if instruction.isLoad {
+                code.append(ARM64Assembler.ldrWordRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+                code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instruction.rd)))
+            } else {
+                code.append(ARM64Assembler.ldrWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instruction.rd)))
+                code.append(ARM64Assembler.strWordRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            }
+        }
+
+        code.append(ARM64Assembler.branch(instructionsForward: 3)) // success -> skip the bail sequence below
+        code.append(ARM64Assembler.movz32(rd: 0, imm16: UInt16(completedInstructionsIfBail)))
+        code.append(ARM64Assembler.ret)
+
+        return code
+    }
+}
+
+/// The union `JITEngine`'s ARM-state discovery actually walks — a
+/// straight-line run can mix `DataProcessingInstruction`s and
+/// `LoadStoreInstruction`s freely, same as `ThumbInstruction` already
+/// does for the Thumb-state side (there, every case lives in one enum
+/// already; ARM state's decoder instead produces `ARMInstruction`, whose
+/// other cases — branches, block transfers, and everything else —
+/// `JITTranslator` was never going to support, so this is the minimal
+/// two-case subset worth discovery bothering to look for, not a
+/// reflection of `ARMInstruction`'s full shape).
+enum ARMJITEligibleInstruction {
+    case dataProcessing(DataProcessingInstruction)
+    case loadStore(LoadStoreInstruction)
 }

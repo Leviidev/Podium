@@ -16,3 +16,13 @@ xcuserdata/
 # copyrighted, and in places encrypted; never committed regardless of
 # what it's extracted/decrypted/decompressed into.
 .reference-firmware/
+
+# A personal, ad-hoc verification harness against the real firmware
+# above — not part of the app or any build target, never committed.
+.standalone_trace/
+
+# Assistant-to-assistant handoff/orientation notes — scratch material
+# for whichever AI is driving, not project documentation.
+HANDOFF.md
+NEXT.md
+CLAUDE.md

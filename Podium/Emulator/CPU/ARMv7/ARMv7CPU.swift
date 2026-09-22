@@ -305,10 +305,17 @@ final class ARMv7CPU: CPU {
             // this check was added.
             let completed: Int
             if block.containsMemoryAccess {
+                let startPC = registers.pc
                 let fastPath = memory.fastPathRegion(for: registers.pc)
                 completed = registers.withUnsafeMutableStorage { regPtr in
                     block.run(registers: regPtr, ramHostPointer: fastPath?.pointer, ramGuestBase: fastPath?.regionBaseAddress ?? 0, ramGuestLength: UInt32(fastPath?.regionLength ?? 0))
                 }
+                // See `JITEngine.reportMemoryBlockOutcome`'s doc comment: a
+                // block whose load/store address is chronically outside
+                // the fast-path region (`completed == 0` every time) costs
+                // more than it saves, so this reports the outcome back for
+                // eviction bookkeeping.
+                jit.reportMemoryBlockOutcome(at: startPC, thumbState: cpsr.thumbState, madeProgress: completed > 0)
             } else {
                 completed = registers.withUnsafeMutableStorage { regPtr in
                     block.run(registers: regPtr)

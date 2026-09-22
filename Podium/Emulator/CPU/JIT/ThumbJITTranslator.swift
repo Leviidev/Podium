@@ -131,11 +131,11 @@ enum ThumbJITTranslator {
             return 2
         default:
             // Every other case this translator's `emit` can ever accept
-            // (dataProcessingShiftedRegister) is a Thumb-2 wide (32-bit)
-            // encoding; anything not in `emit`'s supported set is never
-            // asked about its length by `discoverEligibleRun` (which
-            // stops discovery at the first ineligible instruction without
-            // needing to skip past it).
+            // (`dataProcessingShiftedRegister`, `dataProcessingImmediate`)
+            // is a Thumb-2 wide (32-bit) encoding; anything not in
+            // `emit`'s supported set is never asked about its length by
+            // `discoverEligibleRun` (which stops discovery at the first
+            // ineligible instruction without needing to skip past it).
             return 4
         }
     }
@@ -144,13 +144,80 @@ enum ThumbJITTranslator {
         switch instruction {
         case .dataProcessingShiftedRegister(let instr):
             return emitDataProcessingShiftedRegister(instr).map { ($0, 4) }
+        case .dataProcessingImmediate(let instr):
+            return emitDataProcessingImmediate(instr).map { ($0, 4) }
         case .hiRegister(let instr):
             return emitHiRegister(instr).map { ($0, 2) }
         case .loadStoreImmediate(let instr):
             return emitLoadStoreImmediate(instr, completedInstructionsIfBail: completedInstructionsIfBail).map { ($0, 2) }
+        case .movWide(let instr):
+            return emitMovWide(instr).map { ($0, 4) }
         default:
             return nil
         }
+    }
+
+    /// `MOVW`/`MOVT Rd, #imm16` (Thumb-2, 32-bit) — never sets flags.
+    /// `MOVW` replaces the whole register (`MOVZ`); `MOVT` replaces only
+    /// the upper halfword, so it has to load `Rd`'s current value before
+    /// merging (`MOVK` only ever touches one halfword of whatever's
+    /// already in the destination register, not the guest array slot).
+    private static func emitMovWide(_ instr: ThumbMovWideInstruction) -> [UInt32]? {
+        guard instr.rd != Registers.pcIndex else {
+            return nil
+        }
+
+        if instr.isTop {
+            return [
+                ARM64Assembler.ldrWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instr.rd)),
+                ARM64Assembler.movk32(rd: Scratch.a, imm16: instr.imm16, shiftBy16: true),
+                ARM64Assembler.strWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instr.rd)),
+            ]
+        }
+        return [
+            ARM64Assembler.movz32(rd: Scratch.a, imm16: instr.imm16),
+            ARM64Assembler.strWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instr.rd)),
+        ]
+    }
+
+    /// `AND`/`BIC`/`ORR`/`EOR`/`ADD`/`SUB Rd, Rn, #imm32` (Thumb-2
+    /// modified-immediate form) — the immediate sibling of
+    /// `emitDataProcessingShiftedRegister`, sharing its op set and
+    /// exclusions (`ADC`/`SBC`/`RSB`/`ORN` and any `pc` involvement not
+    /// decoded here) for the same reasons. `imm32` is already the fully
+    /// resolved 32-bit value (see `ThumbDataProcessingImmediateInstruction`'s
+    /// doc comment), materialized into a scratch register via `MOVZ`
+    /// (+`MOVK` if it doesn't fit in 16 bits) before combining — AArch64's
+    /// own immediate-logical encoding can't represent an arbitrary 32-bit
+    /// value in one instruction, unlike `ADD`/`SUB`'s 12-bit immediate
+    /// form, so this always goes through a register for every op, not
+    /// just the ones that would need to.
+    private static func emitDataProcessingImmediate(_ instr: ThumbDataProcessingImmediateInstruction) -> [UInt32]? {
+        guard !instr.setFlags, instr.rd != Registers.pcIndex, instr.rn != Registers.pcIndex else {
+            return nil
+        }
+
+        let combine: (Int, Int, Int) -> UInt32
+        switch instr.op {
+        case .and: combine = ARM64Assembler.and32
+        case .bic: combine = ARM64Assembler.bic32
+        case .orr: combine = ARM64Assembler.orr32
+        case .eor: combine = ARM64Assembler.eor32
+        case .add: combine = ARM64Assembler.add32
+        case .sub: combine = ARM64Assembler.sub32
+        default: return nil // adc, sbc, rsb, orn: not decoded here — see this file's doc comment.
+        }
+
+        var code: [UInt32] = [
+            ARM64Assembler.ldrWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instr.rn)),
+            ARM64Assembler.movz32(rd: Scratch.b, imm16: UInt16(instr.imm32 & 0xFFFF)),
+        ]
+        if instr.imm32 > 0xFFFF {
+            code.append(ARM64Assembler.movk32(rd: Scratch.b, imm16: UInt16(instr.imm32 >> 16), shiftBy16: true))
+        }
+        code.append(combine(Scratch.a, Scratch.a, Scratch.b))
+        code.append(ARM64Assembler.strWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instr.rd)))
+        return code
     }
 
     private static func emitDataProcessingShiftedRegister(_ instr: ThumbDataProcessingShiftedRegisterInstruction) -> [UInt32]? {
