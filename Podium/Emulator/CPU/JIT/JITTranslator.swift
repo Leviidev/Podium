@@ -27,14 +27,26 @@ import Foundation
 /// about this before load/store existed here, since nothing read `w2`/
 /// `w3` at all, but a mixed block now can.
 enum JITTranslator {
+    private static var epilogue: [UInt32] {
+        [
+            ARM64Assembler.mrs_nzcv(xt: 12),
+            ARM64Assembler.ldrWordUnsignedOffset(rt: 13, rn: 4, byteOffset: 0),
+            ARM64Assembler.movz32(rd: 14, imm16: 0x0FFF, shiftBy16: true),
+            ARM64Assembler.movk32(rd: 14, imm16: 0xFFFF, shiftBy16: false),
+            ARM64Assembler.and32(rd: 13, rn: 13, rm: 14),
+            ARM64Assembler.orr32(rd: 13, rn: 13, rm: 12),
+            ARM64Assembler.strWordUnsignedOffset(rt: 13, rn: 4, byteOffset: 0)
+        ]
+    }
+
     private enum Scratch {
-        static let a = 4
-        static let b = 5
+        static let a = 9
+        static let b = 10
     }
 
     /// Extra scratch for load/store address-range checking — see
     /// `ThumbJITTranslator`'s identically-purposed `relativeOffsetScratch`.
-    private static let relativeOffsetScratch = 6
+    private static let relativeOffsetScratch = 11
 
     private static func byteOffset(_ registerIndex: Int) -> Int {
         registerIndex * 4
@@ -61,7 +73,14 @@ enum JITTranslator {
     static func translate(_ instructions: [ARMJITEligibleInstruction]) -> CompiledBlock? {
         guard !instructions.isEmpty else { return nil }
 
-        var words: [UInt32] = []
+        
+        var words: [UInt32] = [
+            ARM64Assembler.ldrWordUnsignedOffset(rt: 12, rn: 4, byteOffset: 0),
+            ARM64Assembler.movz32(rd: 13, imm16: 0xF000, shiftBy16: true),
+            ARM64Assembler.and32(rd: 12, rn: 12, rm: 13),
+            ARM64Assembler.msr_nzcv(xt: 12)
+        ]
+
         var containsMemoryAccess = false
         for (index, instruction) in instructions.enumerated() {
             let generated: [UInt32]?
@@ -77,6 +96,7 @@ enum JITTranslator {
         }
         // Reached only if every instruction's memory access (if any) was
         // in bounds — the whole block completed.
+        words.append(contentsOf: epilogue)
         words.append(ARM64Assembler.movz32(rd: 0, imm16: UInt16(instructions.count)))
         words.append(ARM64Assembler.ret)
 
@@ -224,8 +244,17 @@ enum JITTranslator {
             code.append(ARM64Assembler.addImmediate32(rd: addr, rn: addr, imm12: offset))
         }
         code.append(ARM64Assembler.sub32(rd: rel, rn: addr, rm: 2)) // rel = addr - ramGuestBase(w2)
+        // Save guest flags before bounds check cmp!
+        code.append(ARM64Assembler.mrs_nzcv(xt: 8))
         code.append(ARM64Assembler.cmp32(rn: rel, rm: 3)) // compare against ramGuestLength(w3)
-        code.append(ARM64Assembler.branchIfHS(instructionsForward: 4)) // out of bounds -> bail
+        code.append(ARM64Assembler.branchIfLO(instructionsForward: 3)) // in bounds -> skip to in-bounds restore
+        
+        // --- Out of bounds path ---
+        code.append(ARM64Assembler.msr_nzcv(xt: 8)) // Restore guest flags before bailing out
+        code.append(ARM64Assembler.branch(instructionsForward: 5)) // Jump to the bailout sequence below (epilogue)
+        
+        // --- In bounds path ---
+        code.append(ARM64Assembler.msr_nzcv(xt: 8)) // Restore guest flags for the rest of the block
 
         if instruction.isByte {
             if instruction.isLoad {
@@ -245,8 +274,11 @@ enum JITTranslator {
             }
         }
 
-        code.append(ARM64Assembler.branch(instructionsForward: 3)) // success -> skip the bail sequence below
+        
+        code.append(ARM64Assembler.branch(instructionsForward: epilogue.count + 3)) // success -> skip the bail sequence below
+        code.append(contentsOf: epilogue)
         code.append(ARM64Assembler.movz32(rd: 0, imm16: UInt16(completedInstructionsIfBail)))
+
         code.append(ARM64Assembler.ret)
 
         return code

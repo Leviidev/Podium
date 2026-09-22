@@ -18,8 +18,8 @@ import Foundation
 /// straight-line code ending in `ret`.
 enum ARM64Assembler {
     /// `MOVZ Wd, #imm16` — imm16 must fit in 16 bits unsigned.
-    static func movz32(rd: Int, imm16: UInt16) -> UInt32 {
-        0x5280_0000 | (UInt32(imm16) << 5) | reg(rd)
+    static func movz32(rd: Int, imm16: UInt16, shiftBy16: Bool = false) -> UInt32 {
+        0x5280_0000 | (shiftBy16 ? 1 << 21 : 0) | (UInt32(imm16) << 5) | reg(rd)
     }
 
     /// `MOVK Wd, #imm16{, LSL #16}` — merges `imm16` into the upper or
@@ -122,6 +122,12 @@ enum ARM64Assembler {
         return 0x5400_0000 | (imm19 << 5) | 0b0010
     }
 
+    static func branchIfLO(instructionsForward: Int) -> UInt32 {
+        precondition(instructionsForward > 0 && instructionsForward < (1 << 18), "branch target out of encodable/expected range")
+        let imm19 = UInt32(instructionsForward) & 0x7_FFFF
+        return 0x5400_0000 | (imm19 << 5) | 0b0011
+    }
+
     /// `B #(instructionsForward*4)` (unconditional) — same forward-only,
     /// self-inclusive counting convention as `branchIfHS`.
     static func branch(instructionsForward: Int) -> UInt32 {
@@ -176,5 +182,31 @@ enum ARM64Assembler {
     private static func reg(_ index: Int) -> UInt32 {
         precondition((0...31).contains(index), "AArch64 register index out of range: \(index)")
         return UInt32(index)
+    }
+
+    static func msr_nzcv(xt: Int) -> UInt32 {
+        0xD51B_4200 | reg(xt)
+    }
+
+    static func mrs_nzcv(xt: Int) -> UInt32 {
+        0xD53B_4200 | reg(xt)
+    }
+
+    static func adds32(rd: Int, rn: Int, rm: Int) -> UInt32 {
+        0x2B00_0000 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rd)
+    }
+
+    static func subs32(rd: Int, rn: Int, rm: Int) -> UInt32 {
+        0x6B00_0000 | (reg(rm) << 16) | (reg(rn) << 5) | reg(rd)
+    }
+
+    static func addsImmediate32(rd: Int, rn: Int, imm12: UInt32) -> UInt32 {
+        precondition(imm12 <= 0xFFF, "imm12 out of encodable range")
+        return 0x3100_0000 | (imm12 << 10) | (reg(rn) << 5) | reg(rd)
+    }
+
+    static func subsImmediate32(rd: Int, rn: Int, imm12: UInt32) -> UInt32 {
+        precondition(imm12 <= 0xFFF, "imm12 out of encodable range")
+        return 0x7100_0000 | (imm12 << 10) | (reg(rn) << 5) | reg(rd)
     }
 }
