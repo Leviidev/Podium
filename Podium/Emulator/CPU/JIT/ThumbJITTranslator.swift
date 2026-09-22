@@ -168,8 +168,10 @@ enum ThumbJITTranslator {
             return emitDataProcessingImmediate(instr).map { ($0, 4) }
         case .hiRegister(let instr):
             return emitHiRegister(instr).map { ($0, 2) }
-        case .loadStoreImmediate(let instr):
+                case .loadStoreImmediate(let instr):
             return emitLoadStoreImmediate(instr, completedInstructionsIfBail: completedInstructionsIfBail).map { ($0, 2) }
+        case .loadStoreRegisterOffset(let instr):
+            return emitLoadStoreRegisterOffset(instr, completedInstructionsIfBail: completedInstructionsIfBail).map { ($0, 2) }
         case .movWide(let instr):
             return emitMovWide(instr).map { ($0, 4) }
         case .addSub(let instr):
@@ -298,6 +300,65 @@ enum ThumbJITTranslator {
     /// `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH Rt, [Rn, #imm]` (Thumb16
     /// formats 9/10/11). See this file's doc comment for the bounds-check
     /// and partial-completion scheme.
+    
+    
+    private static func emitLoadStoreRegisterOffset(_ instr: ThumbLoadStoreRegisterOffsetInstruction, completedInstructionsIfBail: Int) -> [UInt32]? {
+        guard instr.rn != Registers.pcIndex, instr.rd != Registers.pcIndex, instr.rm != Registers.pcIndex else {
+            return nil
+        }
+
+        let addr = Scratch.a
+        let rel = relativeOffsetScratch
+        let value = Scratch.a
+
+        var code: [UInt32] = [
+            ARM64Assembler.ldrWordUnsignedOffset(rt: addr, rn: 0, byteOffset: byteOffset(instr.rn)),
+            ARM64Assembler.ldrWordUnsignedOffset(rt: Scratch.b, rn: 0, byteOffset: byteOffset(instr.rm)),
+            ARM64Assembler.add32(rd: addr, rn: addr, rm: Scratch.b),
+            
+            ARM64Assembler.sub32(rd: rel, rn: addr, rm: 2), // rel = addr - ramGuestBase(w2)
+            ARM64Assembler.mrs_nzcv(xt: 8),
+            ARM64Assembler.cmp32(rn: rel, rm: 3), // compare against ramGuestLength(w3)
+            ARM64Assembler.branchIfLO(instructionsForward: 3),
+            ARM64Assembler.msr_nzcv(xt: 8),
+            ARM64Assembler.branch(instructionsForward: 5),
+            ARM64Assembler.msr_nzcv(xt: 8)
+        ]
+
+        switch instr.op {
+        case .str:
+            code.append(ARM64Assembler.ldrWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rd)))
+            code.append(ARM64Assembler.strWordRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+        case .strh:
+            code.append(ARM64Assembler.ldrWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rd)))
+            code.append(ARM64Assembler.strhRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+        case .strb:
+            code.append(ARM64Assembler.ldrWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rd)))
+            code.append(ARM64Assembler.strbRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+        case .ldr:
+            code.append(ARM64Assembler.ldrWordRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rd)))
+        case .ldrh:
+            code.append(ARM64Assembler.ldrhRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rd)))
+        case .ldrb:
+            code.append(ARM64Assembler.ldrbRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rd)))
+        case .ldrsb:
+            code.append(ARM64Assembler.ldrsbRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rd)))
+        case .ldrsh:
+            code.append(ARM64Assembler.ldrshRegisterOffsetUXTW(rt: value, rn: 1, rm: rel))
+            code.append(ARM64Assembler.strWordUnsignedOffset(rt: value, rn: 0, byteOffset: byteOffset(instr.rd)))
+        }
+
+        code.append(ARM64Assembler.branch(instructionsForward: epilogue.count + 2 + 1))
+        code.append(contentsOf: epilogue)
+        code.append(ARM64Assembler.movz32(rd: 0, imm16: UInt16(completedInstructionsIfBail)))
+        code.append(ARM64Assembler.ret)
+        return code
+    }
+
     private static func emitLoadStoreImmediate(_ instr: ThumbLoadStoreImmediateInstruction, completedInstructionsIfBail: Int) -> [UInt32]? {
         guard instr.rn != Registers.pcIndex, instr.rt != Registers.pcIndex, instr.offset <= 0xFFF else {
             return nil
@@ -408,7 +469,19 @@ enum ThumbJITTranslator {
         case .cmp:
             code.append(ARM64Assembler.subsImmediate32(rd: 31, rn: Scratch.a, imm12: instr.imm8))
         case .mov:
-            return nil
+            let zBit: UInt32 = (instr.imm8 == 0) ? (1 << 30) : 0
+            code.append(ARM64Assembler.movz32(rd: Scratch.a, imm16: UInt16(instr.imm8)))
+            code.append(ARM64Assembler.strWordUnsignedOffset(rt: Scratch.a, rn: 0, byteOffset: byteOffset(instr.rdn)))
+            
+            code.append(ARM64Assembler.mrs_nzcv(xt: Scratch.b))
+            code.append(ARM64Assembler.movz32(rd: Scratch.a, imm16: 0xFFFF))
+            code.append(ARM64Assembler.movk32(rd: Scratch.a, imm16: 0x3FFF, shiftBy16: true))
+            code.append(ARM64Assembler.and32(rd: Scratch.b, rn: Scratch.b, rm: Scratch.a))
+            if zBit != 0 {
+                code.append(ARM64Assembler.movz32(rd: Scratch.a, imm16: 0x4000, shiftBy16: true))
+                code.append(ARM64Assembler.orr32(rd: Scratch.b, rn: Scratch.b, rm: Scratch.a))
+            }
+            code.append(ARM64Assembler.msr_nzcv(xt: Scratch.b))
         }
         return code
     }
