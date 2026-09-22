@@ -270,7 +270,27 @@ final class ARMv7CPU: CPU {
         // `4 * block.instructionCount`, is what actually advances `pc`
         // correctly — Thumb instructions are 2 or 4 bytes each, not a
         // fixed 4.
-        if let jit, let block = jit.block(at: registers.pc, thumbState: cpsr.thumbState, memory: memory) {
+        //
+        // `itState != 0` (an active Thumb IT-block) additionally blocks
+        // the JIT attempt outright, regardless of thumbState: every
+        // Thumb-state instruction the JIT can compile
+        // (`dataProcessingShiftedRegister`/`hiRegister`) goes through
+        // `stepThumb()`'s `default` case in the interpreter, which
+        // conditionally executes it against `currentThumbCondition()` (or
+        // skips it, register-write and all, leaving only `pc` advanced,
+        // when that condition fails) — see `stepThumb()`'s doc comment.
+        // `ThumbJITTranslator`'s compiled code has no representation of
+        // that conditional skip at all; it always executes the operation
+        // unconditionally. Compiling and running such an instruction
+        // while a real IT block is predicating it produces a silently
+        // wrong register write whenever the guest condition is actually
+        // false — found via a real, reproducible false kernel panic this
+        // session (a bogus `sleh_abort at interrupt context`, traced back
+        // to exactly this: a conditionally-skipped `MOV r0, r2` inside an
+        // IT block that the JIT executed anyway). Falling back to the
+        // interpreter for the (at most 4) instructions an IT block can
+        // cover is a small, bounded cost next to getting this wrong.
+        if let jit, itState == 0, let block = jit.block(at: registers.pc, thumbState: cpsr.thumbState, memory: memory) {
             registers.withUnsafeMutableStorage { block.run(registers: $0) }
             registers.pc = registers.pc &+ UInt32(block.totalByteLength)
         } else {

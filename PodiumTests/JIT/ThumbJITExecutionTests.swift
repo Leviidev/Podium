@@ -67,6 +67,41 @@ final class ThumbJITExecutionTests: XCTestCase {
         XCTAssertFalse(ThumbJITTranslator.isSupported(.hiRegister(instr)))
     }
 
+    /// The real bug this session found the hard way: `ThumbJITTranslator`
+    /// has no representation of Thumb `IT`-block conditional execution —
+    /// its compiled code always runs unconditionally — but
+    /// `stepThumb()`'s interpreter path conditionally *skips* a
+    /// predicated instruction's effect entirely (advancing `pc` but never
+    /// calling `executeThumb`) whenever `currentThumbCondition()` fails
+    /// against the current flags. Compiling and running a `sub.w r1, r3,
+    /// sb`-shaped instruction while `itState` is active would silently
+    /// perform the write even on an iteration where a real ARM CPU (and
+    /// this interpreter) would skip it — traced back from a real,
+    /// reproducible false kernel panic (`sleh_abort at interrupt
+    /// context`) that only happened with the JIT enabled, never with the
+    /// interpreter alone. `runOneUnit()` now refuses the JIT outright
+    /// whenever `itState != 0`, regardless of whether the specific
+    /// instruction at `pc` happens to be predicated true or false this
+    /// time — this test locks that gate in place.
+    func testJITNeverAttemptedInsideActiveITBlock() throws {
+        let bytes: [UInt8] = [0xa3, 0xeb, 0x09, 0x01] // sub.w r1, r3, sb, little-endian
+
+        let memory = FlatPhysicalMemory(length: 16)
+        try memory.writeByte(bytes[0], at: 0)
+        try memory.writeByte(bytes[1], at: 1)
+        try memory.writeByte(bytes[2], at: 2)
+        try memory.writeByte(bytes[3], at: 3)
+
+        let jitEngine = JITEngine()
+        let cpu = ARMv7CPU(memory: memory, jit: jitEngine)
+        cpu.reset()
+        cpu.cpsr.thumbState = true
+        cpu.itState = 0xA8 // any nonzero value simulates an active IT block
+        _ = cpu.run(maxUnits: 1)
+
+        XCTAssertEqual(jitEngine.stats, JITEngine.Stats())
+    }
+
     /// Runs the same real kernel word (`sub.w r1, r3, sb`) through a
     /// pure-interpreter CPU and a JIT-enabled CPU via `ARMv7CPU.run()`,
     /// and requires them to agree exactly — the same cross-check
