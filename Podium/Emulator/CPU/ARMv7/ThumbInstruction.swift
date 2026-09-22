@@ -400,6 +400,19 @@ struct ThumbDataProcessingImmediateInstruction: Equatable {
     let rn: Int
     let rd: Int
     let imm32: UInt32
+    /// `ThumbExpandImm_C`'s carry-out: bit 31 of `imm32` when the
+    /// encoding used rotation, `nil` (C unchanged) for the unrotated
+    /// byte/replicated patterns. Flag-setting logical ops set C from it.
+    let immediateCarryOut: Bool?
+
+    init(op: ThumbModifiedImmediateOp, setFlags: Bool, rn: Int, rd: Int, imm32: UInt32, immediateCarryOut: Bool? = nil) {
+        self.op = op
+        self.setFlags = setFlags
+        self.rn = rn
+        self.rd = rd
+        self.imm32 = imm32
+        self.immediateCarryOut = immediateCarryOut
+    }
 }
 
 /// Thumb-2 "data-processing (shifted register)" — the 32-bit sibling of
@@ -561,38 +574,19 @@ struct ThumbMlaInstruction: Equatable {
     let ra: Int
 }
 
-/// `VMOV.I32 Qd, #imm8` (NEON "one register and a modified immediate
-/// value", Q-register form only) — verified against a real
-/// `vmov.i32 q8, #0` word from the actual kernel. `imm8` (the ARM manual's
-/// scattered `i:imm3:imm4` field, reassembled here into a plain 0-255
-/// value) is replicated into all four 32-bit lanes, i.e. both halves of
-/// the 128-bit `Q` register get the same 64-bit pattern
-/// `UInt64(imm8) | (UInt64(imm8) << 32)`. Only this one `cmode`/`op`
-/// combination (plain 32-bit replicate, no shift, `VMOV` not `VMVN`) and
-/// only the `Q`-register form (not the single-`D`-register form) are
-/// decoded — every other `cmode` (8/16/64-bit, shifted variants) and the
-/// `VMVN` `op` bit aren't, since no real word has confirmed them yet.
-struct ThumbVectorMoveImmediateInstruction: Equatable {
-    let qd: Int
-    let imm8: UInt32
-}
+/// An Advanced SIMD (NEON) or VFP instruction in Thumb state, decoded in
+/// its ARM form. Thumb's NEON encodings are ARM state's with the top byte
+/// rewritten (ARM DDI 0406C A7.1): data-processing `111U 1111` is ARM's
+/// `1111 001U`, and element/structure load/store `1111 1001 xxx0` is ARM's
+/// `1111 0100 xxx0`; Thumb-2 coprocessor (VFP) encodings are ARM's with
+/// cond == AL, unchanged. So each is decoded by `ARMDecoder` and executed
+/// by the ARM-state executor — every such instruction exists once, for
+/// both states. Equality is by encoding.
+struct ThumbAdvancedSIMDInstruction: Equatable {
+    let armFormWord: UInt32
+    let instruction: ARMInstruction
 
-/// `VSTMIA`/`VLDMIA Rn, {Dd..Dd+regCount-1}` (VFP/NEON extension-register
-/// load/store multiple, double-precision list, increment-after
-/// addressing only) — verified against a real `vstmia r2, {d16, d17}`
-/// word from the actual kernel by flipping individual bits (the same
-/// technique used for `ThumbVectorMoveImmediateInstruction`). Only the
-/// increment-after form is decoded (the coprocessor-field bits that
-/// distinguish it from decrement-before/`VPUSH`-style addressing, and
-/// from the single-precision `S`-register list form, are required to
-/// match this one confirmed shape) — no real word has confirmed the
-/// other addressing modes or the single-precision form yet.
-struct ThumbVectorLoadStoreMultipleInstruction: Equatable {
-    let isLoad: Bool
-    let writeback: Bool
-    let rn: Int
-    let vd: Int
-    let registerCount: Int
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.armFormWord == rhs.armFormWord }
 }
 
 /// `SMMUL Rd, Rn, Rm`: `Rd = (Rn * Rm)[63:32]` (the top 32 bits of the
@@ -741,8 +735,7 @@ enum ThumbInstruction: Equatable {
     case smull(ThumbSmullInstruction)
     case mla(ThumbMlaInstruction)
     case mul(ThumbMulInstruction)
-    case vectorMoveImmediate(ThumbVectorMoveImmediateInstruction)
-    case vectorLoadStoreMultiple(ThumbVectorLoadStoreMultipleInstruction)
+    case advancedSIMD(ThumbAdvancedSIMDInstruction)
     case smmul(ThumbSmmulInstruction)
     case packHalfword(ThumbPackHalfwordInstruction)
     case rbit(ThumbRbitInstruction)

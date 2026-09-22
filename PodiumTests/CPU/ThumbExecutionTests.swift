@@ -1038,4 +1038,173 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertNil(signedCPU.lastError)
         XCTAssertEqual(signedCPU.registers[3], 0xFF81_0001)
     }
+
+    /// `vmov.i32 d16, #0` — the real kernel word in `IOService::addPowerChild`
+    /// that halted boot, decoded through the shared ARM-form NEON path.
+    func testThumbNEONMoveImmediateDRegister() {
+        let cpu = makeThumbCPU(program: [0xEFC0, 0x0010])
+        cpu.neon[16] = 0xDEAD_BEEF_DEAD_BEEF
+        cpu.neon[17] = 0x1234
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[16], 0)
+        XCTAssertEqual(cpu.neon[17], 0x1234, "D form must not touch the next register")
+    }
+
+    /// `vmov.i32 q8, #0` (the Q form the old Thumb-only path handled) and
+    /// `vmov.i8 d0, #0xff` with U=1 — the `0xFF` prefix used to alias onto
+    /// `0xFB` (long multiply).
+    func testThumbNEONQFormAndUEqualsOnePrefix() {
+        let q = makeThumbCPU(program: [0xEFC0, 0x0050])
+        q.neon[16] = 1
+        q.neon[17] = 2
+        q.step()
+        XCTAssertNil(q.lastError)
+        XCTAssertEqual(q.neon[16], 0)
+        XCTAssertEqual(q.neon[17], 0)
+
+        let u = makeThumbCPU(program: [0xFF87, 0x0E1F])
+        u.step()
+        XCTAssertNil(u.lastError)
+        XCTAssertEqual(u.neon[0], 0xFFFF_FFFF_FFFF_FFFF)
+    }
+
+    /// `vstr d16, [sp, #8]` — the real kernel word in
+    /// `IOService::addPowerChild` that halted boot next.
+    func testThumbVstrStoresDoubleAtOffset() {
+        let cpu = makeThumbCPU(program: [0xEDCD, 0x0B02])
+        cpu.registers.sp = 0x80
+        cpu.neon[16] = 0x1122_3344_5566_7788
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x88), 0x5566_7788)
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x8C), 0x1122_3344)
+        XCTAssertEqual(cpu.registers.sp, 0x80, "VSTR never writes back")
+    }
+
+    /// `vldr d0, [pc, #8]` in Thumb: the base is Align(instruction + 4, 4),
+    /// not ARM's instruction + 8, even though it decodes via its ARM form.
+    func testThumbVldrLiteralUsesThumbPC() {
+        let cpu = makeThumbCPU(program: [0x0000, 0xED9F, 0x0B02])
+        cpu.registers.pc = 2 // the VLDR sits at 2: base = Align(6, 4) = 4, address = 12
+        try! cpu.memory.writeWord32(0xAAAA_0001, at: 12)
+        try! cpu.memory.writeWord32(0xBBBB_0002, at: 16)
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[0], 0xBBBB_0002_AAAA_0001)
+    }
+
+    /// An IRQ taken right after `IT` (inside the block) must save ITSTATE
+    /// in SPSR and restore it on `SUBS PC, LR, #4`, so the rest of the
+    /// block still runs under its conditions — here Z is clear, so only
+    /// the `movne` may write r0.
+    func testInterruptInsideITBlockPreservesITState() {
+        let memory = FlatPhysicalMemory(length: 0x200)
+        try! memory.writeWord32(0xE25E_F004, at: 0x18) // IRQ vector: subs pc, lr, #4 (ARM)
+        try! memory.writeWord16(0xBF0C, at: 0x100)    // ite eq
+        try! memory.writeWord16(0x2001, at: 0x102)    // moveq r0, #1
+        try! memory.writeWord16(0x2002, at: 0x104)    // movne r0, #2
+        let cpu = ARMv7CPU(memory: memory)
+        cpu.reset()
+        cpu.cpsr.thumbState = true
+        cpu.cpsr.irqDisabled = false
+        cpu.cpsr.zero = false
+        cpu.registers.pc = 0x100
+        cpu.registers[0] = 0xFF
+
+        cpu.run(maxUnits: 1) // ite eq
+        XCTAssertNotEqual(cpu.itState, 0)
+        cpu.irqAsserted = true
+        cpu.run(maxUnits: 1) // IRQ taken, then the handler's subs pc, lr, #4 runs
+        cpu.irqAsserted = false
+        XCTAssertEqual(cpu.registers.pc, 0x102, "should return to the interrupted IT block")
+        XCTAssertTrue(cpu.cpsr.thumbState)
+        XCTAssertNotEqual(cpu.itState, 0, "ITSTATE must come back from SPSR")
+
+        cpu.run(maxUnits: 2)
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 2)
+        XCTAssertEqual(cpu.itState, 0)
+    }
+
+    /// The real `ipc_kobject_destroy` dispatch at 0x8001a6c2: `cmp r1, #0x1c;
+    /// it eq; beq.w mach_destroy_memory_entry`. The T4 `B.W` must obey the IT
+    /// condition — ignoring it sent every destroyed port down the named-
+    /// memory-entry path and panicked the kernel (kotype 1 != 0x1c).
+    func testWideBranchInsideITBlockObeysITCondition() {
+        func run(r1: UInt32) -> UInt32 {
+            let base: UInt32 = 0x8001_a6c2
+            let memory = FlatPhysicalMemory(length: 0x10_0000, baseAddress: 0x8000_0000)
+            for (offset, halfword) in [UInt16(0x291C), 0xBF08, 0xF054, 0xBEC9].enumerated() {
+                try! memory.writeWord16(halfword, at: base + UInt32(offset * 2))
+            }
+            let cpu = ARMv7CPU(memory: memory)
+            cpu.reset()
+            cpu.cpsr.thumbState = true
+            cpu.registers.pc = base
+            cpu.registers[1] = r1
+            cpu.run(maxUnits: 3)
+            XCTAssertNil(cpu.lastError)
+            return cpu.registers.pc
+        }
+        XCTAssertEqual(run(r1: 1), 0x8001_a6ca, "kotype 1: must fall through")
+        XCTAssertEqual(run(r1: 0x1C), 0x8006_f45c, "kotype 0x1c: must branch")
+    }
+
+    /// `tst.w r3, #0xf00` (real kernel word): a rotated modified immediate,
+    /// so C becomes bit 31 of the constant (0) — not left unchanged.
+    func testThumb2LogicalRotatedImmediateSetsCarryFromConstant() {
+        let cpu = makeThumbCPU(program: [0xF413, 0x6F70])
+        cpu.cpsr.carry = true
+        cpu.registers[3] = 0
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertTrue(cpu.cpsr.zero)
+        XCTAssertFalse(cpu.cpsr.carry)
+
+        // `tst.w r0, #0xff` is unrotated: C must stay as it was.
+        let unrotated = makeThumbCPU(program: [0xF010, 0x0FFF])
+        unrotated.cpsr.carry = true
+        unrotated.step()
+        XCTAssertNil(unrotated.lastError)
+        XCTAssertTrue(unrotated.cpsr.carry)
+    }
+
+    /// Thumb-2 literal loads: with Rn == PC, hw0 bit[7] is U and the offset
+    /// is always imm12 from Align(PC, 4). `ldr.w r2, [pc, #-0x178]` is the
+    /// real kext word that halted boot; `#-0x978` has imm12 bit 11 set,
+    /// which the old T3/T4 split misread as a T4 load.
+    func testThumb2LiteralLoadsWithNegativeOffsets() {
+        func load(_ hw0: UInt16, _ hw1: UInt16, literalAt address: UInt32, value: UInt32) -> ARMv7CPU {
+            let memory = FlatPhysicalMemory(length: 0x4000)
+            try! memory.writeWord16(hw0, at: 0x2000)
+            try! memory.writeWord16(hw1, at: 0x2002)
+            try! memory.writeWord32(value, at: address)
+            let cpu = ARMv7CPU(memory: memory)
+            cpu.reset()
+            cpu.cpsr.thumbState = true
+            cpu.registers.pc = 0x2000
+            cpu.step()
+            return cpu
+        }
+        let near = load(0xF85F, 0x2178, literalAt: 0x2004 - 0x178, value: 0xCAFE_F00D)
+        XCTAssertNil(near.lastError)
+        XCTAssertEqual(near.registers[2], 0xCAFE_F00D)
+
+        let far = load(0xF85F, 0x2978, literalAt: 0x2004 - 0x978, value: 0x1234_5678)
+        XCTAssertNil(far.lastError)
+        XCTAssertEqual(far.registers[2], 0x1234_5678)
+        XCTAssertEqual(far.registers.pc, 0x2004)
+
+        let signed = load(0xF93F, 0x1008, literalAt: 0x2004 - 8, value: 0x0000_8001) // ldrsh.w r1, [pc, #-8]
+        XCTAssertNil(signed.lastError)
+        XCTAssertEqual(signed.registers[1], 0xFFFF_8001)
+    }
+
+    func testThumb2PreloadHintDoesNotLoadIntoPC() {
+        let cpu = makeThumbCPU(program: [0xF81F, 0xF001]) // pld [pc, #-1]
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers.pc, 4)
+    }
 }

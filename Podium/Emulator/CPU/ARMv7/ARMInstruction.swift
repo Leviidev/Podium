@@ -469,6 +469,18 @@ struct VRSHLInstruction: Equatable {
     let vn: Int
 }
 
+/// Advanced SIMD "one register and a modified immediate" (ARM DDI 0406C
+/// A7.4.6): `VMOV`/`VMVN`/`VORR`/`VBIC` (immediate), every `cmode`, `D`
+/// and `Q` forms. `imm64` is already expanded (`AdvSIMDExpandImm`); `vd`
+/// is a `D` register number (the first of the pair for `Q`).
+struct NEONModifiedImmediateInstruction: Equatable {
+    enum Operation: Equatable { case move, moveNot, orr, bic }
+    let operation: Operation
+    let vd: Int
+    let isQuad: Bool
+    let imm64: UInt64
+}
+
 /// `VEOR` (NEON bitwise exclusive-OR), `Dd = Dn ^ Dm` (or the `Q`-register
 /// equivalent). Shares the "three registers of the same length" shape
 /// with `VRSHL` but from the family's "bitwise operations" sub-space:
@@ -622,29 +634,45 @@ struct ElementLoadStoreInstruction: Equatable {
     let writeback: Writeback
 }
 
-/// `VSTM`/`VLDM`/`VPUSH`/`VPOP` for double-precision (`D`) extension
-/// registers — the "increment after" (`VSTMIA`/`VLDMIA`) and "decrement
-/// before" (`VSTMDB`/`VLDMDB`, which is also `VPUSH`/`VPOP` when
-/// `rn`==SP) addressing forms. Verified against a real `vpush {d16-d31}`
-/// word from the actual kernel (0xed6d0b20: P=1,U=0,D=1,W=1,L=0,
-/// Rn=13(SP), Vd=0, imm8=0x20 -> firstRegister=16, registerCount=16, a
-/// full VFPv3/NEON context save). Only the double-precision encoding
-/// (bits[11:8]==0b1011) is decoded; the single-precision sibling
-/// (bits[11:8]==0b1010, `S` registers) stays `.unsupported` until a real
-/// word needs it. `W` (writeback) is always required to be set by the
-/// decoder for this family — real hardware only defines this shape with
-/// writeback; a plain non-writeback "load/store multiple" doesn't exist
-/// for extension registers the way it does for the core `LDM`/`STM`.
-struct ExtensionRegisterLoadStoreMultipleInstruction: Equatable {
+/// VFP/NEON extension-register load/store (ARM DDI 0406C A7.6): `VLDR`/
+/// `VSTR` (one register at `Rn ± imm8*4`), and `VLDM`/`VSTM` increment-
+/// after (optional writeback) or decrement-before (writeback; `VPUSH`/
+/// `VPOP` when `Rn` is SP), for single- (`S`) or double-precision (`D`)
+/// registers. Verified against real `vpush {d16-d31}`, `vstmia r2,
+/// {d16, d17}` and `vstr d16, [sp, #8]` words from the actual kernel.
+struct ExtensionRegisterLoadStoreInstruction: Equatable {
+    enum Addressing: Equatable {
+        case offset(UInt32, add: Bool)
+        case incrementAfter(writeback: Bool)
+        case decrementBefore
+    }
     let condition: ARMCondition
     let isLoad: Bool
-    /// `true` = increment after (`VSTMIA`/`VLDMIA`), `false` = decrement
-    /// before (`VSTMDB`/`VLDMDB`).
-    let addOffset: Bool
+    let isDouble: Bool
     let rn: Int
-    /// `Dd`: the first (lowest-numbered) `D` register transferred.
+    /// The first register transferred: a `D` index when `isDouble`,
+    /// otherwise an `S` index.
     let firstRegister: Int
     let registerCount: Int
+    /// Words the whole transfer spans — for multiples this is `imm8`
+    /// itself, including the extra word of the legacy odd-`imm8`
+    /// (`FLDMX`/`FSTMX`) form, so writeback moves `Rn` exactly as far as
+    /// hardware would.
+    let wordCount: Int
+    let addressing: Addressing
+}
+
+/// `VMOV` between two core registers and one `D` register, or two
+/// consecutive `S` registers (ARM DDI 0406C A7.8, "64-bit transfers").
+/// `toCore` is the `op`/L bit: extension register(s) -> `Rt`/`Rt2`.
+struct VFPTwoRegisterTransferInstruction: Equatable {
+    let condition: ARMCondition
+    let toCore: Bool
+    let isDouble: Bool
+    let rt: Int
+    let rt2: Int
+    /// A `D` index when `isDouble`, otherwise the first of two `S` indices.
+    let extensionRegister: Int
 }
 
 enum ARMInstruction: Equatable {
@@ -683,13 +711,15 @@ enum ARMInstruction: Equatable {
     case clearExclusive
     case vectorRoundingShiftLeft(VRSHLInstruction)
     case bitwiseExclusiveOr(VEORInstruction)
+    case neonModifiedImmediate(NEONModifiedImmediateInstruction)
     case bitwiseOr(VORRInstruction)
     case integerAdd(VADDInstruction)
     case vectorExtract(VEXTInstruction)
     case vectorShiftImmediate(VectorShiftImmediateInstruction)
     case elementLoadStore(ElementLoadStoreInstruction)
     case reverseElements(VREVInstruction)
-    case extensionRegisterLoadStoreMultiple(ExtensionRegisterLoadStoreMultipleInstruction)
+    case extensionRegisterLoadStore(ExtensionRegisterLoadStoreInstruction)
+    case vfpTwoRegisterTransfer(VFPTwoRegisterTransferInstruction)
     /// A recognized-but-not-yet-implemented instruction family: multiply
     /// and the "extra load/store" SWP/reserved encodings (SH==00), the
     /// `S`-bit form of block data transfer (see

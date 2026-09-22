@@ -22,4 +22,17 @@ struct NEONRegisters {
             storage[index] = newValue
         }
     }
+
+    /// Single-precision `S` registers alias the low 16 `D` registers:
+    /// `S(2n)` is the low half of `D(n)`, `S(2n+1)` the high half.
+    func single(_ index: Int) -> UInt32 {
+        precondition((0..<32).contains(index), "S register index out of range: \(index)")
+        return UInt32(truncatingIfNeeded: storage[index / 2] >> (index % 2 == 0 ? 0 : 32))
+    }
+
+    mutating func setSingle(_ index: Int, _ value: UInt32) {
+        precondition((0..<32).contains(index), "S register index out of range: \(index)")
+        let shift: UInt64 = index % 2 == 0 ? 0 : 32
+        storage[index / 2] = (storage[index / 2] & ~(0xFFFF_FFFF << shift)) | (UInt64(value) << shift)
+    }
 }

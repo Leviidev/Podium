@@ -46,6 +46,7 @@ extension ARMv7CPU {
     func stepThumb() {
         let instructionAddress = registers.pc
         currentInstructionAddress = instructionAddress
+        currentInstructionITState = itState
         let hw0: UInt16
         do {
             let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
@@ -95,16 +96,17 @@ extension ARMv7CPU {
             executeThumbCompareBranch(instr, instructionAddress: instructionAddress)
 
         case .branchWide(let instr):
-            // B.W (T3, conditional) carries its own real condition, the
-            // same as 16-bit Bcond — never gated by ITSTATE. The
-            // unconditional T4 form's `.always` here bypasses ITSTATE
-            // too; real hardware would still apply an active IT block's
-            // condition to it, but an unconditional B.W placed inside an
-            // IT block is not a pattern real compiled code produces, so
-            // this is a deliberate, narrow simplification rather than
-            // being left silently wrong.
+            // B.W T3 (conditional) carries its own condition, like 16-bit
+            // Bcond, and can't appear inside an IT block. The T4 form
+            // (`.always`) is IT-able and is exactly how compilers encode
+            // a far conditional branch: `it eq; b.w target` — it must
+            // obey the IT block's condition. (Ignoring it here once made
+            // every such branch unconditional: ipc_kobject_destroy's
+            // `it eq; beq.w mach_destroy_memory_entry` then treated every
+            // port as a memory entry, panicking the kernel.)
+            let condition = instr.condition == .always ? currentThumbCondition() : instr.condition
             advanceThumbITState()
-            guard cpsr.isSatisfied(instr.condition) else { return }
+            guard cpsr.isSatisfied(condition) else { return }
             executeThumbBranchWide(instr, instructionAddress: instructionAddress)
 
         default:
@@ -182,10 +184,8 @@ extension ARMv7CPU {
             executeThumbReverseBytes(instr)
         case .mul(let instr):
             executeThumbMul(instr)
-        case .vectorMoveImmediate(let instr):
-            executeThumbVectorMoveImmediate(instr)
-        case .vectorLoadStoreMultiple(let instr):
-            executeThumbVectorLoadStoreMultiple(instr)
+        case .advancedSIMD(let simd):
+            execute(simd.instruction, rawWord: simd.armFormWord, instructionAddress: instructionAddress)
         case .smmul(let instr):
             executeThumbSmmul(instr)
         case .packHalfword(let instr):
@@ -744,49 +744,6 @@ extension ARMv7CPU {
         }
     }
 
-    /// See `ThumbVectorMoveImmediateInstruction`'s doc comment: replicates
-    /// `imm8` into all four 32-bit lanes, i.e. both `D` halves of `Qd`
-    /// get the identical 64-bit pattern.
-    private func executeThumbVectorMoveImmediate(_ instr: ThumbVectorMoveImmediateInstruction) {
-        let lane = UInt64(instr.imm8) | (UInt64(instr.imm8) << 32)
-        neon[instr.qd * 2] = lane
-        neon[instr.qd * 2 + 1] = lane
-    }
-
-    /// See `ThumbVectorLoadStoreMultipleInstruction`'s doc comment:
-    /// increment-after transfer of `registerCount` consecutive 64-bit `D`
-    /// registers starting at `vd`, 8 bytes apart, exactly like
-    /// `executeThumbLoadStoreDual`'s two-word transfer but for an
-    /// arbitrary (real-word-confirmed) count of 64-bit registers.
-    private func executeThumbVectorLoadStoreMultiple(_ instr: ThumbVectorLoadStoreMultipleInstruction) {
-        let base = registers[instr.rn]
-        do {
-            for i in 0..<instr.registerCount {
-                let address = base &+ UInt32(i * 8)
-                let lowPhysicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
-                let highPhysicalAddress = try translatedAddress(address &+ 4, access: instr.isLoad ? .read : .write)
-                if instr.isLoad {
-                    let low = try memory.readWord32(at: lowPhysicalAddress)
-                    let high = try memory.readWord32(at: highPhysicalAddress)
-                    neon[instr.vd + i] = UInt64(low) | (UInt64(high) << 32)
-                } else {
-                    let value = neon[instr.vd + i]
-                    try memory.writeWord32(UInt32(truncatingIfNeeded: value), at: lowPhysicalAddress)
-                    try memory.writeWord32(UInt32(truncatingIfNeeded: value >> 32), at: highPhysicalAddress)
-                }
-            }
-        } catch let memoryError as MemoryAccessError {
-            if !raiseDataAbort(memoryError, faultAddress: base) { lastError = .memoryFault(memoryError, address: base) }
-            return
-        } catch {
-            if !raiseDataAbort(.unmappedAddress(base), faultAddress: base) { lastError = .memoryFault(.unmappedAddress(base), address: base) }
-            return
-        }
-        if instr.writeback {
-            registers[instr.rn] = base &+ UInt32(instr.registerCount * 8)
-        }
-    }
-
     // MARK: - Branches
 
     private func executeThumbConditionalBranch(_ instr: ThumbConditionalBranchInstruction, instructionAddress: UInt32) {
@@ -911,7 +868,10 @@ extension ARMv7CPU {
         if let arithmeticResult {
             setNZCV(arithmeticResult)
         } else {
-            setNZ(result) // Logical ops: C/V unaffected (no shifter carry for a modified immediate).
+            // Logical ops: V unaffected; C comes from ThumbExpandImm_C's
+            // carry-out when the immediate was rotated, else unaffected.
+            setNZ(result)
+            if let carry = instr.immediateCarryOut { cpsr.carry = carry }
         }
     }
 

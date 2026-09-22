@@ -414,14 +414,16 @@ final class ARMDecoderTests: XCTestCase {
         // first-ever ARM-state (non-Thumb) unsupported-instruction halt
         // this session (a VFP/NEON context-save prologue). P=1,U=0,D=1,
         // W=1,L=0,Rn=13(SP),Vd=0,imm8=0x20.
-        guard case .extensionRegisterLoadStoreMultiple(let instr) = ARMDecoder.decode(0xED6D_0B20) else {
-            return XCTFail("Expected extensionRegisterLoadStoreMultiple")
+        guard case .extensionRegisterLoadStore(let instr) = ARMDecoder.decode(0xED6D_0B20) else {
+            return XCTFail("Expected extensionRegisterLoadStore")
         }
         XCTAssertFalse(instr.isLoad)
-        XCTAssertFalse(instr.addOffset)
+        XCTAssertTrue(instr.isDouble)
+        XCTAssertEqual(instr.addressing, .decrementBefore)
         XCTAssertEqual(instr.rn, 13)
         XCTAssertEqual(instr.firstRegister, 16)
         XCTAssertEqual(instr.registerCount, 16)
+        XCTAssertEqual(instr.wordCount, 32)
     }
 
     func testDecodesVeorFromRealKernel() {
@@ -752,5 +754,28 @@ final class ARMDecoderTests: XCTestCase {
             return XCTFail("Expected moveToStatusRegister")
         }
         XCTAssertTrue(instr.isSPSR)
+    }
+
+    /// Every (op, cmode) family of the NEON one-register-and-modified-
+    /// immediate group, each encoding confirmed with Capstone.
+    func testNEONModifiedImmediateCoversEveryCmodeFamily() {
+        let cases: [(word: UInt32, operation: NEONModifiedImmediateInstruction.Operation, vd: Int, isQuad: Bool, imm64: UInt64)] = [
+            (0xF387_0E1F, .move, 0, false, 0xFFFF_FFFF_FFFF_FFFF),     // vmov.i8 d0, #0xff
+            (0xF280_2070, .moveNot, 2, true, 0),                       // vmvn.i32 q1, #0 (value before inversion)
+            (0xF280_1B11, .orr, 1, false, 0x0100_0100_0100_0100),      // vorr.i16 d1, #0x100
+            (0xF387_373F, .bic, 3, false, 0xFF00_0000_FF00_0000),      // vbic.i32 d3, #0xff000000
+            (0xF382_4E3A, .move, 4, false, 0xFF00_FF00_FF00_FF00),     // vmov.i64 d4, #0xff00ff00ff00ff00
+            (0xF287_5F10, .move, 5, false, 0x3F80_0000_3F80_0000),     // vmov.f32 d5, #1.0
+            (0xF281_6C12, .move, 6, false, 0x0000_12FF_0000_12FF),     // vmov.i32 d6, #0x12ff
+        ]
+        for c in cases {
+            guard case .neonModifiedImmediate(let instr) = ARMDecoder.decode(c.word) else {
+                XCTFail(String(format: "0x%08x: expected neonModifiedImmediate", c.word)); continue
+            }
+            XCTAssertEqual(instr.operation, c.operation, String(format: "0x%08x", c.word))
+            XCTAssertEqual(instr.vd, c.vd, String(format: "0x%08x", c.word))
+            XCTAssertEqual(instr.isQuad, c.isQuad, String(format: "0x%08x", c.word))
+            XCTAssertEqual(instr.imm64, c.imm64, String(format: "0x%08x", c.word))
+        }
     }
 }

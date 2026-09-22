@@ -1085,4 +1085,33 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 5, crm: 0, opc2: 0), 0b00101 | (1 << 11))
         XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 6, crm: 0, opc2: 0), 0x0070_0000)
     }
+
+    func testVldmiaSinglePrecisionWithWritebackFillsSRegisterHalves() {
+        let cpu = makeCPU(program: [0xECB0_0A04]) // vldmia r0!, {s0-s3}
+        cpu.registers[0] = 0x40
+        for (i, value) in [UInt32(1), 2, 3, 4].enumerated() {
+            try! cpu.memory.writeWord32(value, at: 0x40 + UInt32(i * 4))
+        }
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[0], 0x0000_0002_0000_0001, "S0 is D0's low half, S1 its high half")
+        XCTAssertEqual(cpu.neon[1], 0x0000_0004_0000_0003)
+        XCTAssertEqual(cpu.registers[0], 0x50)
+    }
+
+    func testVmovBetweenCoreRegisterPairAndDRegister() {
+        let toD = makeCPU(program: [0xEC41_0B30]) // vmov d16, r0, r1
+        toD.registers[0] = 0xAAAA_AAAA
+        toD.registers[1] = 0xBBBB_BBBB
+        toD.step()
+        XCTAssertNil(toD.lastError)
+        XCTAssertEqual(toD.neon[16], 0xBBBB_BBBB_AAAA_AAAA)
+
+        let toCore = makeCPU(program: [0xEC51_0B30]) // vmov r0, r1, d16
+        toCore.neon[16] = 0x1111_2222_3333_4444
+        toCore.step()
+        XCTAssertNil(toCore.lastError)
+        XCTAssertEqual(toCore.registers[0], 0x3333_4444)
+        XCTAssertEqual(toCore.registers[1], 0x1111_2222)
+    }
 }

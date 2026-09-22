@@ -188,17 +188,14 @@ final class ARMv7CPU: CPU {
     weak var deviceEventHandler: DeviceEventHandler?
 
     /// Brings devices up to date and takes a pending, unmasked interrupt,
-    /// if any — once per unit, i.e. between instructions. Interrupts are
-    /// held off while a Thumb IT block is active: real hardware can take
-    /// one mid-block by saving ITSTATE in SPSR, but deferring by at most
-    /// three instructions is indistinguishable to the guest and keeps
-    /// ITSTATE out of exception entry/return entirely.
+    /// if any — once per unit, i.e. between instructions (including inside
+    /// a Thumb IT block: exception entry saves ITSTATE in SPSR and the
+    /// return restores it, as on real hardware).
     @inline(__always)
     private func serviceDevicesAndInterrupts() {
         if virtualTime >= nextDeviceEventAt {
             deviceEventHandler?.deviceEventDue(at: virtualTime)
         }
-        guard itState == 0 else { return }
         if fiqAsserted && !cpsr.fiqDisabled {
             takeInterrupt(isFIQ: true)
         } else if irqAsserted && !cpsr.irqDisabled {
@@ -214,7 +211,7 @@ final class ARMv7CPU: CPU {
     /// masked, A is masked, and execution continues in ARM state at the
     /// IRQ (+0x18) or FIQ (+0x1C) vector.
     private func takeInterrupt(isFIQ: Bool) {
-        let savedCPSR = cpsr.rawValue
+        let savedCPSR = Self.cpsr(cpsr.rawValue, withITState: itState)
         let newModeBits = isFIQ ? Self.fiqModeBits : Self.irqModeBits
         let returnAddress = registers.pc
 
@@ -222,7 +219,8 @@ final class ARMv7CPU: CPU {
         setSavedProgramStatus(savedCPSR, forModeBits: newModeBits)
 
         registers.lr = returnAddress &+ 4
-        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask) | newModeBits
+        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask & ~Self.itBitsMask) | newModeBits
+        itState = 0
         cpsr.thumbState = false
         cpsr.irqDisabled = true
         cpsr.rawValue |= Self.asyncAbortDisabledBit
@@ -259,6 +257,24 @@ final class ARMv7CPU: CPU {
     /// machine, verified against real `it`/`itt`/`ittt` words from the
     /// actual kernel (ARM DDI 0406C A2.5.2).
     var itState: UInt8 = 0
+
+    /// `itState` as it was when the current instruction started, before
+    /// `stepThumb` advanced it. An exception this instruction raises must
+    /// save *this* in SPSR, since the instruction re-executes under it.
+    var currentInstructionITState: UInt8 = 0
+
+    /// CPSR's ITSTATE fields: IT[1:0] in bits [26:25], IT[7:2] in [15:10].
+    /// `itState` is the live copy; these bits only ever hold it inside an
+    /// SPSR, across an exception.
+    static let itBitsMask: UInt32 = 0b11 << 25 | 0x3F << 10
+
+    static func cpsr(_ raw: UInt32, withITState it: UInt8) -> UInt32 {
+        (raw & ~itBitsMask) | UInt32(it & 0b11) << 25 | UInt32(it >> 2) << 10
+    }
+
+    static func itState(fromCPSR raw: UInt32) -> UInt8 {
+        UInt8(truncatingIfNeeded: (raw >> 25) & 0b11 | ((raw >> 10) & 0x3F) << 2)
+    }
 
     /// Whether the Thumb instruction currently executing is the
     /// conditional target of an active `IT` block (as opposed to running
@@ -331,6 +347,7 @@ final class ARMv7CPU: CPU {
         // what makes `Registers.pcForOperandRead` (instruction address +
         // 8) fall out of `pc + 4` below. A taken branch overwrites this.
         registers.pc = instructionAddress &+ 4
+        currentInstructionITState = 0
 
         execute(ARMDecoder.decode(word), rawWord: word, instructionAddress: instructionAddress)
     }
@@ -463,7 +480,9 @@ final class ARMv7CPU: CPU {
 
     // MARK: - Execute
 
-    private func execute(_ instruction: ARMInstruction, rawWord: UInt32, instructionAddress: UInt32) {
+    /// Internal (not private) so Thumb's Advanced SIMD instructions, which
+    /// decode to their ARM-state form, run through this same executor.
+    func execute(_ instruction: ARMInstruction, rawWord: UInt32, instructionAddress: UInt32) {
         switch instruction {
         case .dataProcessing(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
@@ -564,6 +583,8 @@ final class ARMv7CPU: CPU {
 
         case .bitwiseExclusiveOr(let instr):
             executeBitwiseExclusiveOr(instr)
+        case .neonModifiedImmediate(let instr):
+            executeNEONModifiedImmediate(instr)
 
         case .bitwiseOr(let instr):
             executeBitwiseOr(instr)
@@ -583,9 +604,13 @@ final class ARMv7CPU: CPU {
         case .reverseElements(let instr):
             executeReverseElements(instr)
 
-        case .extensionRegisterLoadStoreMultiple(let instr):
+        case .extensionRegisterLoadStore(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
-            executeExtensionRegisterLoadStoreMultiple(instr)
+            executeExtensionRegisterLoadStore(instr)
+
+        case .vfpTwoRegisterTransfer(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeVFPTwoRegisterTransfer(instr)
 
         case .unsupported:
             lastError = .unsupportedInstruction(rawWord: rawWord, address: instructionAddress)
@@ -711,14 +736,18 @@ final class ARMv7CPU: CPU {
         guard case .translationFault(let virtualAddress, let reason, let isWrite) = error else { return false }
         guard mmuEnabled else { return false }
 
-        let savedCPSR = cpsr.rawValue
+        // The faulting instruction re-executes on return, so SPSR gets the
+        // IT state it started with (stepThumb has already advanced the
+        // live copy past it).
+        let savedCPSR = Self.cpsr(cpsr.rawValue, withITState: cpsr.thumbState ? currentInstructionITState : 0)
         let oldModeBits = savedCPSR & Self.modeBitsMask
 
         switchProcessorMode(from: oldModeBits, to: Self.abortModeBits)
         setSavedProgramStatus(savedCPSR, forModeBits: Self.abortModeBits)
 
         registers.lr = currentInstructionAddress &+ 8
-        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask) | Self.abortModeBits
+        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask & ~Self.itBitsMask) | Self.abortModeBits
+        itState = 0
         cpsr.thumbState = false
         cpsr.irqDisabled = true
 
@@ -922,6 +951,17 @@ final class ARMv7CPU: CPU {
                 }
             }
             neon[dd + lane] = result
+        }
+    }
+
+    private func executeNEONModifiedImmediate(_ instr: NEONModifiedImmediateInstruction) {
+        for d in instr.vd..<(instr.vd + (instr.isQuad ? 2 : 1)) {
+            switch instr.operation {
+            case .move: neon[d] = instr.imm64
+            case .moveNot: neon[d] = ~instr.imm64
+            case .orr: neon[d] |= instr.imm64
+            case .bic: neon[d] &= ~instr.imm64
+            }
         }
     }
 
@@ -1302,7 +1342,8 @@ final class ARMv7CPU: CPU {
 
         if instr.rd == Registers.pcIndex && !instr.op.isComparison {
             if isExceptionReturn, let savedCPSR = savedProgramStatus(forModeBits: modeBitsBeforeWrite) {
-                cpsr.rawValue = savedCPSR
+                cpsr.rawValue = savedCPSR & ~Self.itBitsMask
+                itState = Self.itState(fromCPSR: savedCPSR)
                 switchProcessorMode(from: modeBitsBeforeWrite, to: cpsr.rawValue & Self.modeBitsMask)
                 registers.pc = result
             } else {
@@ -1560,33 +1601,48 @@ final class ARMv7CPU: CPU {
         }
     }
 
-    /// `VSTM`/`VLDM`/`VPUSH`/`VPOP` (double-precision). Each `D` register
-    /// transfers as two little-endian words at consecutive addresses —
-    /// the same low-word-then-high-word convention `LDRD`/`STRD` and
-    /// `LDREXD`/`STREXD` already use for a 64-bit value split across two
-    /// 32-bit slots. Writeback is unconditional (see the instruction's
-    /// doc comment: this family is only ever decoded with `W` set).
-    private func executeExtensionRegisterLoadStoreMultiple(_ instr: ExtensionRegisterLoadStoreMultipleInstruction) {
-        let base = operandValue(for: instr.rn)
-        let transferSize = UInt32(instr.registerCount) * 8
-        let startAddress = instr.addOffset ? base : base &- transferSize
+    /// `Rn`'s value as an address base, where `Rn == PC` means the
+    /// word-aligned PC as the executing instruction set sees it — the
+    /// instruction's address + 8 in ARM state, + 4 in Thumb (a `VLDR`
+    /// literal decoded through its ARM form still runs in Thumb state).
+    private func addressBase(for rn: Int) -> UInt32 {
+        guard rn == Registers.pcIndex else { return registers[rn] }
+        return (currentInstructionAddress &+ (cpsr.thumbState ? 4 : 8)) & ~3
+    }
+
+    /// See `ExtensionRegisterLoadStoreInstruction`'s doc comment.
+    private func executeExtensionRegisterLoadStore(_ instr: ExtensionRegisterLoadStoreInstruction) {
+        let base = addressBase(for: instr.rn)
+        let span = UInt32(instr.wordCount) * 4
+        let startAddress: UInt32
+        switch instr.addressing {
+        case .offset(let offset, let add): startAddress = add ? base &+ offset : base &- offset
+        case .incrementAfter: startAddress = base
+        case .decrementBefore: startAddress = base &- span
+        }
 
         var address = startAddress
         do {
-            for offset in 0..<instr.registerCount {
-                let lowPhysicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
-                let highPhysicalAddress = try translatedAddress(address &+ 4, access: instr.isLoad ? .read : .write)
-                let register = instr.firstRegister + offset
-                if instr.isLoad {
-                    let low = try memory.readWord32(at: lowPhysicalAddress)
-                    let high = try memory.readWord32(at: highPhysicalAddress)
-                    neon[register] = UInt64(low) | (UInt64(high) << 32)
+            for index in instr.firstRegister..<(instr.firstRegister + instr.registerCount) {
+                let access: ARMv7MMU.Access = instr.isLoad ? .read : .write
+                let low = try translatedAddress(address, access: access)
+                if instr.isDouble {
+                    let high = try translatedAddress(address &+ 4, access: access)
+                    if instr.isLoad {
+                        neon[index] = UInt64(try memory.readWord32(at: low)) | UInt64(try memory.readWord32(at: high)) << 32
+                    } else {
+                        try memory.writeWord32(UInt32(truncatingIfNeeded: neon[index]), at: low)
+                        try memory.writeWord32(UInt32(truncatingIfNeeded: neon[index] >> 32), at: high)
+                    }
+                    address = address &+ 8
                 } else {
-                    let value = neon[register]
-                    try memory.writeWord32(UInt32(truncatingIfNeeded: value), at: lowPhysicalAddress)
-                    try memory.writeWord32(UInt32(truncatingIfNeeded: value >> 32), at: highPhysicalAddress)
+                    if instr.isLoad {
+                        neon.setSingle(index, try memory.readWord32(at: low))
+                    } else {
+                        try memory.writeWord32(neon.single(index), at: low)
+                    }
+                    address = address &+ 4
                 }
-                address = address &+ 8
             }
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -1596,6 +1652,30 @@ final class ARMv7CPU: CPU {
             return
         }
 
-        registers[instr.rn] = instr.addOffset ? base &+ transferSize : base &- transferSize
+        switch instr.addressing {
+        case .incrementAfter(writeback: true): registers[instr.rn] = base &+ span
+        case .decrementBefore: registers[instr.rn] = base &- span
+        default: break
+        }
+    }
+
+    /// See `VFPTwoRegisterTransferInstruction`'s doc comment.
+    private func executeVFPTwoRegisterTransfer(_ instr: VFPTwoRegisterTransferInstruction) {
+        if instr.isDouble {
+            if instr.toCore {
+                registers[instr.rt] = UInt32(truncatingIfNeeded: neon[instr.extensionRegister])
+                registers[instr.rt2] = UInt32(truncatingIfNeeded: neon[instr.extensionRegister] >> 32)
+            } else {
+                neon[instr.extensionRegister] = UInt64(registers[instr.rt]) | UInt64(registers[instr.rt2]) << 32
+            }
+        } else {
+            if instr.toCore {
+                registers[instr.rt] = neon.single(instr.extensionRegister)
+                registers[instr.rt2] = neon.single(instr.extensionRegister + 1)
+            } else {
+                neon.setSingle(instr.extensionRegister, registers[instr.rt])
+                neon.setSingle(instr.extensionRegister + 1, registers[instr.rt2])
+            }
+        }
     }
 }

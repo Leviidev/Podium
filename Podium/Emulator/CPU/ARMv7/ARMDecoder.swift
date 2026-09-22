@@ -404,38 +404,16 @@ enum ARMDecoder {
         return .unsupported(rawWord: word)
     }
 
-    /// `MCR`/`MRC` (coprocessor register transfer) — the one coprocessor
-    /// instruction shape decoded so far. Identified by bits[27:24]==1110
-    /// and bit4==1 (the same "1" that also distinguishes MCR/MRC from
-    /// CDP within this space); everything else in the coprocessor block
-    /// (CDP, LDC/STC, MCRR/MRRC) stays `.unsupported`.
+    /// The coprocessor space: VFP/NEON extension-register load/store for
+    /// coprocessors 10/11, and `MCR`/`MRC` (bits[27:24]==1110, bit4==1).
+    /// Everything else (CDP, generic LDC/STC, MCRR/MRRC) stays
+    /// `.unsupported`.
     private static func decodeCoprocessorBlock(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
-        // VSTM/VLDM/VPUSH/VPOP (double-precision extension registers):
-        // bits[27:25]==110 (fixed for this "extension register load/
-        // store" family, distinguishing it from MCR/MRC's bits[27:24]==
-        // 1110 below), bits[11:8]==0b1011 selects double-precision width
-        // (vs. 0b1010 for single, not decoded). W (bit21) distinguishes
-        // this "multiple" form from VSTR/VLDR's single-register form
-        // (which always has W==0) — see
-        // `ExtensionRegisterLoadStoreMultipleInstruction`'s doc comment.
-        if word.bitField(27, 25) == 0b110, word.bitField(11, 8) == 0b1011, word.bit(21) {
-            let p = word.bit(24)
-            let u = word.bit(23)
-            guard p != u else {
-                // P==U (both increment-after-without-writeback-shape or
-                // both decrement-before-without-U) isn't a valid VSTM/
-                // VLDM addressing mode.
-                return .unsupported(rawWord: word)
-            }
-            let d = word.bit(22) ? 1 << 4 : 0
-            return .extensionRegisterLoadStoreMultiple(ExtensionRegisterLoadStoreMultipleInstruction(
-                condition: condition,
-                isLoad: word.bit(20),
-                addOffset: u,
-                rn: Int(word.bitField(19, 16)),
-                firstRegister: d | Int(word.bitField(15, 12)),
-                registerCount: Int(word.bitField(7, 0)) / 2
-            ))
+        // Coprocessor 10/11 load/store (VLDR/VSTR/VLDM/VSTM/VPUSH/VPOP)
+        // and 64-bit core<->VFP transfers: bits[27:25]==110 with
+        // bits[11:9]==101.
+        if word.bitField(27, 25) == 0b110, word.bitField(11, 9) == 0b101 {
+            return decodeExtensionRegisterLoadStore(word, condition: condition)
         }
 
         guard word.bitField(27, 24) == 0b1110, word.bit(4) else {
@@ -521,6 +499,13 @@ enum ARMDecoder {
                 return .unsupported(rawWord: word)
             }
             return .memoryBarrier
+        }
+
+        // Advanced SIMD one register and a modified immediate — bits[21:19]
+        // == 000 is what separates it from the "two registers and a shift
+        // amount" group below, which shares every other fixed bit.
+        if word.bitField(31, 25) == 0b1111_001, word.bit(23), word.bitField(21, 19) == 0, !word.bit(7), word.bit(4) {
+            return decodeNEONModifiedImmediate(word)
         }
 
         // VRSHL (NEON "three registers of the same length" family,
@@ -723,5 +708,109 @@ enum ARMDecoder {
         }
 
         return .unsupported(rawWord: word)
+    }
+    /// See `NEONModifiedImmediateInstruction`. The operation comes from
+    /// (`op`, `cmode`) per ARM DDI 0406C Table A7-15.
+    private static func decodeNEONModifiedImmediate(_ word: UInt32) -> ARMInstruction {
+        let op = word.bit(5)
+        let cmode = word.bitField(11, 8)
+        let isQuad = word.bit(6)
+        let vd = Int((word.bit(22) ? 0b1_0000 : 0) | word.bitField(15, 12))
+        if isQuad && vd & 1 == 1 { return .undefined(rawWord: word) }
+        let imm8 = (word.bit(24) ? UInt32(0x80) : 0) | (word.bitField(18, 16) << 4) | word.bitField(3, 0)
+
+        let isOrrOrBicShape = cmode & 0b1001 == 0b0001 || cmode & 0b1101 == 0b1001
+        let operation: NEONModifiedImmediateInstruction.Operation
+        if !op {
+            operation = isOrrOrBicShape ? .orr : .move
+        } else if cmode == 0b1111 {
+            return .undefined(rawWord: word)
+        } else if cmode == 0b1110 {
+            operation = .move // VMOV.I64
+        } else {
+            operation = isOrrOrBicShape ? .bic : .moveNot
+        }
+
+        return .neonModifiedImmediate(NEONModifiedImmediateInstruction(
+            operation: operation, vd: vd, isQuad: isQuad, imm64: advancedSIMDExpandImmediate(op: op, cmode: cmode, imm8: imm8)
+        ))
+    }
+
+    /// `AdvSIMDExpandImm` (ARM DDI 0406C A7.4.6).
+    static func advancedSIMDExpandImmediate(op: Bool, cmode: UInt32, imm8: UInt32) -> UInt64 {
+        func replicate32(_ value: UInt32) -> UInt64 { UInt64(value) | UInt64(value) << 32 }
+        func replicate16(_ value: UInt32) -> UInt64 {
+            let v = UInt64(value & 0xFFFF)
+            return v | v << 16 | v << 32 | v << 48
+        }
+        switch cmode >> 1 {
+        case 0b000: return replicate32(imm8)
+        case 0b001: return replicate32(imm8 << 8)
+        case 0b010: return replicate32(imm8 << 16)
+        case 0b011: return replicate32(imm8 << 24)
+        case 0b100: return replicate16(imm8)
+        case 0b101: return replicate16(imm8 << 8)
+        case 0b110: return replicate32(cmode & 1 == 0 ? (imm8 << 8) | 0xFF : (imm8 << 16) | 0xFFFF)
+        default:
+            if cmode & 1 == 0 && !op {
+                return UInt64(imm8) * 0x0101_0101_0101_0101
+            }
+            if cmode & 1 == 0 {
+                var result: UInt64 = 0
+                for bit in 0..<8 where imm8 & (1 << bit) != 0 {
+                    result |= 0xFF << (UInt64(bit) * 8)
+                }
+                return result
+            }
+            // cmode 1111, op 0: single-precision float immediate.
+            let b6 = (imm8 >> 6) & 1
+            let imm32 = ((imm8 >> 7) & 1) << 31 | (b6 ^ 1) << 30 | (b6 == 1 ? 0b11111 : 0) << 25 | (imm8 & 0x3F) << 19
+            return replicate32(imm32)
+        }
+    }
+    /// See `ExtensionRegisterLoadStoreInstruction` and
+    /// `VFPTwoRegisterTransferInstruction`: the coprocessor 10/11 load/
+    /// store space, split by P/U/W (bits[24:23,21]) per ARM DDI 0406C
+    /// Table A7-17.
+    private static func decodeExtensionRegisterLoadStore(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
+        let p = word.bit(24), u = word.bit(23), d = word.bit(22), w = word.bit(21), l = word.bit(20)
+        let isDouble = word.bit(8)
+        let vd = Int(word.bitField(15, 12))
+        let rn = Int(word.bitField(19, 16))
+        let imm8 = Int(word.bitField(7, 0))
+        let firstRegister = isDouble ? (d ? 16 : 0) | vd : (vd << 1) | (d ? 1 : 0)
+
+        if !p && !u {
+            // 64-bit transfers live at P=0,U=0,D=1,W=0.
+            guard d, !w, word.bitField(7, 6) == 0, word.bit(4) else { return .undefined(rawWord: word) }
+            let m = word.bit(5)
+            let vm = Int(word.bitField(3, 0))
+            return .vfpTwoRegisterTransfer(VFPTwoRegisterTransferInstruction(
+                condition: condition, toCore: l, isDouble: isDouble,
+                rt: vd, rt2: rn, extensionRegister: isDouble ? (m ? 16 : 0) | vm : (vm << 1) | (m ? 1 : 0)
+            ))
+        }
+
+        let addressing: ExtensionRegisterLoadStoreInstruction.Addressing
+        var registerCount = isDouble ? imm8 / 2 : imm8
+        var wordCount = imm8
+        if p && !w {
+            addressing = .offset(UInt32(imm8) * 4, add: u)
+            registerCount = 1
+            wordCount = isDouble ? 2 : 1
+        } else if !p && u {
+            addressing = .incrementAfter(writeback: w)
+        } else if p && !u && w {
+            addressing = .decrementBefore
+        } else {
+            return .undefined(rawWord: word)
+        }
+        guard registerCount > 0, firstRegister + registerCount <= 32 else { return .unsupported(rawWord: word) }
+
+        return .extensionRegisterLoadStore(ExtensionRegisterLoadStoreInstruction(
+            condition: condition, isLoad: l, isDouble: isDouble, rn: rn,
+            firstRegister: firstRegister, registerCount: registerCount,
+            wordCount: wordCount, addressing: addressing
+        ))
     }
 }

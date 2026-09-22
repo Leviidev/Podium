@@ -129,6 +129,69 @@ enum DeviceTreePatcher {
         deviceTree.writeUInt32LE(size, at: location.valueOffset + 4)
     }
 
+    /// Fills `/chosen/nvram-proxy-data`, which iBoot populates with the
+    /// device's NVRAM contents on real hardware and which the kernel's
+    /// `IODTNVRAM` parses while the platform expert starts. The shipped
+    /// template has 8 KB of zeros there, which that parser can't survive:
+    /// it walks partitions by each 16-byte header's length field, and a
+    /// zero length never advances — the real kernel was found looping in
+    /// `initNVRAMImage` forever (profiled: `snprintf`/`OSNumber`/
+    /// `OSDictionary::setObject` under `IODTNVRAM::init` via
+    /// `IODTPlatformExpert::processTopLevel`). This writes a minimal image
+    /// in that same format — a `common` partition of `name=value`
+    /// variables, then a free (`wwwwwwwwwwww`) partition for the rest — at
+    /// the property's existing size, so nothing else in the tree moves.
+    static func patchNVRAMProxyData(_ deviceTree: inout Data, variables: [(name: String, value: String)] = defaultNVRAMVariables) {
+        guard let location = findProperties(in: deviceTree, path: ["chosen"], propertyNames: ["nvram-proxy-data"]).first,
+              location.currentLength >= 64, location.currentLength % 16 == 0 else { return }
+        let image = nvramImage(size: location.currentLength, variables: variables)
+        let start = deviceTree.startIndex + location.valueOffset
+        deviceTree.replaceSubrange(start..<start + location.currentLength, with: image)
+    }
+
+    static let defaultNVRAMVariables: [(name: String, value: String)] = [("auto-boot", "true")]
+
+    /// A CHRP-style NVRAM image as `IODTNVRAM::initNVRAMImage` reads it:
+    /// 16-byte partition headers (signature, checksum, length in 16-byte
+    /// units as a native little-endian `UInt16`, 12-byte name).
+    static func nvramImage(size: Int, variables: [(name: String, value: String)]) -> Data {
+        var image = Data(count: size)
+        let commonLength = size / 2
+
+        func writeHeader(at offset: Int, signature: UInt8, length: Int, name: String) {
+            image[offset] = signature
+            image[offset + 1] = 0
+            image[offset + 2] = UInt8(truncatingIfNeeded: length / 16)
+            image[offset + 3] = UInt8(truncatingIfNeeded: (length / 16) >> 8)
+            for (index, byte) in name.utf8.prefix(12).enumerated() {
+                image[offset + 4 + index] = byte
+            }
+            image[offset + 1] = partitionChecksum(image[offset..<offset + 16])
+        }
+
+        writeHeader(at: 0, signature: 0x70, length: commonLength, name: "common")
+        var cursor = 16
+        for (name, value) in variables {
+            let entry = Array("\(name)=\(value)".utf8) + [0]
+            guard cursor + entry.count < commonLength else { break }
+            image.replaceSubrange(cursor..<cursor + entry.count, with: entry)
+            cursor += entry.count
+        }
+        writeHeader(at: commonLength, signature: 0x7F, length: size - commonLength, name: "wwwwwwwwwwww")
+        return image
+    }
+
+    /// `IODTNVRAM::calculatePartitionChecksum`: an 8-bit add-with-carry
+    /// over the 16 header bytes, computed with the checksum byte zeroed.
+    static func partitionChecksum(_ header: Data) -> UInt8 {
+        var sum: UInt8 = 0
+        for byte in header {
+            let (partial, overflow) = sum.addingReportingOverflow(byte)
+            sum = overflow ? partial &+ 1 : partial
+        }
+        return sum
+    }
+
     /// Read-only walk collecting every requested property's location
     /// within the target node — nothing here mutates `data`, so the
     /// offsets it returns are all still valid relative to each other

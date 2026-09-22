@@ -302,8 +302,8 @@ enum ThumbDecoder {
             // `TBB`/`TBH`/`LDRD`/`STRD`, which share its space — see
             // `decode32LoadStoreMultiple`'s doc comment), `01`
             // data-processing (shifted register), `10` VFP/NEON
-            // extension-register load/store multiple (see
-            // `decode32VectorLoadStoreMultiple`'s doc comment), `11`
+            // extension-register load/store (decoded in ARM form — see
+            // `ThumbAdvancedSIMDInstruction`), `11`
             // coprocessor (bits[11:8] fixed at 0b1110 with hw1 bit[4] set
             // for MCR/MRC specifically, or 0b1111 for NEON/VFP
             // data-processing — see `decode32SIMDDataProcessing`'s doc
@@ -315,13 +315,19 @@ enum ThumbDecoder {
             case 0b01:
                 return decode32DataProcessingShiftedRegister(hw0, hw1)
             case 0b10:
-                return decode32VectorLoadStoreMultiple(hw0, hw1)
+                // Thumb-2 coprocessor encodings are the ARM encodings with
+                // cond == 1110 (AL), bit for bit — so coprocessor 10/11
+                // (VFP/NEON) load/store goes through `ARMDecoder` too.
+                if hw1.bitField16(11, 9) == 0b101 {
+                    return decode32AdvancedSIMD(armForm: UInt32(hw0) << 16 | UInt32(hw1), hw0, hw1)
+                }
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             case 0b11:
                 if hw0.bitField16(11, 8) == 0b1110, hw1.bit16(4) {
                     return decode32Coprocessor(hw0, hw1)
                 }
                 if hw0.bitField16(11, 8) == 0b1111 {
-                    return decode32SIMDDataProcessing(hw0, hw1)
+                    return decode32AdvancedSIMD(armForm: advancedSIMDDataProcessingARMForm(hw0, hw1), hw0, hw1)
                 }
                 return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             default:
@@ -340,10 +346,26 @@ enum ThumbDecoder {
             // `decode32ExtendOrShift`'s doc comment), `11` long
             // multiply/multiply-accumulate/divide (`0xFB` prefix, of
             // which only `UMULL`'s exact bits[7:4] pattern is decoded).
+            // bit[10] set (`0xFC`-`0xFF`) is a different space entirely:
+            // `0xFF` is Advanced SIMD data-processing with U=1, and the
+            // rest are coprocessor instructions. Switching on bits[9:8]
+            // alone would alias them onto `0xF8`-`0xFB`.
+            if hw0.bit16(10) {
+                if hw0.bitField16(9, 8) == 0b11 {
+                    return decode32AdvancedSIMD(armForm: advancedSIMDDataProcessingARMForm(hw0, hw1), hw0, hw1)
+                }
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+            }
             switch hw0.bitField16(9, 8) {
             case 0b00:
                 return decode32LoadStoreSingle(hw0, hw1)
             case 0b01:
+                // `0xF9` with bit[4] clear has no load/store meaning (there
+                // are no signed stores): it's Advanced SIMD element/structure
+                // load/store, ARM form `1111 0100 xxx0`.
+                if !hw0.bit16(4) {
+                    return decode32AdvancedSIMD(armForm: 0xF400_0000 | UInt32(hw0 & 0xFF) << 16 | UInt32(hw1), hw0, hw1)
+                }
                 return decode32LoadStoreSignedByte(hw0, hw1)
             case 0b10:
                 return decode32ExtendOrShift(hw0, hw1)
@@ -377,65 +399,19 @@ enum ThumbDecoder {
         ))
     }
 
-    /// `VSTMIA`/`VLDMIA` (double-precision `D`-register list,
-    /// increment-after only) — see
-    /// `ThumbVectorLoadStoreMultipleInstruction`'s doc comment. Field
-    /// layout, verified bit-by-bit against a real
-    /// `vstmia r2, {d16, d17}` word from the actual kernel: `Rn` is
-    /// `hw0` bits[3:0]; `L` (load vs store) is `hw0` bit[4]; `W`
-    /// (writeback) is `hw0` bit[5]; `D` (register number's top bit) is
-    /// `hw0` bit[6]; `Vd` is `D:hw1.bitField16(15, 12)`; the register
-    /// count is `imm8 / 2` where `imm8` is `hw1.bitField16(7, 0)` (real
-    /// hardware requires `imm8` even here — an odd value is
-    /// unpredictable, so this rejects it rather than guessing). The
-    /// remaining bits (`hw0` bits[9:7], `hw1` bits[11:8] == `0b1011`,
-    /// the fixed "double-precision VFP/NEON coprocessor" pattern that
-    /// also distinguishes this from the generic `STC`/`LDC` coprocessor
-    /// space and from the single-precision `S`-register list form) are
-    /// required to match this one confirmed shape exactly.
-    private static func decode32VectorLoadStoreMultiple(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard !hw0.bit16(9), !hw0.bit16(8), hw0.bit16(7),
-              hw1.bitField16(11, 8) == 0b1011
-        else {
-            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+    /// See `ThumbAdvancedSIMDInstruction`'s doc comment.
+    private static func decode32AdvancedSIMD(armForm word: UInt32, _ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
+        let decoded = ARMDecoder.decode(word)
+        switch decoded {
+        case .unsupported: return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        case .undefined: return .undefined(rawHalfword: hw0, secondHalfword: hw1)
+        default: return .advancedSIMD(ThumbAdvancedSIMDInstruction(armFormWord: word, instruction: decoded))
         }
-        let imm8 = hw1.bitField16(7, 0)
-        guard imm8 != 0, imm8 & 1 == 0 else {
-            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
-        }
-        let vd = Int((hw0.bit16(6) ? 0b1_0000 : 0) | hw1.bitField16(15, 12))
-        return .vectorLoadStoreMultiple(ThumbVectorLoadStoreMultipleInstruction(
-            isLoad: hw0.bit16(4), writeback: hw0.bit16(5), rn: Int(hw0.bitField16(3, 0)),
-            vd: vd, registerCount: Int(imm8) / 2
-        ))
     }
 
-    /// NEON/VFP data-processing — only `VMOV.I32 Qd, #imm8` (see
-    /// `ThumbVectorMoveImmediateInstruction`'s doc comment) is decoded,
-    /// verified bit-by-bit against a real `vmov.i32 q8, #0` word from the
-    /// actual kernel by flipping individual bits and observing how a
-    /// disassembler's output changed (the same technique used for
-    /// `ARMDecoder`'s `VRSHL`). Field layout: `i` (bit12 of `hw0`, the
-    /// immediate's bit 7) : `imm3` (bits[2:0] of `hw0`, bits[6:4]) :
-    /// `imm4` (bits[3:0] of `hw1`, bits[3:0]); `Qd` is `D:Vd(3)` — `D`
-    /// (bit6 of `hw0`) as the register number's top bit, `Vd(3)`
-    /// (bits[15:13] of `hw1`) as the rest, matching the `Q`-register
-    /// aliasing of `D`-register pairs. The other bits checked here (op,
-    /// `Q`, and the remaining `cmode` bits) pin this to exactly that one
-    /// confirmed shape — every other `cmode`/`op` combination (8/16/64-
-    /// bit element sizes, shifted variants, `VMVN`, the single-`D`-
-    /// register form) isn't decoded, since no real word has confirmed
-    /// them.
-    private static func decode32SIMDDataProcessing(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard hw0.bitField16(5, 3) == 0,
-              hw1.bit16(4), !hw1.bit16(5), hw1.bit16(6), !hw1.bit16(7),
-              hw1.bitField16(12, 8) == 0
-        else {
-            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
-        }
-        let qd = Int((hw0.bit16(6) ? 0b1000 : 0) | hw1.bitField16(15, 13))
-        let imm8 = (hw0.bit16(12) ? UInt32(0x80) : 0) | (UInt32(hw0.bitField16(2, 0)) << 4) | UInt32(hw1.bitField16(3, 0))
-        return .vectorMoveImmediate(ThumbVectorMoveImmediateInstruction(qd: qd, imm8: imm8))
+    /// Thumb `111U 1111 xxxxxxxx` -> ARM `1111 001U xxxxxxxx`.
+    private static func advancedSIMDDataProcessingARMForm(_ hw0: UInt16, _ hw1: UInt16) -> UInt32 {
+        0xF200_0000 | (hw0.bit16(12) ? 1 << 24 : 0) | UInt32(hw0 & 0xFF) << 16 | UInt32(hw1)
     }
 
     /// Data-processing (shifted register) — verified against a real
@@ -569,6 +545,14 @@ enum ThumbDecoder {
         let isLoad = hw0.bit16(4)
         let rn = Int(hw0.bitField16(3, 0))
         let rt = Int(hw1.bitField16(15, 12))
+        // Byte/halfword loads into PC are the preload hints (PLD and the
+        // unallocated memory hints) — no-ops here, never a load into PC.
+        if isLoad, rt == Registers.pcIndex, isByte || isHalfword {
+            return .memoryBarrier
+        }
+        if rn == Registers.pcIndex {
+            return decode32LoadLiteral(hw0, hw1, isLoad: isLoad, isByte: isByte, isHalfword: isHalfword, isSigned: false)
+        }
         if hw0.bit16(7) {
             // T3: 12-bit unsigned immediate, always add, never writeback.
             return .loadStoreWide(ThumbLoadStoreWideInstruction(
@@ -596,6 +580,23 @@ enum ThumbDecoder {
         ))
     }
 
+    /// Thumb-2 `LDR`/`LDRB`/`LDRH`/`LDRSB`/`LDRSH` (literal): with `Rn ==
+    /// PC`, hw0 bit[7] is the U (add/subtract) bit and the offset is always
+    /// a 12-bit immediate from `Align(PC, 4)` — not the T3/T4 split used
+    /// for every other base register, where bit[7] picks the form. Reading
+    /// it as T3/T4 once rejected (or worse, misread as T4 with P/U/W taken
+    /// from the immediate) real negative-offset literal loads like
+    /// `ldr.w r2, [pc, #-0x178]`. Stores to a literal address don't exist.
+    private static func decode32LoadLiteral(_ hw0: UInt16, _ hw1: UInt16, isLoad: Bool, isByte: Bool, isHalfword: Bool, isSigned: Bool) -> ThumbInstruction {
+        guard isLoad else { return .undefined(rawHalfword: hw0, secondHalfword: hw1) }
+        return .loadStoreWide(ThumbLoadStoreWideInstruction(
+            isLoad: true, isByte: isByte, isHalfword: isHalfword, isSigned: isSigned,
+            rn: Registers.pcIndex, rt: Int(hw1.bitField16(15, 12)),
+            preIndexed: true, addOffset: hw0.bit16(7), writeback: false,
+            offset: UInt32(hw1.bitField16(11, 0))
+        ))
+    }
+
     /// `LDRSB`/`LDRSH` (immediate) — the sign-extending siblings of the
     /// T3/T4 forms above, sharing their exact hw1 (Rt/P/U/W/imm) layout
     /// and the same bit[7] T3-vs-T4 selector role, but with a different
@@ -618,6 +619,13 @@ enum ThumbDecoder {
         }
         let rn = Int(hw0.bitField16(3, 0))
         let rt = Int(hw1.bitField16(15, 12))
+        // Signed byte/halfword "loads" into PC are the PLI/memory hints.
+        if rt == Registers.pcIndex {
+            return .memoryBarrier
+        }
+        if rn == Registers.pcIndex {
+            return decode32LoadLiteral(hw0, hw1, isLoad: true, isByte: !isHalfword, isHalfword: isHalfword, isSigned: true)
+        }
         if hw0.bit16(7) {
             return .loadStoreWide(ThumbLoadStoreWideInstruction(
                 isLoad: true, isByte: !isHalfword, isHalfword: isHalfword, isSigned: true, rn: rn, rt: rt,
@@ -879,8 +887,10 @@ enum ThumbDecoder {
             let imm3 = hw1.bitField16(14, 12)
             let imm8 = hw1.bitField16(7, 0)
             let imm32 = expandModifiedImmediate(i: i, imm3: UInt32(imm3), imm8: UInt32(imm8))
+            let isRotated = (i << 1) | UInt32(imm3 >> 2) != 0
             return .dataProcessingImmediate(ThumbDataProcessingImmediateInstruction(
-                op: op, setFlags: hw0.bit16(4), rn: Int(hw0.bitField16(3, 0)), rd: Int(hw1.bitField16(11, 8)), imm32: imm32
+                op: op, setFlags: hw0.bit16(4), rn: Int(hw0.bitField16(3, 0)), rd: Int(hw1.bitField16(11, 8)), imm32: imm32,
+                immediateCarryOut: isRotated ? imm32.bit(31) : nil
             ))
         }
 

@@ -156,4 +156,34 @@ final class DeviceTreePatcherTests: XCTestCase {
         XCTAssertEqual(tree.readUInt32LE(at: valueOffset), 0x8100_0000)
         XCTAssertEqual(tree.readUInt32LE(at: valueOffset + 4), 0x1000)
     }
+
+    /// Walks the generated image the way the kernel's
+    /// `IODTNVRAM::initNVRAMImage` does (advance by each header's length,
+    /// in 16-byte units) — it must terminate, find `common` first and the
+    /// free partition after it, with valid header checksums. An all-zero
+    /// image (the shipped template) never advances.
+    func testNVRAMImageParsesLikeIODTNVRAM() {
+        let size = 0x2000
+        let image = DeviceTreePatcher.nvramImage(size: size, variables: [("auto-boot", "true"), ("boot-args", "debug=0x8")])
+        var offset = 0
+        var names: [String] = []
+        var steps = 0
+        while offset < size {
+            steps += 1
+            XCTAssertLessThan(steps, 16, "partition walk must terminate")
+            if steps >= 16 { break }
+            let units = Int(image[offset + 2]) | Int(image[offset + 3]) << 8
+            XCTAssertGreaterThan(units, 0)
+            var header = image[offset..<offset + 16]
+            let storedChecksum = header[header.startIndex + 1]
+            header[header.startIndex + 1] = 0
+            XCTAssertEqual(DeviceTreePatcher.partitionChecksum(header), storedChecksum)
+            names.append(String(decoding: image[offset + 4..<offset + 16].prefix(while: { $0 != 0 }), as: UTF8.self))
+            offset += units * 16
+        }
+        XCTAssertEqual(offset, size)
+        XCTAssertEqual(names, ["common", "wwwwwwwwwwww"])
+        let common = String(decoding: image[16..<64], as: UTF8.self)
+        XCTAssertTrue(common.hasPrefix("auto-boot=true\0boot-args=debug=0x8\0"))
+    }
 }

@@ -544,33 +544,39 @@ final class ThumbDecoderTests: XCTestCase {
     }
 
     func testDecodesVmovI32QRegisterImmediateFromRealKernel() {
-        // vmov.i32 q8, #0 — from the real kernel at 0x802b7c4e.
-        guard case .vectorMoveImmediate(let instr) = ThumbDecoder.decode(0xefc0, 0x0050) else {
-            return XCTFail("Expected vectorMoveImmediate")
+        // vmov.i32 q8, #0 — from the real kernel at 0x802b7c4e, decoded
+        // through its ARM form (see ThumbAdvancedSIMDInstruction).
+        guard case .advancedSIMD(let simd) = ThumbDecoder.decode(0xefc0, 0x0050),
+              case .neonModifiedImmediate(let instr) = simd.instruction else {
+            return XCTFail("Expected an Advanced SIMD modified-immediate instruction")
         }
-        XCTAssertEqual(instr.qd, 8)
-        XCTAssertEqual(instr.imm8, 0)
+        XCTAssertEqual(simd.armFormWord, 0xF2C0_0050)
+        XCTAssertEqual(instr.operation, .move)
+        XCTAssertEqual(instr.vd, 16)
+        XCTAssertTrue(instr.isQuad)
+        XCTAssertEqual(instr.imm64, 0)
     }
 
     func testDecodesVmovI32QRegisterImmediateNonzeroFromRealKernel() {
-        // Same real word with hw1 bit0 flipped (0x0051): vmov.i32 q8, #1 —
-        // confirms the imm8/Qd field extraction beyond the all-zero case.
-        guard case .vectorMoveImmediate(let instr) = ThumbDecoder.decode(0xefc0, 0x0051) else {
-            return XCTFail("Expected vectorMoveImmediate")
+        // Same real word with hw1 bit0 flipped (0x0051): vmov.i32 q8, #1.
+        guard case .advancedSIMD(let simd) = ThumbDecoder.decode(0xefc0, 0x0051),
+              case .neonModifiedImmediate(let instr) = simd.instruction else {
+            return XCTFail("Expected an Advanced SIMD modified-immediate instruction")
         }
-        XCTAssertEqual(instr.qd, 8)
-        XCTAssertEqual(instr.imm8, 1)
+        XCTAssertEqual(instr.vd, 16)
+        XCTAssertEqual(instr.imm64, 0x0000_0001_0000_0001)
     }
 
     func testDecodesVstmiaDoubleRegisterListFromRealKernel() {
         // vstmia r2, {d16, d17} — from the real kernel at 0x802b7c6e.
-        guard case .vectorLoadStoreMultiple(let instr) = ThumbDecoder.decode(0xecc2, 0x0b04) else {
-            return XCTFail("Expected vectorLoadStoreMultiple")
+        guard case .advancedSIMD(let simd) = ThumbDecoder.decode(0xecc2, 0x0b04),
+              case .extensionRegisterLoadStore(let instr) = simd.instruction else {
+            return XCTFail("Expected extensionRegisterLoadStore")
         }
         XCTAssertFalse(instr.isLoad)
-        XCTAssertFalse(instr.writeback)
+        XCTAssertEqual(instr.addressing, .incrementAfter(writeback: false))
         XCTAssertEqual(instr.rn, 2)
-        XCTAssertEqual(instr.vd, 16)
+        XCTAssertEqual(instr.firstRegister, 16)
         XCTAssertEqual(instr.registerCount, 2)
     }
 
