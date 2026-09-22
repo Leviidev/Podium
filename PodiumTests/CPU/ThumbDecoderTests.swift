@@ -182,6 +182,17 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rotate, 0)
     }
 
+    func testDecodesUxthWideFromRealKernel() {
+        // uxth.w r8, fp — from the real kernel at 0x802227f8.
+        guard case .extendWide(let instr) = ThumbDecoder.decode(0xfa1f, 0xf88b) else {
+            return XCTFail("Expected extendWide")
+        }
+        XCTAssertEqual(instr.kind, .unsignedHalfword)
+        XCTAssertEqual(instr.rd, 8)
+        XCTAssertEqual(instr.rm, 11)
+        XCTAssertEqual(instr.rotate, 0)
+    }
+
     func testDecodesDsbFromRealKernel() {
         // dsb sy — from the real kernel at 0x8007b106.
         guard case .memoryBarrier = ThumbDecoder.decode(0xf3bf, 0x8f4f) else {
@@ -631,6 +642,24 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertTrue(instr.addOffset)
         XCTAssertTrue(instr.writeback)
         XCTAssertEqual(instr.offset, 1)
+    }
+
+    func testDecodesLdrshWideFromRealKernel() {
+        // ldrsh.w r2, [r6] — from the real kernel at 0x80233400. Traced
+        // back from a real early-boot kernel halt.
+        guard case .loadStoreWide(let instr) = ThumbDecoder.decode(0xf9b6, 0x2000) else {
+            return XCTFail("Expected loadStoreWide")
+        }
+        XCTAssertTrue(instr.isLoad)
+        XCTAssertFalse(instr.isByte)
+        XCTAssertTrue(instr.isHalfword)
+        XCTAssertTrue(instr.isSigned)
+        XCTAssertEqual(instr.rn, 6)
+        XCTAssertEqual(instr.rt, 2)
+        XCTAssertTrue(instr.preIndexed)
+        XCTAssertTrue(instr.addOffset)
+        XCTAssertFalse(instr.writeback)
+        XCTAssertEqual(instr.offset, 0)
     }
 
     func testDecodesSubsImmediate3FromRealKernel() {

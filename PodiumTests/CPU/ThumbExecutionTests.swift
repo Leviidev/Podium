@@ -513,6 +513,40 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 0x2211_4433)
     }
 
+    /// Traced back from a real, otherwise-inexplicable kernel data abort
+    /// during IOKit startup (a kernel that had, by then, already run
+    /// correctly for 18M+ instructions past every other fix this
+    /// session): `ldr.w r8, [pc, #0x158]` sitting at a 2-byte-aligned
+    /// (not 4-byte-aligned) address read 2 bytes into its literal pool
+    /// instead of at the start, loading the wrong 32-bit constant, which
+    /// then flowed into a PC-relative address computation and produced a
+    /// garbage pointer that crashed `strncmp`. The other `loadStoreWide`
+    /// tests in this file don't catch this because they all place the
+    /// instruction at address 0 (4-byte aligned already, where the buggy
+    /// and correct formulas happen to agree) — same class of gap
+    /// `testTbbAtUnalignedAddressReadsTableRightAfterInstructionRealKernelWord`
+    /// already covers for `TBB`.
+    func testLdrPcRelativeWideAtUnalignedAddressRealKernelWord() {
+        let memory = FlatPhysicalMemory(length: 0x200)
+        try! memory.writeWord16(0xf8df, at: 2) // ldr.w r8, [pc, #0x158] — real word from the actual kernel, at 0x8023083e
+        try! memory.writeWord16(0x8158, at: 4) // second halfword of the same instruction
+        // Correct literal address: Align(2+4,4) + 0x158 == 4 + 0x158 == 0x15c.
+        // The pre-fix bug would instead read from the unaligned (2+4) +
+        // 0x158 == 0x15e, landing 2 bytes into this word plus 2 bytes of
+        // whatever follows it — never equal to the correct value below.
+        try! memory.writeWord32(0xC0FF_EE00, at: 0x15c)
+
+        let cpu = ARMv7CPU(memory: memory)
+        cpu.reset()
+        cpu.cpsr.thumbState = true
+        cpu.registers.pc = 2
+
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[8], 0xC0FF_EE00)
+    }
+
     func testStrhWRegisterOffsetRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xf821, 0x2023, // strh.w r2, [r1, r3, lsl #2], real word from the actual kernel
@@ -549,6 +583,18 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[0], 0xFFFF_FFFF)
         XCTAssertEqual(cpu.registers[5], 11) // pre-indexed with writeback.
+    }
+
+    func testLdrshWideSignExtendsNegativeHalfwordRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xf9b6, 0x2000, // ldrsh.w r2, [r6], real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[6] = 10
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord16(0xFFFE, at: 10) // -2 as a signed halfword.
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[2], 0xFFFF_FFFE)
     }
 
     func testLdrhWideLoadsHalfwordRealKernelWord() {
@@ -813,6 +859,17 @@ final class ThumbExecutionTests: XCTestCase {
 
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[1], 0xDD)
+    }
+
+    func testUxthWideZeroExtendsHighRegisterRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xfa1f, 0xf88b, // uxth.w r8, fp, real word from the actual kernel
+        ])
+        cpu.registers[11] = 0xAABB_CCDD
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[8], 0xCCDD)
     }
 
     func testDsbIsANoOpRealKernelWord() {

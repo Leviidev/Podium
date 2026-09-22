@@ -161,7 +161,7 @@ extension ARMv7CPU {
         case .branchLink(let instr):
             executeThumbBranchLink(instr, instructionAddress: instructionAddress)
         case .loadStoreWide(let instr):
-            executeThumbLoadStoreWide(instr)
+            executeThumbLoadStoreWide(instr, instructionAddress: instructionAddress)
         case .loadStoreRegister(let instr):
             executeThumbLoadStoreRegister(instr)
         case .blockDataTransfer(let instr):
@@ -936,8 +936,21 @@ extension ARMv7CPU {
 
     // MARK: - Thumb-2: LDR/STR (immediate, T3/T4)
 
-    private func executeThumbLoadStoreWide(_ instr: ThumbLoadStoreWideInstruction) {
-        let base = registers[instr.rn]
+    /// `Rn == PC` (the literal-load form, e.g. `LDR.W Rt, [PC, #imm12]`)
+    /// reads PC through the usual Thumb "PC as operand" rule —
+    /// `Align(instructionAddress+4, 4)`, the same alignment `TBB`/`TBH`
+    /// and every other PC-relative computation in this file applies —
+    /// not the raw, possibly-unaligned `registers.pc` (which by this
+    /// point already holds `instructionAddress+4` unaligned, since
+    /// `stepThumb()` advances it before dispatching). Traced back from a
+    /// real, otherwise-unexplained kernel data abort during IOKit
+    /// startup: a `ldr.w r8, [pc, #0x158]` at an address that wasn't
+    /// 4-byte aligned read 2 bytes into the literal pool instead of at
+    /// its start, silently loading the wrong 32-bit constant.
+    private func executeThumbLoadStoreWide(_ instr: ThumbLoadStoreWideInstruction, instructionAddress: UInt32) {
+        let base = instr.rn == Registers.pcIndex
+            ? (instructionAddress &+ 4) & ~UInt32(0b11)
+            : registers[instr.rn]
         let offsetAddress = instr.addOffset ? base &+ instr.offset : base &- instr.offset
         let transferAddress = instr.preIndexed ? offsetAddress : base
 
@@ -953,7 +966,9 @@ extension ARMv7CPU {
                     value = try memory.readWord32(at: physicalAddress)
                 }
                 if instr.isSigned {
-                    value = UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: value))))
+                    value = instr.isHalfword
+                        ? UInt32(bitPattern: Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: value))))
+                        : UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: value))))
                 }
                 if instr.rt == Registers.pcIndex {
                     cpsr.thumbState = value.bit(0)
