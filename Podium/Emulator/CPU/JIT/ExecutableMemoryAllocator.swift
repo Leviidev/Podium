@@ -16,8 +16,8 @@ enum ExecutableMemoryError: Error {
 }
 
 /// Allocates RWX memory the W^X-safe way Apple Silicon requires: pages
-/// mapped with `MAP_JIT`, toggled between writable and executable around
-/// each write rather than ever being both at once.
+/// toggled between writable and executable around each write rather than
+/// ever being both at once.
 ///
 /// Apple's per-thread toggle for this (`pthread_jit_write_protect_np`)
 /// is explicitly unavailable on iOS — the SDK marks it
@@ -35,13 +35,26 @@ enum ExecutableMemoryError: Error {
 /// the underlying dynamic-codesigning right (an entitlement, or a
 /// debugger attached) — see `JITEngine`'s doc comment for what that
 /// means in practice for this app.
+///
+/// Deliberately does *not* pass `MAP_JIT`: that flag puts a page under
+/// the `pthread_jit_write_protect_np` toggle model this file can't use
+/// on iOS (see above) — a `MAP_JIT` page's protection is expected to be
+/// flipped through that per-thread API, not through ordinary
+/// `mprotect()` calls like the ones `write()` below makes. Combining the
+/// two silently breaks the *write* step (confirmed empirically: `mmap`
+/// with `MAP_JIT` succeeds, but the following `mprotect()` call in
+/// `write()` then fails with `writeProtectionUnavailable`, even locally
+/// on macOS with no codesigning restriction in play at all — the
+/// combination itself is the problem, not any entitlement). A plain
+/// anonymous mapping is exactly what the ordinary-`mprotect()` toggle
+/// model expects, and round-trips correctly end to end.
 enum ExecutableMemoryAllocator {
     static func allocate(byteCount: Int) throws -> UnsafeMutableRawPointer {
         let pointer = mmap(
             nil,
             roundedUpToPageSize(byteCount),
-            PROT_READ | PROT_WRITE | PROT_EXEC,
-            MAP_PRIVATE | MAP_ANON | MAP_JIT,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANON,
             -1,
             0
         )

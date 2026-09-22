@@ -62,6 +62,13 @@ final class JITEngine {
         return compiled
     }
 
+    /// Reads directly through `memory` (physical addresses), not through
+    /// the CPU's MMU translation — `JITEngine` only has a `MemoryBus`,
+    /// not the CPU's CP15/MMU state needed to translate. Only safe while
+    /// `pc` is identity-mapped (virtBase==physBase), which holds for this
+    /// kernel's early boot; a future caller running after the guest
+    /// enables a non-identity mapping would need this reworked to route
+    /// through the CPU's own translation instead.
     private func discoverEligibleRun(startingAt address: UInt32, memory: MemoryBus) -> [DataProcessingInstruction] {
         var instructions: [DataProcessingInstruction] = []
         var cursor = address

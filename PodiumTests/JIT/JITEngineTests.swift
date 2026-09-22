@@ -10,7 +10,7 @@ final class JITEngineTests: XCTestCase {
 
         let engine = JITEngine()
         guard let block = engine.block(at: 0, memory: memory) else {
-            throw XCTSkip("Executable memory (MAP_JIT) isn't available in this test environment.")
+            throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
 
         XCTAssertEqual(block.instructionCount, 2)
@@ -39,7 +39,7 @@ final class JITEngineTests: XCTestCase {
 
         let engine = JITEngine()
         guard let block = engine.block(at: 0, memory: memory) else {
-            throw XCTSkip("Executable memory (MAP_JIT) isn't available in this test environment.")
+            throw XCTSkip("Executable memory (mprotect PROT_EXEC) isn't available in this test environment.")
         }
         XCTAssertEqual(block.instructionCount, 1, "The flag-setting SUBS must not be swept into the compiled block")
     }

@@ -259,7 +259,23 @@ final class ARMv7CPU: CPU {
     }
 
     private func runOneUnit() {
-        if let jit, let block = jit.block(at: registers.pc, memory: memory) {
+        // `JITEngine`/`JITTranslator` only ever decode/compile ARM-state
+        // `DataProcessingInstruction`s — `discoverEligibleRun` calls
+        // `ARMDecoder.decode`, the ARM-state decoder, unconditionally.
+        // Without this Thumb-state guard, whenever the CPU is actually in
+        // Thumb state (the overwhelming majority of this kernel's real
+        // code), the JIT would misinterpret the raw 4 bytes at `pc` as an
+        // ARM-state word and — if they happened to decode as an eligible
+        // sequence — compile and execute completely different, wrong
+        // logic than the real Thumb instructions there. Before the
+        // `ExecutableMemoryAllocator` fix (see its own doc comment), this
+        // was latent rather than live: allocation always failed on the
+        // first attempt and disabled the JIT for the rest of the run, so
+        // `jit.block` always returned `nil` and every instruction, Thumb
+        // or ARM, went through the (correct) interpreter regardless of
+        // this gap. Now that allocation actually succeeds, this check is
+        // load-bearing.
+        if !cpsr.thumbState, let jit, let block = jit.block(at: registers.pc, memory: memory) {
             registers.withUnsafeMutableStorage { block.run(registers: $0) }
             registers.pc = registers.pc &+ UInt32(4 * block.instructionCount)
         } else {
