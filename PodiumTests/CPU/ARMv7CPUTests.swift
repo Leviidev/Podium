@@ -765,6 +765,36 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[0], 0xC0FF_EE00)
     }
 
+    func testLdrexdLoadsDoublewordRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE1B2_4F9F, // ldrexd r4, r5, [r2] -- real word from the actual kernel
+        ])
+        cpu.registers[2] = 100
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord32(0x1111_1111, at: 100) // low word -> r4
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord32(0x2222_2222, at: 104) // high word -> r5
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[4], 0x1111_1111)
+        XCTAssertEqual(cpu.registers[5], 0x2222_2222)
+    }
+
+    func testStrexdStoresDoublewordAndSignalsSuccessRealKernelWord() {
+        let cpu = makeCPU(program: [
+            0xE1A2_3F98, // strexd r3, r8, sb, [r2] -- real word from the actual kernel
+        ])
+        cpu.registers[2] = 100
+        cpu.registers[8] = 0x1111_1111
+        cpu.registers[9] = 0x2222_2222
+        cpu.registers[3] = 0xFFFF_FFFF // Poison, to prove it gets overwritten with 0.
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[3], 0) // Always succeeds — see StoreExclusiveDoubleInstruction's doc comment.
+        XCTAssertEqual(try! (cpu.memory as! FlatPhysicalMemory).readWord32(at: 100), 0x1111_1111)
+        XCTAssertEqual(try! (cpu.memory as! FlatPhysicalMemory).readWord32(at: 104), 0x2222_2222)
+    }
+
     func testStrexStoresAndSignalsSuccessRealKernelWord() {
         let cpu = makeCPU(program: [
             0xE18C_3F90, // strex r3, r0, [ip] -- real word from the actual kernel

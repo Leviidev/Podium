@@ -139,6 +139,7 @@ final class EmulatorCore {
         activateCoreIfNeeded()
         guard let armCPU = cpu as? ARMv7CPU, let memory else { return }
 
+        Self.resetLogFile()
         status = .booting
         appendLog("Extracting kernel from \(firmware.metadata.originalFileName)…")
 
@@ -289,18 +290,77 @@ final class EmulatorCore {
         appendLog("boot_args written at 0x\(bootArgsAddress.hexString8) (virtBase=physBase=0x\(Self.physicalMemoryBaseAddress.hexString8), memSize=\(Int64(Self.physicalMemorySize).formattedByteCount)); r0 points there.")
         appendLog("Kernel loaded. Entry point: 0x\(image.entryPointPC.hexString8). Starting execution…")
 
+        // Run in chunks rather than one big `run(maxUnits:)` so this loop
+        // can watch for the CPU actually reaching the real kernel's
+        // `_panic` entry point (0x80017c10, confirmed via `nm` on the
+        // decrypted kernelcache) mid-execution. Real device runs so far
+        // reach a kernel panic well before any unsupported/undefined
+        // instruction or memory fault trips `armCPU.lastError`, so without
+        // this, Podium reports a misleadingly generic "still running"
+        // status instead of the actual panic.
+        let panicEntryAddress: UInt32 = 0x8001_7c10
+        let chunkSize = 200_000
         let stepBudget = Self.maxBootUnits
-        let unitsRun = await Task.detached(priority: .userInitiated) {
-            armCPU.run(maxUnits: stepBudget)
-        }.value
+        var unitsRun = 0
+        var hitPanic = false
+        while unitsRun < stepBudget {
+            let ran = await Task.detached(priority: .userInitiated) {
+                armCPU.run(maxUnits: min(chunkSize, stepBudget - unitsRun))
+            }.value
+            unitsRun += ran
+            if armCPU.registers.pc == panicEntryAddress {
+                hitPanic = true
+                break
+            }
+            if ran == 0 || armCPU.lastError != nil {
+                break
+            }
+        }
 
-        if let error = armCPU.lastError {
+        if hitPanic {
+            let message = Self.readCString(from: memory, at: armCPU.registers[0], maxLength: 512)
+            status = .error("Kernel panic after \(unitsRun) instruction group\(unitsRun == 1 ? "" : "s"): \(message)")
+            appendLog("Kernel reached _panic (0x\(panicEntryAddress.hexString8)). Format string at 0x\(armCPU.registers[0].hexString8): \(message)")
+        } else if let error = armCPU.lastError {
             status = .error("Halted after \(unitsRun) instruction group\(unitsRun == 1 ? "" : "s"): \(Self.describe(error)).")
             appendLog("Execution halted: \(error)")
         } else {
             status = .running
             appendLog("Ran \(unitsRun) instruction groups without hitting an unimplemented instruction (step budget reached). PC now 0x\(armCPU.registers.pc.hexString8).")
         }
+
+        // The `pram` region (see the comment above `pramAddress`) is where
+        // the real kernel's panic path writes its fully-rendered log —
+        // varargs substituted, unlike the raw format string at r0 above —
+        // so a real device run's crash log survives even if panic
+        // detection above ever misses the exact entry address.
+        if let pramText = Self.readPrintableText(from: memory, at: pramAddress, length: Int(pramSize)), !pramText.isEmpty {
+            appendLog("pram (panic log) region contents: \(pramText)")
+        }
+    }
+
+    /// Reads a NUL-terminated C string starting at `address`, best-effort
+    /// (stops early on any read failure rather than throwing, since this
+    /// only ever runs after something has already gone wrong).
+    private static func readCString(from memory: MemoryBus, at address: UInt32, maxLength: Int) -> String {
+        var bytes: [UInt8] = []
+        var cursor = address
+        for _ in 0..<maxLength {
+            guard let byte = try? memory.readByte(at: cursor), byte != 0 else { break }
+            bytes.append(byte)
+            cursor &+= 1
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    /// Reads `length` bytes starting at `address` and returns the
+    /// printable-ASCII subset (kernel panic logs are plain text with
+    /// occasional NULs/padding, not arbitrary binary), or nil if the
+    /// region couldn't be read at all.
+    private static func readPrintableText(from memory: MemoryBus, at address: UInt32, length: Int) -> String? {
+        guard let data = try? memory.readBytes(length, at: address) else { return nil }
+        let printable = data.filter { $0 == 0x0A || (0x20...0x7E).contains($0) }
+        return String(decoding: printable, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func describe(_ error: CPUError) -> String {
@@ -334,9 +394,39 @@ final class EmulatorCore {
     }
 
     private func appendLog(_ message: String) {
-        log.append(EmulatorLogEntry(date: Date(), message: message))
+        let entry = EmulatorLogEntry(date: Date(), message: message)
+        log.append(entry)
         if log.count > Self.logCapacity {
             log.removeFirst(log.count - Self.logCapacity)
+        }
+        Self.persistLogLine("\(entry.formattedTime) \(message)")
+    }
+
+    /// Every log entry, additionally mirrored to a real file in the app's
+    /// Documents directory — unlike the in-memory `log` above (capped at
+    /// `logCapacity`, lost on relaunch), this survives the app quitting
+    /// or crashing and can be pulled straight off the device (e.g. via
+    /// `xcrun devicectl device copy from`) without needing the UI at all.
+    private static let logFileURL: URL? = {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("podium.log")
+    }()
+
+    /// Starts a fresh log file for this boot attempt so it isn't a
+    /// confusing mix of unrelated runs.
+    private static func resetLogFile() {
+        guard let url = logFileURL else { return }
+        try? "".write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private static func persistLogLine(_ line: String) {
+        guard let url = logFileURL, let data = (line + "\n").data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            handle.seekToEndOfFile()
+            handle.write(data)
+        } else {
+            try? data.write(to: url)
         }
     }
 }

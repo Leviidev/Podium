@@ -22,6 +22,7 @@ final class ManualRealFirmwareVerification: XCTestCase {
 
         let image = try MachOLoader.load(machO, into: bus)
         let bootArgsAddress = (image.highestAddressUsed + 0xFFF) & ~UInt32(0xFFF)
+        print("deviceTreeless highestAddressUsed=0x\(image.highestAddressUsed.hexString8)")
 
         if deviceTree != nil {
             dumpZeroLengthFourProperties(deviceTree!)
@@ -66,8 +67,31 @@ final class ManualRealFirmwareVerification: XCTestCase {
         cpu.reset()
         cpu.loadInitialRegisters(initialRegisters)
 
-        let fastForwarded = cpu.run(maxUnits: 50_000_000)
-        print("RESULT: ran \(fastForwarded) units, pc=0x\(cpu.registers.pc.hexString8), error=\(String(describing: cpu.lastError)), thumbState=\(cpu.cpsr.thumbState)")
+        // _panic is at 0x80017c10 in the real kernel (verified via nm on the
+        // extracted Mach-O). A real breakpoint (ARMv7CPU.breakpoints) stops
+        // execution exactly on entry, before panic()'s own body runs, so
+        // r0 (format string) and lr (the actual call site inside whatever
+        // called panic — this is exactly the "caller 0x..." XNU itself
+        // prints in the panic header) are captured precisely rather than
+        // guessed at via periodic PC sampling, which is unreliable once
+        // execution is inside a tight loop past the address of interest.
+        let panicAddress: UInt32 = 0x80017c10
+        cpu.breakpoints = [panicAddress]
+        let totalRan = cpu.run(maxUnits: 50_000_000)
+        if cpu.hitBreakpoint == panicAddress {
+            let fmtPtr = cpu.registers[0]
+            var bytes: [UInt8] = []
+            var addr = fmtPtr
+            for _ in 0..<200 {
+                guard let b = try? bus.readByte(at: addr), b != 0 else { break }
+                bytes.append(b)
+                addr &+= 1
+            }
+            let message = String(decoding: bytes, as: UTF8.self)
+            print("HIT PANIC at units=\(totalRan): fmt=0x\(fmtPtr.hexString8) msg=\(message) caller(lr)=0x\(cpu.registers.lr.hexString8) r1=0x\(cpu.registers[1].hexString8) r2=0x\(cpu.registers[2].hexString8) r3=0x\(cpu.registers[3].hexString8)")
+        } else {
+            print("RESULT: ran \(totalRan) units, pc=0x\(cpu.registers.pc.hexString8), error=\(String(describing: cpu.lastError)), thumbState=\(cpu.cpsr.thumbState)")
+        }
         if case .unsupportedInstruction(_, let haltAddress)? = cpu.lastError {
             let hw0 = try bus.readWord16(at: haltAddress)
             let hw1 = try bus.readWord16(at: haltAddress &+ 2)

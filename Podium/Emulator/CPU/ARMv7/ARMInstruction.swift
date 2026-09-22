@@ -339,6 +339,19 @@ struct LoadExclusiveInstruction: Equatable {
     let rn: Int
 }
 
+/// `LDREXD Rt, Rt2, [Rn]`: loads a 64-bit value into the register pair
+/// `Rt:Rt2` (`Rt2 == Rt+1`, always — real hardware requires `Rt` even and
+/// rejects an odd `Rt` as unpredictable, so `Rt2` isn't a separately
+/// decoded field). Shares `LoadExclusiveInstruction`'s "exclusive tag
+/// not modeled" rationale. Verified against a real `ldrexd r4, r5, [r2]`
+/// word from the actual kernel — distinguished from plain `LDREX` by
+/// bit[21] of the opcode (`0b101` vs `0b100` in bits[23:21]).
+struct LoadExclusiveDoubleInstruction: Equatable {
+    let condition: ARMCondition
+    let rt: Int
+    let rn: Int
+}
+
 /// `STREX Rd, Rt, [Rn]`: stores `Rt` to `[Rn]` and sets `Rd` to the
 /// exclusive-access status (`0` success, `1` fail). This emulator runs
 /// a single interpreter thread with no concurrent agent that could
@@ -348,6 +361,21 @@ struct LoadExclusiveInstruction: Equatable {
 /// against. Verified against a real `strex r3, r0, [ip]` word from the
 /// actual kernel, sharing `LoadExclusiveInstruction`'s decode gate.
 struct StoreExclusiveInstruction: Equatable {
+    let condition: ARMCondition
+    let rd: Int
+    let rt: Int
+    let rn: Int
+}
+
+/// `STREXD Rd, Rt, Rt2, [Rn]`: stores the register pair `Rt:Rt2`
+/// (`Rt2 == Rt+1`, always — same constraint as `LDREXD`) as a 64-bit
+/// value to `[Rn]` and sets `Rd` to the exclusive-access status. Shares
+/// `StoreExclusiveInstruction`'s "unconditional success is correct, not
+/// a shortcut" rationale. Verified against a real
+/// `strexd r3, r8, sb, [r2]` word from the actual kernel — distinguished
+/// from plain `STREX` by bit[21] of the opcode, the same as
+/// `LoadExclusiveDoubleInstruction` vs `LoadExclusiveInstruction`.
+struct StoreExclusiveDoubleInstruction: Equatable {
     let condition: ARMCondition
     let rd: Int
     let rt: Int
@@ -452,6 +480,8 @@ enum ARMInstruction: Equatable {
     case clz(ClzInstruction)
     case loadExclusive(LoadExclusiveInstruction)
     case storeExclusive(StoreExclusiveInstruction)
+    case loadExclusiveDouble(LoadExclusiveDoubleInstruction)
+    case storeExclusiveDouble(StoreExclusiveDoubleInstruction)
     /// `DSB`/`DMB`/`ISB` (memory/instruction ordering barriers) and
     /// `PLD` (immediate, a cache-prefetch hint). Podium's interpreter
     /// executes everything strictly in program order with no caching,

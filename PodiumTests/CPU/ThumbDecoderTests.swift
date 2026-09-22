@@ -506,6 +506,103 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertEqual(instr.shiftAmount, 3)
     }
 
+    func testDecodesVmovI32QRegisterImmediateFromRealKernel() {
+        // vmov.i32 q8, #0 — from the real kernel at 0x802b7c4e.
+        guard case .vectorMoveImmediate(let instr) = ThumbDecoder.decode(0xefc0, 0x0050) else {
+            return XCTFail("Expected vectorMoveImmediate")
+        }
+        XCTAssertEqual(instr.qd, 8)
+        XCTAssertEqual(instr.imm8, 0)
+    }
+
+    func testDecodesVmovI32QRegisterImmediateNonzeroFromRealKernel() {
+        // Same real word with hw1 bit0 flipped (0x0051): vmov.i32 q8, #1 —
+        // confirms the imm8/Qd field extraction beyond the all-zero case.
+        guard case .vectorMoveImmediate(let instr) = ThumbDecoder.decode(0xefc0, 0x0051) else {
+            return XCTFail("Expected vectorMoveImmediate")
+        }
+        XCTAssertEqual(instr.qd, 8)
+        XCTAssertEqual(instr.imm8, 1)
+    }
+
+    func testDecodesVstmiaDoubleRegisterListFromRealKernel() {
+        // vstmia r2, {d16, d17} — from the real kernel at 0x802b7c6e.
+        guard case .vectorLoadStoreMultiple(let instr) = ThumbDecoder.decode(0xecc2, 0x0b04) else {
+            return XCTFail("Expected vectorLoadStoreMultiple")
+        }
+        XCTAssertFalse(instr.isLoad)
+        XCTAssertFalse(instr.writeback)
+        XCTAssertEqual(instr.rn, 2)
+        XCTAssertEqual(instr.vd, 16)
+        XCTAssertEqual(instr.registerCount, 2)
+    }
+
+    func testDecodesSmmulFromRealKernel() {
+        // smmul r0, r0, r1 — from the real kernel at 0x800311fc.
+        guard case .smmul(let instr) = ThumbDecoder.decode(0xfb50, 0xf001) else {
+            return XCTFail("Expected smmul")
+        }
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertEqual(instr.rn, 0)
+        XCTAssertEqual(instr.rm, 1)
+    }
+
+    func testDecodesPkhbtFromRealKernel() {
+        // pkhbt r0, r1, r0 — from the real kernel at 0x8006a392.
+        guard case .packHalfword(let instr) = ThumbDecoder.decode(0xeac1, 0x0000) else {
+            return XCTFail("Expected packHalfword")
+        }
+        XCTAssertFalse(instr.useTopBottom)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertEqual(instr.rm, 0)
+        XCTAssertEqual(instr.shiftAmount, 0)
+    }
+
+    func testDecodesRbitFromRealKernel() {
+        // rbit r0, r1 — from the real kernel at 0x8007faa0.
+        guard case .rbit(let instr) = ThumbDecoder.decode(0xfa91, 0xf0a1) else {
+            return XCTFail("Expected rbit")
+        }
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertEqual(instr.rm, 1)
+    }
+
+    func testDecodesMlsFromRealKernel() {
+        // mls r0, r1, r0, r3 — from the real kernel at 0x80033b44.
+        guard case .mls(let instr) = ThumbDecoder.decode(0xfb01, 0x3010) else {
+            return XCTFail("Expected mls")
+        }
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.rm, 0)
+        XCTAssertEqual(instr.ra, 3)
+    }
+
+    func testDecodesRevFromRealKernel() {
+        // rev r0, r0 — from the real kernel at 0x8000a8f8.
+        guard case .reverseBytes(let instr) = ThumbDecoder.decode(0xba00, 0) else {
+            return XCTFail("Expected reverseBytes")
+        }
+        XCTAssertFalse(instr.isHalfwordWise)
+        XCTAssertEqual(instr.rd, 0)
+        XCTAssertEqual(instr.rm, 0)
+    }
+
+    func testDecodesStrhWRegisterOffsetFromRealKernel() {
+        // strh.w r2, [r1, r3, lsl #2] — from the real kernel at 0x80033a44.
+        guard case .loadStoreRegister(let instr) = ThumbDecoder.decode(0xf821, 0x2023) else {
+            return XCTFail("Expected loadStoreRegister")
+        }
+        XCTAssertFalse(instr.isLoad)
+        XCTAssertFalse(instr.isByte)
+        XCTAssertTrue(instr.isHalfword)
+        XCTAssertEqual(instr.rn, 1)
+        XCTAssertEqual(instr.rt, 2)
+        XCTAssertEqual(instr.rm, 3)
+        XCTAssertEqual(instr.shiftAmount, 2)
+    }
+
     func testDecodesSubWShiftedRegisterFromRealKernel() {
         // sub.w r1, r3, sb (r9) — from the real kernel at 0x80018042.
         guard case .dataProcessingShiftedRegister(let instr) = ThumbDecoder.decode(0xeba3, 0x0109) else {

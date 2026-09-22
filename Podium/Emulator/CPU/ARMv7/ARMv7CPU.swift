@@ -66,6 +66,15 @@ final class ARMv7CPU: CPU {
     var cp15 = CP15State()
     var neon = NEONRegisters()
 
+    /// Addresses `run(maxUnits:)` stops at (before executing the
+    /// instruction there), leaving `registers` exactly as they were on
+    /// entry to that address — e.g. reading a function's arguments right
+    /// as it's called, which sampling the PC only every N units can't
+    /// reliably catch (a tight loop after the address of interest is very
+    /// unlikely to land back exactly on it at a sampled boundary).
+    var breakpoints: Set<UInt32> = []
+    private(set) var hitBreakpoint: UInt32?
+
     let jit: JITEngine?
 
     let memory: MemoryBus
@@ -140,6 +149,25 @@ final class ARMv7CPU: CPU {
     /// actual kernel (ARM DDI 0406C A2.5.2).
     var itState: UInt8 = 0
 
+    /// Whether the Thumb instruction currently executing is the
+    /// conditional target of an active `IT` block (as opposed to running
+    /// unconditionally with no block active) — set once per instruction
+    /// in `stepThumb()`, mirroring how `currentInstructionAddress` is
+    /// captured once per step rather than threaded through every execute
+    /// call. Several 16-bit Thumb encodings (`ADD`/`SUB`/`MOV`/`AND`/
+    /// `EOR`/`ORR`/`BIC`/`MVN`/`LSL`/`LSR`/`ASR`/`ROR`/`ADC`/`SBC`/`NEG`/
+    /// `MUL`, per ARM DDI 0406C A6.7 and the unified assembler syntax
+    /// rules) implicitly set flags only when unconditional — inside an
+    /// `IT` block their assembly form drops the `S` suffix and they must
+    /// leave `CPSR` alone, unlike their always-flag-setting 32-bit
+    /// (`.w`, explicit `S` bit) counterparts or comparison-only
+    /// instructions (`CMP`/`CMN`/`TST`, which have no non-flag-setting
+    /// form at all). Traced back from a real early-boot kernel panic: an
+    /// `andne r0, r6` inside an `itttt ne` block was clobbering the `Z`
+    /// flag the preceding `cmp` had set for `NE`, causing the block's
+    /// 4th instruction (also conditioned on `NE`) to be wrongly skipped.
+    var currentThumbInstructionIsConditional = false
+
     init(memory: MemoryBus, jit: JITEngine? = nil) {
         self.memory = memory
         self.jit = jit
@@ -213,8 +241,13 @@ final class ARMv7CPU: CPU {
     @discardableResult
     func run(maxUnits: Int) -> Int {
         isRunning = true
+        hitBreakpoint = nil
         var unitsRun = 0
         while isRunning && lastError == nil && unitsRun < maxUnits {
+            if !breakpoints.isEmpty, breakpoints.contains(registers.pc) {
+                hitBreakpoint = registers.pc
+                break
+            }
             runOneUnit()
             unitsRun += 1
         }
@@ -313,6 +346,10 @@ final class ARMv7CPU: CPU {
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeClz(instr)
 
+        case .loadExclusiveDouble(let instr):
+            executeLoadExclusiveDouble(instr)
+        case .storeExclusiveDouble(let instr):
+            executeStoreExclusiveDouble(instr)
         case .loadExclusive(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeLoadExclusive(instr)
@@ -672,6 +709,24 @@ final class ARMv7CPU: CPU {
         }
     }
 
+    /// See `LoadExclusiveDoubleInstruction`'s doc comment. Little-endian:
+    /// `Rt` gets the word at `[Rn]`, `Rt2` (`Rt+1`) gets `[Rn+4]` — the
+    /// same low/high split every other doubleword transfer in this file
+    /// uses.
+    private func executeLoadExclusiveDouble(_ instr: LoadExclusiveDoubleInstruction) {
+        let address = operandValue(for: instr.rn)
+        do {
+            let lowPhysicalAddress = try translatedAddress(address, access: .read)
+            let highPhysicalAddress = try translatedAddress(address &+ 4, access: .read)
+            registers[instr.rt] = try memory.readWord32(at: lowPhysicalAddress)
+            registers[instr.rt + 1] = try memory.readWord32(at: highPhysicalAddress)
+        } catch let memoryError as MemoryAccessError {
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
+        } catch {
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
+        }
+    }
+
     /// See `StoreExclusiveInstruction`'s doc comment for why
     /// unconditional success is correct, not a simplification, in this
     /// single-threaded emulator.
@@ -680,6 +735,22 @@ final class ARMv7CPU: CPU {
         do {
             let physicalAddress = try translatedAddress(address, access: .write)
             try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+            registers[instr.rd] = 0
+        } catch let memoryError as MemoryAccessError {
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
+        } catch {
+            if !raiseDataAbort(.unmappedAddress(address), faultAddress: address) { lastError = .memoryFault(.unmappedAddress(address), address: address) }
+        }
+    }
+
+    /// See `StoreExclusiveDoubleInstruction`'s doc comment.
+    private func executeStoreExclusiveDouble(_ instr: StoreExclusiveDoubleInstruction) {
+        let address = operandValue(for: instr.rn)
+        do {
+            let lowPhysicalAddress = try translatedAddress(address, access: .write)
+            let highPhysicalAddress = try translatedAddress(address &+ 4, access: .write)
+            try memory.writeWord32(registers[instr.rt], at: lowPhysicalAddress)
+            try memory.writeWord32(registers[instr.rt + 1], at: highPhysicalAddress)
             registers[instr.rd] = 0
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }

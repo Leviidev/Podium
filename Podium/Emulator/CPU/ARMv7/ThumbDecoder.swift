@@ -247,6 +247,19 @@ enum ThumbDecoder {
                     return .unsupported(rawHalfword: hw0, secondHalfword: nil)
                 }
                 return .it(ThumbItInstruction(firstCondition: UInt8(hw0.bitField16(7, 4)), mask: UInt8(mask)))
+            case 0b1010:
+                // REV/REV16 (Thumb16 form) — bit[6] selects (0=REV,
+                // 1=REV16), verified against a real `rev r0, r0` word
+                // from the actual kernel by flipping individual bits.
+                // Bit[7] must stay clear here — `REVSH` (and any other
+                // bit[7]==1 shape) isn't decoded, since no real word has
+                // confirmed it.
+                guard !hw0.bit16(7) else {
+                    return .unsupported(rawHalfword: hw0, secondHalfword: nil)
+                }
+                return .reverseBytes(ThumbReverseBytesInstruction(
+                    isHalfwordWise: hw0.bit16(6), rd: Int(hw0.bitField16(2, 0)), rm: Int(hw0.bitField16(5, 3))
+                ))
             default:
                 return .unsupported(rawHalfword: hw0, secondHalfword: nil)
             }
@@ -282,20 +295,30 @@ enum ThumbDecoder {
         case 0b11101:
             // bits[10:9] split this class four ways — verified against
             // one real kernel word from each confirmed branch: `00`
-            // load/store multiple, `01` data-processing (shifted
-            // register), `11` coprocessor (bits[11:8] fixed at 0b1110
-            // with hw1 bit[4] set for MCR/MRC specifically; other
-            // coprocessor instructions like CDP/LDC/STC aren't
-            // decoded). `10` (load/store dual/exclusive, table branch)
-            // isn't decoded — no real word has confirmed it.
+            // load/store multiple (this same sub-decode also covers
+            // `TBB`/`TBH`/`LDRD`/`STRD`, which share its space — see
+            // `decode32LoadStoreMultiple`'s doc comment), `01`
+            // data-processing (shifted register), `10` VFP/NEON
+            // extension-register load/store multiple (see
+            // `decode32VectorLoadStoreMultiple`'s doc comment), `11`
+            // coprocessor (bits[11:8] fixed at 0b1110 with hw1 bit[4] set
+            // for MCR/MRC specifically, or 0b1111 for NEON/VFP
+            // data-processing — see `decode32SIMDDataProcessing`'s doc
+            // comment; other coprocessor instructions like CDP/LDC/STC
+            // aren't decoded).
             switch hw0.bitField16(10, 9) {
             case 0b00:
                 return decode32LoadStoreMultiple(hw0, hw1)
             case 0b01:
                 return decode32DataProcessingShiftedRegister(hw0, hw1)
+            case 0b10:
+                return decode32VectorLoadStoreMultiple(hw0, hw1)
             case 0b11:
                 if hw0.bitField16(11, 8) == 0b1110, hw1.bit16(4) {
                     return decode32Coprocessor(hw0, hw1)
+                }
+                if hw0.bitField16(11, 8) == 0b1111 {
+                    return decode32SIMDDataProcessing(hw0, hw1)
                 }
                 return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             default:
@@ -351,6 +374,67 @@ enum ThumbDecoder {
         ))
     }
 
+    /// `VSTMIA`/`VLDMIA` (double-precision `D`-register list,
+    /// increment-after only) — see
+    /// `ThumbVectorLoadStoreMultipleInstruction`'s doc comment. Field
+    /// layout, verified bit-by-bit against a real
+    /// `vstmia r2, {d16, d17}` word from the actual kernel: `Rn` is
+    /// `hw0` bits[3:0]; `L` (load vs store) is `hw0` bit[4]; `W`
+    /// (writeback) is `hw0` bit[5]; `D` (register number's top bit) is
+    /// `hw0` bit[6]; `Vd` is `D:hw1.bitField16(15, 12)`; the register
+    /// count is `imm8 / 2` where `imm8` is `hw1.bitField16(7, 0)` (real
+    /// hardware requires `imm8` even here — an odd value is
+    /// unpredictable, so this rejects it rather than guessing). The
+    /// remaining bits (`hw0` bits[9:7], `hw1` bits[11:8] == `0b1011`,
+    /// the fixed "double-precision VFP/NEON coprocessor" pattern that
+    /// also distinguishes this from the generic `STC`/`LDC` coprocessor
+    /// space and from the single-precision `S`-register list form) are
+    /// required to match this one confirmed shape exactly.
+    private static func decode32VectorLoadStoreMultiple(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
+        guard !hw0.bit16(9), !hw0.bit16(8), hw0.bit16(7),
+              hw1.bitField16(11, 8) == 0b1011
+        else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        let imm8 = hw1.bitField16(7, 0)
+        guard imm8 != 0, imm8 & 1 == 0 else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        let vd = Int((hw0.bit16(6) ? 0b1_0000 : 0) | hw1.bitField16(15, 12))
+        return .vectorLoadStoreMultiple(ThumbVectorLoadStoreMultipleInstruction(
+            isLoad: hw0.bit16(4), writeback: hw0.bit16(5), rn: Int(hw0.bitField16(3, 0)),
+            vd: vd, registerCount: Int(imm8) / 2
+        ))
+    }
+
+    /// NEON/VFP data-processing — only `VMOV.I32 Qd, #imm8` (see
+    /// `ThumbVectorMoveImmediateInstruction`'s doc comment) is decoded,
+    /// verified bit-by-bit against a real `vmov.i32 q8, #0` word from the
+    /// actual kernel by flipping individual bits and observing how a
+    /// disassembler's output changed (the same technique used for
+    /// `ARMDecoder`'s `VRSHL`). Field layout: `i` (bit12 of `hw0`, the
+    /// immediate's bit 7) : `imm3` (bits[2:0] of `hw0`, bits[6:4]) :
+    /// `imm4` (bits[3:0] of `hw1`, bits[3:0]); `Qd` is `D:Vd(3)` — `D`
+    /// (bit6 of `hw0`) as the register number's top bit, `Vd(3)`
+    /// (bits[15:13] of `hw1`) as the rest, matching the `Q`-register
+    /// aliasing of `D`-register pairs. The other bits checked here (op,
+    /// `Q`, and the remaining `cmode` bits) pin this to exactly that one
+    /// confirmed shape — every other `cmode`/`op` combination (8/16/64-
+    /// bit element sizes, shifted variants, `VMVN`, the single-`D`-
+    /// register form) isn't decoded, since no real word has confirmed
+    /// them.
+    private static func decode32SIMDDataProcessing(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
+        guard hw0.bitField16(5, 3) == 0,
+              hw1.bit16(4), !hw1.bit16(5), hw1.bit16(6), !hw1.bit16(7),
+              hw1.bitField16(12, 8) == 0
+        else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        let qd = Int((hw0.bit16(6) ? 0b1000 : 0) | hw1.bitField16(15, 13))
+        let imm8 = (hw0.bit16(12) ? UInt32(0x80) : 0) | (UInt32(hw0.bitField16(2, 0)) << 4) | UInt32(hw1.bitField16(3, 0))
+        return .vectorMoveImmediate(ThumbVectorMoveImmediateInstruction(qd: qd, imm8: imm8))
+    }
+
     /// Data-processing (shifted register) — verified against a real
     /// `sub.w r1, r3, sb` word from the actual kernel. Shares
     /// `ThumbModifiedImmediateOp`'s table with the modified-immediate
@@ -359,12 +443,28 @@ enum ThumbDecoder {
     /// hw1, bits[7:6] of hw1), same split as ARM state's immediate
     /// shifts.
     private static func decode32DataProcessingShiftedRegister(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard let op = ThumbModifiedImmediateOp(rawValue: UInt8(hw0.bitField16(8, 5))) else {
-            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
-        }
         let imm3 = hw1.bitField16(14, 12)
         let imm2 = hw1.bitField16(7, 6)
         let shiftAmount = UInt8((imm3 << 2) | imm2)
+
+        // PKHBT/PKHTB: `op` field 0b0110, not part of `ThumbModifiedImmediateOp`'s
+        // table at all — a dedicated encoding sharing this same space.
+        // Verified against a real `pkhbt r0, r1, r0` word from the actual
+        // kernel: hw1 bit[4] is fixed at 0 (distinguishing this from the
+        // ALU-op table below, which never sets it for any decoded op),
+        // and bit[5] selects `PKHTB` (`ASR`) vs `PKHBT` (`LSL`, the fixed
+        // shift each alias always uses — real hardware doesn't allow the
+        // other shift type here, unlike the general ALU-op form below).
+        if hw0.bitField16(8, 5) == 0b0110, !hw1.bit16(4) {
+            return .packHalfword(ThumbPackHalfwordInstruction(
+                useTopBottom: hw1.bit16(5), rn: Int(hw0.bitField16(3, 0)), rd: Int(hw1.bitField16(11, 8)),
+                rm: Int(hw1.bitField16(3, 0)), shiftAmount: shiftAmount
+            ))
+        }
+
+        guard let op = ThumbModifiedImmediateOp(rawValue: UInt8(hw0.bitField16(8, 5))) else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
         guard let shiftType = ShiftType(rawValue: UInt8(hw1.bitField16(5, 4))) else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
@@ -439,18 +539,18 @@ enum ThumbDecoder {
         ))
     }
 
-    /// `LDR`/`STR`/`LDRB`/`STRB` (immediate) — T3 (12-bit unsigned
-    /// offset, always pre-indexed, no writeback), T4 (8-bit signed
-    /// offset, pre/post-indexed, optional writeback), and the
+    /// `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH` (immediate), and the
     /// register-offset form (`Rm LSL imm2`, always pre-indexed, never
     /// writeback — verified against a real `ldr.w r3, [r5, r0, lsl #3]`
-    /// word). bits[6:5] select size: `10` word, `00` byte (verified
-    /// against real `str.w`/`ldr.w`/`str ...!`/`ldr ...,#4`/`strb`
-    /// words from the actual kernel); `01` (halfword) isn't decoded
-    /// yet, since no real word has confirmed it. Within the bit[7]==0
-    /// half, the fixed `1` at hw1 bit[11] distinguishes T4's immediate
-    /// form from the register-offset form's fixed `000000` at
-    /// hw1 bits[11:6].
+    /// word (word) and a real `strh.w r2, [r1, r3, lsl #2]` word
+    /// (halfword)). T3: 12-bit unsigned offset, always pre-indexed, no
+    /// writeback. T4: 8-bit signed offset, pre/post-indexed, optional
+    /// writeback. bits[6:5] select size: `10` word, `00` byte, `01`
+    /// halfword (verified against real `str.w`/`ldr.w`/`str ...!`/
+    /// `ldr ...,#4`/`strb`/`strh.w` words from the actual kernel).
+    /// Within the bit[7]==0 half, the fixed `1` at hw1 bit[11]
+    /// distinguishes T4's immediate form from the register-offset
+    /// form's fixed `000000` at hw1 bits[11:6].
     private static func decode32LoadStoreSingle(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
         guard hw0.bitField16(15, 8) == 0b1111_1000 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
@@ -484,13 +584,11 @@ enum ThumbDecoder {
                 offset: UInt32(hw1.bitField16(7, 0))
             ))
         }
-        guard hw1.bitField16(11, 6) == 0, !isHalfword else {
-            // Register-offset halfword form isn't decoded — no real
-            // word has confirmed it yet, unlike byte/word above.
+        guard hw1.bitField16(11, 6) == 0 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         return .loadStoreRegister(ThumbLoadStoreRegisterInstruction(
-            isLoad: isLoad, isByte: isByte, rn: rn, rt: rt,
+            isLoad: isLoad, isByte: isByte, isHalfword: isHalfword, rn: rn, rt: rt,
             rm: Int(hw1.bitField16(3, 0)), shiftAmount: Int(hw1.bitField16(5, 4))
         ))
     }
@@ -545,14 +643,17 @@ enum ThumbDecoder {
     /// against a real `uxtb.w r1, r10` word from the actual kernel.
     private static func decode32ExtendOrShift(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
         // hw0's op nibble (bits[7:4]) splits this space into (at
-        // least) three real sub-families by its own top two bits,
-        // bits[7:6] — confirmed by three real words landing on three
-        // different values: `lsl.w` (bits[7:4]==0b0000, bits[7:6]==00,
+        // least) four real sub-families by its own top two bits,
+        // bits[7:6] — confirmed by real words landing on four different
+        // values: `lsl.w` (bits[7:4]==0b0000, bits[7:6]==00,
         // register-controlled shift), `uxtb.w` (bits[7:4]==0b0101,
-        // bits[7:6]==01, sign/zero-extend), and `clz` (Thumb-2 form,
-        // bits[7:4]==0b1011, bits[7:6]==10, alongside — per the real
-        // ARM ARM, though unconfirmed here — `REV`/`REV16`/`RBIT`/
-        // `REVSH`). An earlier version of this function used just bit6
+        // bits[7:6]==01, sign/zero-extend), `rbit` (bits[7:4]==0b1001,
+        // bits[7:6]==10, `hw1` bits[7:4]==0b1010 — see below), and `clz`
+        // (Thumb-2 form, bits[7:4]==0b1011, bits[7:6]==10, `hw1`
+        // bits[7:4]==0b1000). `REV`/`REV16`/`REVSH`, `rbit`'s likely
+        // siblings per the real ARM ARM, aren't decoded — no real word
+        // has confirmed their exact bits yet. An earlier version of this
+        // function used just bit6
         // as the discriminator, which happened to route `lsl.w`
         // correctly but let a *different* bit6==0 op value (`clz`'s
         // 0b1011) fall into the shift-register branch instead of being
@@ -576,7 +677,23 @@ enum ThumbDecoder {
                 shiftType: shiftType, rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
             ))
         }
-        guard hw1.bitField16(15, 12) == 0b1111, hw1.bitField16(7, 4) == 0b1000 else {
+        guard hw1.bitField16(15, 12) == 0b1111 else {
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        }
+        // `RBIT` (hw0 bits[7:4]==0b1001, hw1 bits[7:4]==0b1010, verified
+        // against a real `rbit r0, r1` word from the actual kernel) has
+        // a different `hw1` bits[7:4] marker than `CLZ`/`extendWide`
+        // below (0b1000) — real hardware apparently reuses hw0's op
+        // nibble across sub-families with a *different* hw1 marker per
+        // sub-family, not one shared marker for all of them, contrary to
+        // what an earlier version of this function assumed. `REV`/
+        // `REV16`/`REVSH` (this same op nibble's likely siblings per the
+        // real ARM ARM) aren't decoded — no real word has confirmed
+        // their exact bits yet.
+        if hw0.bitField16(7, 4) == 0b1001, hw1.bitField16(7, 4) == 0b1010 {
+            return .rbit(ThumbRbitInstruction(rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0))))
+        }
+        guard hw1.bitField16(7, 4) == 0b1000 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         switch hw0.bitField16(7, 4) {
@@ -592,16 +709,25 @@ enum ThumbDecoder {
     }
 
     private static func decode32LongMultiply(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
-        guard hw0.bitField16(15, 8) == 0b1111_1011, hw1.bitField16(7, 4) == 0 else {
+        guard hw0.bitField16(15, 8) == 0b1111_1011 else {
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         switch hw0.bitField16(7, 4) {
-        case 0b1010:
+        case 0b1010 where hw1.bitField16(7, 4) == 0:
             return .umull(ThumbUmullInstruction(
                 rdLo: Int(hw1.bitField16(15, 12)), rdHi: Int(hw1.bitField16(11, 8)),
                 rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
             ))
-        case 0b0000:
+        case 0b0000 where hw1.bitField16(7, 4) == 0b0001:
+            // MLS Rd, Rn, Rm, Ra (Rd = Ra - Rn*Rm): shares `MLA`'s op
+            // nibble but hw1 bit[4] set (vs clear for MLA/MUL) — verified
+            // against a real `mls r0, r1, r0, r3` word from the actual
+            // kernel.
+            return .mls(ThumbMlsInstruction(
+                rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)),
+                rm: Int(hw1.bitField16(3, 0)), ra: Int(hw1.bitField16(15, 12))
+            ))
+        case 0b0000 where hw1.bitField16(7, 4) == 0:
             if hw1.bitField16(15, 12) == 0b1111 {
                 // MUL alias (Ra == 1111): verified against a real
                 // `mul r1, r0, r2` word from the actual kernel.
@@ -612,6 +738,18 @@ enum ThumbDecoder {
             return .mla(ThumbMlaInstruction(
                 rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)),
                 rm: Int(hw1.bitField16(3, 0)), ra: Int(hw1.bitField16(15, 12))
+            ))
+        case 0b0101 where hw1.bitField16(7, 4) == 0:
+            // SMMUL (Ra == 1111, the no-accumulate alias of SMMLA — same
+            // relationship as MUL/MLA above): verified against a real
+            // `smmul r0, r0, r1` word from the actual kernel. SMMLA
+            // itself (Ra != 1111) isn't decoded, since no real word has
+            // confirmed it yet.
+            guard hw1.bitField16(15, 12) == 0b1111 else {
+                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+            }
+            return .smmul(ThumbSmmulInstruction(
+                rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0))
             ))
         default:
             return .unsupported(rawHalfword: hw0, secondHalfword: hw1)

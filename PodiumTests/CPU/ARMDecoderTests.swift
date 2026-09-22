@@ -203,6 +203,25 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.rn, 12)
     }
 
+    func testDecodesLdrexdFromRealKernel() {
+        // ldrexd r4, r5, [r2] — from the real kernel at 0x80080f74.
+        guard case .loadExclusiveDouble(let instr) = ARMDecoder.decode(0xE1B2_4F9F) else {
+            return XCTFail("Expected loadExclusiveDouble")
+        }
+        XCTAssertEqual(instr.rt, 4)
+        XCTAssertEqual(instr.rn, 2)
+    }
+
+    func testDecodesStrexdFromRealKernel() {
+        // strexd r3, r8, sb, [r2] — from the real kernel at 0x80080f84.
+        guard case .storeExclusiveDouble(let instr) = ARMDecoder.decode(0xE1A2_3F98) else {
+            return XCTFail("Expected storeExclusiveDouble")
+        }
+        XCTAssertEqual(instr.rd, 3)
+        XCTAssertEqual(instr.rt, 8)
+        XCTAssertEqual(instr.rn, 2)
+    }
+
     func testDecodesStrexFromRealKernel() {
         // strex r3, r0, [ip] — from the real kernel at 0x80080fac.
         guard case .storeExclusive(let instr) = ARMDecoder.decode(0xE18C_3F90) else {

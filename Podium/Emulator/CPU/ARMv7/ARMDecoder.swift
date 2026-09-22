@@ -107,8 +107,19 @@ enum ARMDecoder {
                         condition: condition, rt: Int(word.bitField(15, 12)), rn: Int(word.bitField(19, 16))
                     ))
                 }
+                if word.bitField(27, 20) == 0b0001_1011, word.bitField(11, 8) == 0b1111, word.bitField(3, 0) == 0b1111 {
+                    return .loadExclusiveDouble(LoadExclusiveDoubleInstruction(
+                        condition: condition, rt: Int(word.bitField(15, 12)), rn: Int(word.bitField(19, 16))
+                    ))
+                }
                 if word.bitField(27, 20) == 0b0001_1000, word.bitField(11, 4) == 0b1111_1001 {
                     return .storeExclusive(StoreExclusiveInstruction(
+                        condition: condition, rd: Int(word.bitField(15, 12)),
+                        rt: Int(word.bitField(3, 0)), rn: Int(word.bitField(19, 16))
+                    ))
+                }
+                if word.bitField(27, 20) == 0b0001_1010, word.bitField(11, 4) == 0b1111_1001 {
+                    return .storeExclusiveDouble(StoreExclusiveDoubleInstruction(
                         condition: condition, rd: Int(word.bitField(15, 12)),
                         rt: Int(word.bitField(3, 0)), rn: Int(word.bitField(19, 16))
                     ))

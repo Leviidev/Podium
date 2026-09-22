@@ -239,6 +239,16 @@ struct ThumbClzInstruction: Equatable {
     let rm: Int
 }
 
+/// `RBIT Rd, Rm`: reverses the bit order of a word (`Rd.bit[i] =
+/// Rm.bit[31-i]`), never flag-setting. Verified against a real
+/// `rbit r0, r1` word from the actual kernel — shares `ThumbClzInstruction`'s
+/// decode space (see `ThumbDecoder.decode32ExtendOrShift`'s doc comment)
+/// but a different `hw1` bits[7:4] marker.
+struct ThumbRbitInstruction: Equatable {
+    let rd: Int
+    let rm: Int
+}
+
 /// `UXTB` (Thumb-2, 32-bit "wide" form — `SXTH`/`UXTH`/`SXTB` share
 /// this same `kind`-tagged struct architecturally but aren't decoded,
 /// see `decode32ExtendOrShift`'s doc comment for why only `UXTB`'s
@@ -440,16 +450,21 @@ struct ThumbLoadStoreWideInstruction: Equatable {
     let offset: UInt32
 }
 
-/// Thumb-2 `LDR`/`STR`/`LDRB`/`STRB` (register) — the register-offset
-/// sibling of `ThumbLoadStoreWideInstruction`'s immediate forms, verified
-/// against a real `ldr.w r3, [r5, r0, lsl #3]` word from the actual
-/// kernel. Always pre-indexed, always adds, never writes back (per ARM
-/// DDI 0406C A8.8.66/A8.8.204: `index=TRUE, add=TRUE, wback=FALSE`), and
-/// the offset is always `Rm LSL imm2` — no other shift type is encodable
-/// here.
+/// Thumb-2 `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH` (register) — the
+/// register-offset sibling of `ThumbLoadStoreWideInstruction`'s immediate
+/// forms, verified against a real `ldr.w r3, [r5, r0, lsl #3]` word (word
+/// form) and a real `strh.w r2, [r1, r3, lsl #2]` word (halfword form,
+/// both from the actual kernel). Always pre-indexed, always adds, never
+/// writes back (per ARM DDI 0406C A8.8.66/A8.8.204/A8.8.203: `index=TRUE,
+/// add=TRUE, wback=FALSE`), and the offset is always `Rm LSL imm2` — no
+/// other shift type is encodable here. `isByte`/`isHalfword` are mutually
+/// exclusive, same as `ThumbLoadStoreWideInstruction`; signed halfword
+/// register-offset loads (`LDRSH`) live in a separate `0xF9`-prefixed
+/// space and aren't decoded here.
 struct ThumbLoadStoreRegisterInstruction: Equatable {
     let isLoad: Bool
     let isByte: Bool
+    let isHalfword: Bool
     let rn: Int
     let rt: Int
     let rm: Int
@@ -511,6 +526,95 @@ struct ThumbMlaInstruction: Equatable {
     let rn: Int
     let rm: Int
     let ra: Int
+}
+
+/// `VMOV.I32 Qd, #imm8` (NEON "one register and a modified immediate
+/// value", Q-register form only) — verified against a real
+/// `vmov.i32 q8, #0` word from the actual kernel. `imm8` (the ARM manual's
+/// scattered `i:imm3:imm4` field, reassembled here into a plain 0-255
+/// value) is replicated into all four 32-bit lanes, i.e. both halves of
+/// the 128-bit `Q` register get the same 64-bit pattern
+/// `UInt64(imm8) | (UInt64(imm8) << 32)`. Only this one `cmode`/`op`
+/// combination (plain 32-bit replicate, no shift, `VMOV` not `VMVN`) and
+/// only the `Q`-register form (not the single-`D`-register form) are
+/// decoded — every other `cmode` (8/16/64-bit, shifted variants) and the
+/// `VMVN` `op` bit aren't, since no real word has confirmed them yet.
+struct ThumbVectorMoveImmediateInstruction: Equatable {
+    let qd: Int
+    let imm8: UInt32
+}
+
+/// `VSTMIA`/`VLDMIA Rn, {Dd..Dd+regCount-1}` (VFP/NEON extension-register
+/// load/store multiple, double-precision list, increment-after
+/// addressing only) — verified against a real `vstmia r2, {d16, d17}`
+/// word from the actual kernel by flipping individual bits (the same
+/// technique used for `ThumbVectorMoveImmediateInstruction`). Only the
+/// increment-after form is decoded (the coprocessor-field bits that
+/// distinguish it from decrement-before/`VPUSH`-style addressing, and
+/// from the single-precision `S`-register list form, are required to
+/// match this one confirmed shape) — no real word has confirmed the
+/// other addressing modes or the single-precision form yet.
+struct ThumbVectorLoadStoreMultipleInstruction: Equatable {
+    let isLoad: Bool
+    let writeback: Bool
+    let rn: Int
+    let vd: Int
+    let registerCount: Int
+}
+
+/// `SMMUL Rd, Rn, Rm`: `Rd = (Rn * Rm)[63:32]` (the top 32 bits of the
+/// signed 64-bit product, truncated toward zero — no rounding, unlike
+/// `SMMULR`, which isn't decoded), never flag-setting. The `Ra == 1111`
+/// no-accumulate alias of `SMMLA`, the same relationship `MUL`
+/// (`ThumbMulInstruction`) has to `MLA`; `SMMLA` itself isn't decoded.
+/// Verified against a real `smmul r0, r0, r1` word from the actual
+/// kernel.
+struct ThumbSmmulInstruction: Equatable {
+    let rd: Int
+    let rn: Int
+    let rm: Int
+}
+
+/// `PKHBT`/`PKHTB Rd, Rn, Rm{, shift #amount}`: packs one halfword from
+/// `Rn` with one from a shifted `Rm` into `Rd`. `PKHBT`
+/// (`useTopBottom == false`) always shifts `Rm` with `LSL` and takes
+/// `Rd[31:16] = (Rm << amount)[31:16]`, `Rd[15:0] = Rn[15:0]`; `PKHTB`
+/// (`useTopBottom == true`) always shifts `Rm` with `ASR` and takes
+/// `Rd[15:0] = (Rm >> amount)[15:0]`, `Rd[31:16] = Rn[31:16]` — never
+/// flag-setting. Verified against a real `pkhbt r0, r1, r0` word from
+/// the actual kernel (`PKHTB` itself, and any non-zero shift amount,
+/// aren't separately confirmed, but share the exact same field layout).
+struct ThumbPackHalfwordInstruction: Equatable {
+    let useTopBottom: Bool
+    let rn: Int
+    let rd: Int
+    let rm: Int
+    let shiftAmount: UInt8
+}
+
+/// `MLS Rd, Rn, Rm, Ra`: `Rd = Ra - Rn*Rm`, never flag-setting. Shares
+/// `ThumbMlaInstruction`'s op nibble and field layout (same `rd`/`rn`/
+/// `rm`/`ra` positions), distinguished only by `hw1` bit[4]. Verified
+/// against a real `mls r0, r1, r0, r3` word from the actual kernel.
+struct ThumbMlsInstruction: Equatable {
+    let rd: Int
+    let rn: Int
+    let rm: Int
+    let ra: Int
+}
+
+/// `REV`/`REV16 Rd, Rm` (Thumb16 form): `REV` reverses the whole word's
+/// byte order (`Rd.byte[i] = Rm.byte[3-i]`); `REV16`
+/// (`isHalfwordWise == true`) reverses each halfword independently
+/// (`Rd.byte[0]=Rm.byte[1]`, `Rd.byte[1]=Rm.byte[0]`,
+/// `Rd.byte[2]=Rm.byte[3]`, `Rd.byte[3]=Rm.byte[2]`) — never
+/// flag-setting. Verified against a real `rev r0, r0` word from the
+/// actual kernel; `REVSH` (a third variant in this same encoding space)
+/// isn't decoded, since no real word has confirmed it.
+struct ThumbReverseBytesInstruction: Equatable {
+    let isHalfwordWise: Bool
+    let rd: Int
+    let rm: Int
 }
 
 /// `LDRD`/`STRD` (immediate): transfers `Rt`/`Rt2` to/from consecutive
@@ -590,6 +694,13 @@ enum ThumbInstruction: Equatable {
     case umull(ThumbUmullInstruction)
     case mla(ThumbMlaInstruction)
     case mul(ThumbMulInstruction)
+    case vectorMoveImmediate(ThumbVectorMoveImmediateInstruction)
+    case vectorLoadStoreMultiple(ThumbVectorLoadStoreMultipleInstruction)
+    case smmul(ThumbSmmulInstruction)
+    case packHalfword(ThumbPackHalfwordInstruction)
+    case rbit(ThumbRbitInstruction)
+    case mls(ThumbMlsInstruction)
+    case reverseBytes(ThumbReverseBytesInstruction)
     /// A recognized-but-not-yet-implemented Thumb instruction family —
     /// see `ThumbDecoder`'s doc comment for what's covered so far.
     case unsupported(rawHalfword: UInt16, secondHalfword: UInt16?)

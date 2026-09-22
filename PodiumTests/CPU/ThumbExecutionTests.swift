@@ -357,6 +357,175 @@ final class ThumbExecutionTests: XCTestCase {
         XCTAssertEqual(cpu.registers[3], 0xC0FF_EE00)
     }
 
+    /// Traced back from a real mid-boot halt (`unsupportedInstruction` at
+    /// 0x80033a44, an emulated kernel that by then had already correctly
+    /// run 18M+ instructions past the `TBB` fix above): the register-offset
+    /// halfword form of `STRH`/`LDRH` shares this same instruction family
+    /// as `testLdrWRegisterOffsetRealKernelWord` above but wasn't decoded
+    /// yet, since no real word had confirmed it before this one did.
+    /// Traced back from a real early-boot kernel panic: a genuine null
+    /// pointer store, caused by the 4th instruction of a real `itttt ne`
+    /// block (`addne.w r0, r1, r0, lsl #2`) being wrongly skipped. Root
+    /// cause was the 3rd instruction, `andne r0, r6` — a 16-bit Thumb
+    /// `AND` — unconditionally overwriting the `Z` flag `cmp r1, #0` had
+    /// set for `NE`, even though 16-bit Thumb ALU ops must leave flags
+    /// alone when they're themselves the conditional target of an active
+    /// `IT` block. All 5 real words are from the actual kernel at
+    /// 0x80033336.
+    func testAndInsideItBlockDoesNotClobberFlagsRealKernelWords() {
+        let cpu = makeThumbCPU(program: [
+            0x2900, // cmp r1, #0
+            0xbf1f, // itttt ne
+            0xf8db, 0x0000, // ldrne.w r0, [fp]  (fp == r11)
+            0x3801, // subne r0, #1
+            0x4030, // andne r0, r6
+            0xeb01, 0x0080, // addne.w r0, r1, r0, lsl #2
+        ], memorySize: 256)
+        cpu.registers[1] = 0xC058_C000 // non-zero: NE holds throughout
+        cpu.registers[6] = 0
+        cpu.registers[11] = 64 // fp
+        try! (cpu.memory as! FlatPhysicalMemory).writeWord32(0x200, at: 64)
+
+        for _ in 0..<6 {
+            cpu.step()
+            XCTAssertNil(cpu.lastError)
+        }
+
+        // ldrne: r0 = 0x200; subne: r0 = 0x1ff; andne: r0 = 0x1ff & r6(0) = 0,
+        // and must NOT touch Z (still true from `cmp r1,#0` seeing r1 != 0
+        // is false... concretely: Z stays clear, so NE keeps holding);
+        // addne.w: r0 = r1 + (r0 << 2) = 0xC058C000 + 0 = 0xC058C000.
+        XCTAssertEqual(cpu.registers[0], 0xC058_C000)
+    }
+
+    func testVmovI32QRegisterImmediateZeroRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xefc0, 0x0050, // vmov.i32 q8, #0, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.neon[16] = 0xFFFF_FFFF_FFFF_FFFF
+        cpu.neon[17] = 0xFFFF_FFFF_FFFF_FFFF
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[16], 0) // D16 (low half of Q8)
+        XCTAssertEqual(cpu.neon[17], 0) // D17 (high half of Q8)
+    }
+
+    func testVmovI32QRegisterImmediateNonzeroReplicatesAcrossLanes() {
+        let cpu = makeThumbCPU(program: [
+            0xefc0, 0x0051, // vmov.i32 q8, #1 (hw1 bit0 flipped from the real word)
+        ], memorySize: 256)
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[16], 0x0000_0001_0000_0001)
+        XCTAssertEqual(cpu.neon[17], 0x0000_0001_0000_0001)
+    }
+
+    func testVstmiaDoubleRegisterListRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xecc2, 0x0b04, // vstmia r2, {d16, d17}, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[2] = 32
+        cpu.neon[16] = 0x1111_1111_2222_2222
+        cpu.neon[17] = 0x3333_3333_4444_4444
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        let memory = cpu.memory as! FlatPhysicalMemory
+        XCTAssertEqual(try memory.readWord32(at: 32), 0x2222_2222) // D16 low word
+        XCTAssertEqual(try memory.readWord32(at: 36), 0x1111_1111) // D16 high word
+        XCTAssertEqual(try memory.readWord32(at: 40), 0x4444_4444) // D17 low word
+        XCTAssertEqual(try memory.readWord32(at: 44), 0x3333_3333) // D17 high word
+        XCTAssertEqual(cpu.registers[2], 32) // no writeback in this real word
+    }
+
+    func testSmmulRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xfb50, 0xf001, // smmul r0, r0, r1, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[0] = 0x8000_0000 // -2^31
+        cpu.registers[1] = 2
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // (-2^31 * 2) = -2^32; top 32 bits of the 64-bit result = -1.
+        XCTAssertEqual(cpu.registers[0], 0xFFFF_FFFF)
+    }
+
+    func testPkhbtRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xeac1, 0x0000, // pkhbt r0, r1, r0, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[1] = 0x1111_2222
+        cpu.registers[0] = 0x3333_4444
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Rd[31:16] = Rm[31:16] (no shift), Rd[15:0] = Rn[15:0].
+        XCTAssertEqual(cpu.registers[0], 0x3333_2222)
+    }
+
+    func testRbitRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xfa91, 0xf0a1, // rbit r0, r1, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[1] = 0x0000_0001
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0x8000_0000)
+    }
+
+    func testMlsRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xfb01, 0x3010, // mls r0, r1, r0, r3, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[1] = 5
+        cpu.registers[0] = 3
+        cpu.registers[3] = 100
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // r0 = ra(100) - rn(5)*rm(3, the OLD r0) = 100 - 15 = 85.
+        XCTAssertEqual(cpu.registers[0], 85)
+    }
+
+    func testRevRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xba00, // rev r0, r0, real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[0] = 0x1122_3344
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0x4433_2211)
+    }
+
+    func testRev16() {
+        let cpu = makeThumbCPU(program: [
+            0xba40, // rev16 r0, r0 (base word with bit6 set)
+        ], memorySize: 256)
+        cpu.registers[0] = 0x1122_3344
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[0], 0x2211_4433)
+    }
+
+    func testStrhWRegisterOffsetRealKernelWord() {
+        let cpu = makeThumbCPU(program: [
+            0xf821, 0x2023, // strh.w r2, [r1, r3, lsl #2], real word from the actual kernel
+        ], memorySize: 256)
+        cpu.registers[1] = 0
+        cpu.registers[3] = 2 // offset = r3 << 2 = 8
+        cpu.registers[2] = 0xC0FF_EE55
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(try (cpu.memory as! FlatPhysicalMemory).readWord16(at: 8), 0xEE55)
+    }
+
     func testSubWShiftedRegisterRealKernelWord() {
         let cpu = makeThumbCPU(program: [
             0xeba3, 0x0109, // sub.w r1, r3, sb (r9), real word from the actual kernel
@@ -457,6 +626,41 @@ final class ThumbExecutionTests: XCTestCase {
 
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers.pc, 14) // (0 + 4) + 5*2
+    }
+
+    /// Traced back from a real early-boot kernel panic: unlike the usual
+    /// Thumb "read PC as an operand" rule, `TBB`'s base when `Rn==PC` is
+    /// *not* additionally word-aligned — it's simply the address right
+    /// after the (always 4-byte) instruction. The other `TBB`/`TBH` tests
+    /// in this file all place the instruction at a word-aligned address
+    /// (0), where the wrong, word-aligning formula and the correct one
+    /// happen to agree and can't tell them apart. This one starts the
+    /// instruction at address 2 (2-byte aligned, not 4-byte aligned) —
+    /// exactly the real kernel's own alignment (0x80090232, ≡ 2 mod 4) —
+    /// where the buggy formula used to round the read address down by 2
+    /// bytes, into the TBB instruction's own second halfword, and jump
+    /// into garbage instead of the real case handler.
+    func testTbbAtUnalignedAddressReadsTableRightAfterInstructionRealKernelWord() {
+        let memory = FlatPhysicalMemory(length: 256)
+        try! memory.writeWord16(0xe8df, at: 2) // tbb [pc, r1] — real word from the actual kernel, at 0x80090232
+        try! memory.writeWord16(0xf001, at: 4) // second halfword of the same instruction
+        try! memory.writeWord16(0xCC03, at: 6) // table[0] = 3 (low byte) right after the instruction; high byte (0xCC) is unused filler
+
+        let cpu = ARMv7CPU(memory: memory)
+        cpu.reset()
+        cpu.cpsr.thumbState = true
+        cpu.registers.pc = 2
+        cpu.registers[1] = 0 // index 0
+
+        cpu.step()
+
+        XCTAssertNil(cpu.lastError)
+        // Correct: base = instructionAddress(2) + 4 == 6 (no extra
+        // word-alignment), table[0] == 3, target = 6 + 2*3 == 12.
+        // The pre-fix bug would round the base down to 4 — the
+        // instruction's own second halfword — read 0x01 from it, and
+        // land on 8 instead.
+        XCTAssertEqual(cpu.registers.pc, 12)
     }
 
     func testUmullRealKernelWordComputes64BitProduct() {
