@@ -303,6 +303,12 @@ final class ARMv7CPU: CPU {
     init(memory: MemoryBus, jit: JITEngine? = nil) {
         self.memory = memory
         self.jit = jit
+        flushTLB()
+    }
+
+    deinit {
+        tlbTags.deallocate()
+        tlbPages.deallocate()
     }
 
     func reset() {
@@ -311,6 +317,7 @@ final class ARMv7CPU: CPU {
         lastError = nil
         isRunning = false
         itState = 0
+        flushTLB()
     }
 
     /// Sets all 16 registers at once — how a kernel image's
@@ -340,7 +347,7 @@ final class ARMv7CPU: CPU {
         let word: UInt32
         do {
             let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
-            word = try memory.readWord32(at: physicalAddress)
+            word = try readPhysical32(physicalAddress)
         } catch let memoryError as MemoryAccessError {
             if !raisePrefetchAbort(memoryError) { lastError = .memoryFault(memoryError, address: instructionAddress) }
             return
@@ -770,7 +777,98 @@ final class ARMv7CPU: CPU {
 
     func translatedAddress(_ virtualAddress: UInt32, access: ARMv7MMU.Access) throws -> UInt32 {
         guard mmuEnabled else { return virtualAddress }
-        return try ARMv7MMU.translate(virtualAddress: virtualAddress, access: access, cp15: cp15, memory: memory)
+        let user = cpsr.rawValue & Self.modeBitsMask == Self.userModeBits
+        let kind: Int
+        switch access {
+        case .read: kind = 0
+        case .write: kind = 2
+        case .execute: kind = 4
+        }
+        let slot = (kind + (user ? 1 : 0)) &* Self.tlbEntries &+ Int((virtualAddress >> 12) & UInt32(Self.tlbEntries - 1))
+        let tag = (virtualAddress & 0xFFFF_F000) | 1
+        if tlbTags[slot] == tag {
+            return tlbPages[slot] | (virtualAddress & 0xFFF)
+        }
+        let physical = try ARMv7MMU.translate(
+            virtualAddress: virtualAddress, access: access, ttbcr: cp15.ttbcr, ttbr0: cp15.ttbr0, ttbr1: cp15.ttbr1,
+            dacr: cp15.dacr, memory: memory, privileged: !user
+        )
+        tlbTags[slot] = tag
+        tlbPages[slot] = physical & 0xFFFF_F000
+        return physical
+    }
+
+    // MARK: - TLB
+
+    /// A software TLB in front of `ARMv7MMU.translate`: successful walks
+    /// cached per 4 KB virtual page, per access kind (read/write/execute)
+    /// and privilege; faults are never cached. It follows real hardware's
+    /// contract — the guest must invalidate (CP15 c8) after changing a
+    /// valid mapping — and is also emptied whenever SCTLR, TTBR0/1, TTBCR,
+    /// DACR or CONTEXTIDR change, which covers every context switch.
+    private static let tlbEntries = 1024
+    private let tlbTags = UnsafeMutablePointer<UInt32>.allocate(capacity: 6 * tlbEntries)
+    private let tlbPages = UnsafeMutablePointer<UInt32>.allocate(capacity: 6 * tlbEntries)
+
+    func flushTLB() {
+        tlbTags.initialize(repeating: 0, count: 6 * Self.tlbEntries)
+    }
+
+    /// CP15 writes that change translation: SCTLR (c1), TTBR0/TTBR1/TTBCR
+    /// (c2), DACR (c3), the TLB maintenance operations (c8), CONTEXTIDR
+    /// (c13, opc2 1).
+    private static func cp15WriteAffectsTranslation(crn: Int, opc2: Int) -> Bool {
+        crn == 1 || crn == 2 || crn == 3 || crn == 8 || (crn == 13 && opc2 == 1)
+    }
+
+    // MARK: - Guest RAM fast path
+
+    /// Physical DRAM as a host pointer, found once through the bus: loads
+    /// and stores that land in it skip the bus's region search and its
+    /// protocol dispatch, which dominated host time once user space ran.
+    private var ramFastPath: (pointer: UnsafeMutableRawPointer, base: UInt32, length: UInt32)?
+    private var ramFastPathResolved = false
+
+    @inline(__always)
+    private func ramPointer(_ physical: UInt32, width: UInt32) -> UnsafeMutableRawPointer? {
+        if !ramFastPathResolved {
+            ramFastPathResolved = true
+            if let map = linearMap, let region = memory.fastPathRegion(for: map.physicalBase) {
+                ramFastPath = (region.pointer, region.regionBaseAddress, UInt32(region.regionLength))
+            }
+        }
+        guard let ram = ramFastPath, physical &- ram.base <= ram.length &- width else { return nil }
+        return ram.pointer + Int(physical &- ram.base)
+    }
+
+    func readPhysical32(_ physical: UInt32) throws -> UInt32 {
+        if let p = ramPointer(physical, width: 4) { return UInt32(littleEndian: p.loadUnaligned(as: UInt32.self)) }
+        return try memory.readWord32(at: physical)
+    }
+
+    func readPhysical16(_ physical: UInt32) throws -> UInt16 {
+        if let p = ramPointer(physical, width: 2) { return UInt16(littleEndian: p.loadUnaligned(as: UInt16.self)) }
+        return try memory.readWord16(at: physical)
+    }
+
+    func readPhysical8(_ physical: UInt32) throws -> UInt8 {
+        if let p = ramPointer(physical, width: 1) { return p.load(as: UInt8.self) }
+        return try memory.readByte(at: physical)
+    }
+
+    func writePhysical32(_ value: UInt32, _ physical: UInt32) throws {
+        if let p = ramPointer(physical, width: 4) { p.storeBytes(of: value.littleEndian, as: UInt32.self); return }
+        try memory.writeWord32(value, at: physical)
+    }
+
+    func writePhysical16(_ value: UInt16, _ physical: UInt32) throws {
+        if let p = ramPointer(physical, width: 2) { p.storeBytes(of: value.littleEndian, as: UInt16.self); return }
+        try memory.writeWord16(value, at: physical)
+    }
+
+    func writePhysical8(_ value: UInt8, _ physical: UInt32) throws {
+        if let p = ramPointer(physical, width: 1) { p.storeBytes(of: value, as: UInt8.self); return }
+        try memory.writeByte(value, at: physical)
     }
 
     // MARK: - Data accesses that may cross a page
@@ -800,30 +898,30 @@ final class ARMv7CPU: CPU {
         if splitsAcrossPages(virtualAddress, width: width) {
             var value: UInt32 = 0
             for (i, physical) in try bytePhysicalAddresses(virtualAddress, width: width, access: .read).enumerated() {
-                value |= UInt32(try memory.readByte(at: physical)) << UInt32(8 * i)
+                value |= UInt32(try readPhysical8(physical)) << UInt32(8 * i)
             }
             return value
         }
         let physical = try translatedAddress(virtualAddress, access: .read)
         switch width {
-        case 1: return UInt32(try memory.readByte(at: physical))
-        case 2: return UInt32(try memory.readWord16(at: physical))
-        default: return try memory.readWord32(at: physical)
+        case 1: return UInt32(try readPhysical8(physical))
+        case 2: return UInt32(try readPhysical16(physical))
+        default: return try readPhysical32(physical)
         }
     }
 
     func writeData(_ value: UInt32, _ virtualAddress: UInt32, width: Int) throws {
         if splitsAcrossPages(virtualAddress, width: width) {
             for (i, physical) in try bytePhysicalAddresses(virtualAddress, width: width, access: .write).enumerated() {
-                try memory.writeByte(UInt8(truncatingIfNeeded: value >> UInt32(8 * i)), at: physical)
+                try writePhysical8(UInt8(truncatingIfNeeded: value >> UInt32(8 * i)), physical)
             }
             return
         }
         let physical = try translatedAddress(virtualAddress, access: .write)
         switch width {
-        case 1: try memory.writeByte(UInt8(truncatingIfNeeded: value), at: physical)
-        case 2: try memory.writeWord16(UInt16(truncatingIfNeeded: value), at: physical)
-        default: try memory.writeWord32(value, at: physical)
+        case 1: try writePhysical8(UInt8(truncatingIfNeeded: value), physical)
+        case 2: try writePhysical16(UInt16(truncatingIfNeeded: value), physical)
+        default: try writePhysical32(value, physical)
         }
     }
 
@@ -1100,6 +1198,9 @@ final class ARMv7CPU: CPU {
             }
 
             cp15.write(coprocessor: instr.coprocessor, opc1: instr.opc1, crn: instr.crn, crm: instr.crm, opc2: instr.opc2, value: value)
+            if instr.coprocessor == 15, Self.cp15WriteAffectsTranslation(crn: instr.crn, opc2: instr.opc2) {
+                flushTLB()
+            }
         }
     }
 

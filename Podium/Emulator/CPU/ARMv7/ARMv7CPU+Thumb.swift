@@ -50,7 +50,7 @@ extension ARMv7CPU {
         let hw0: UInt16
         do {
             let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
-            hw0 = try memory.readWord16(at: physicalAddress)
+            hw0 = try readPhysical16(physicalAddress)
         } catch let memoryError as MemoryAccessError {
             if !raisePrefetchAbort(memoryError) { lastError = .memoryFault(memoryError, address: instructionAddress) }
             return
@@ -64,7 +64,7 @@ extension ARMv7CPU {
         if isWide {
             do {
                 let physicalAddress2 = try translatedAddress(instructionAddress &+ 2, access: .execute)
-                hw1 = try memory.readWord16(at: physicalAddress2)
+                hw1 = try readPhysical16(physicalAddress2)
             } catch let memoryError as MemoryAccessError {
                 if !raisePrefetchAbort(memoryError) { lastError = .memoryFault(memoryError, address: instructionAddress &+ 2) }
                 return

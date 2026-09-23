@@ -14,11 +14,10 @@ import Foundation
 /// Deliberately out of scope, honestly: the simplified/access-flag AP
 /// model (SCTLR.AFE) — `ARMv7CPU` checks for and refuses that combination
 /// rather than silently misapplying the legacy 3-bit AP model to it — TEX
-/// remap, and any notion of a TLB (every access re-walks the tables, which
-/// is slower but never stale). Podium also has no processor-mode/
-/// privilege model (see `CPSR`'s doc comment), so every access is checked
-/// as if privileged, which is accurate for the kernel-only boot code this
-/// CPU has run so far but would be wrong for a genuine user-mode access.
+/// remap. Permissions are checked for the access's privilege: User-mode
+/// accesses get the user half of Table B3-8 (copy-on-write and read-only
+/// user mappings depend on it). `ARMv7CPU` keeps a TLB of successful walks
+/// in front of this (see `translatedAddress`).
 enum ARMv7MMU {
     enum Access {
         case read
@@ -31,16 +30,32 @@ enum ARMv7MMU {
         virtualAddress: UInt32,
         access: Access,
         cp15: CP15State,
-        memory: MemoryBus
+        memory: MemoryBus,
+        privileged: Bool = true
     ) throws -> UInt32 {
-        let ttbcr = cp15.ttbcr
+        try translate(virtualAddress: virtualAddress, access: access, ttbcr: cp15.ttbcr, ttbr0: cp15.ttbr0, ttbr1: cp15.ttbr1,
+                      dacr: cp15.dacr, memory: memory, privileged: privileged)
+    }
+
+    /// The walk itself, taking just the registers it reads (passing the
+    /// whole `CP15State` copied its storage dictionary on every access).
+    static func translate(
+        virtualAddress: UInt32,
+        access: Access,
+        ttbcr: UInt32,
+        ttbr0: UInt32,
+        ttbr1: UInt32,
+        dacr: UInt32,
+        memory: MemoryBus,
+        privileged: Bool
+    ) throws -> UInt32 {
         let n = Int(ttbcr.bitField(2, 0))
 
         // ARM DDI 0406C B3.5.4: with N==0, TTBR0 covers the whole 4GB
         // space. With N>0, TTBR0 covers VA[31:32-N] == 0 and TTBR1 covers
         // everything else.
         let useTTBR1 = n > 0 && (virtualAddress >> (32 - n)) != 0
-        let ttbr = useTTBR1 ? cp15.ttbr1 : cp15.ttbr0
+        let ttbr = useTTBR1 ? ttbr1 : ttbr0
 
         // TTBR1's table (and TTBR0's when N==0) is always the full
         // 4096-entry, 16KB table indexed by VA[31:20]. TTBR0's table
@@ -74,13 +89,13 @@ enum ARMv7MMU {
             }
 
             let domain = Int(firstLevelDescriptor.bitField(8, 5))
-            let requiresPermissionCheck = try checkDomain(domain, isPage: true, cp15: cp15, virtualAddress: virtualAddress, isWrite: isWrite)
+            let requiresPermissionCheck = try checkDomain(domain, isPage: true, dacr: dacr, virtualAddress: virtualAddress, isWrite: isWrite)
 
             let isLargePage = secondLevelDescriptor.bitField(1, 0) == 0b01
             if requiresPermissionCheck {
                 let ap = pageAccessPermission(secondLevelDescriptor)
                 let executeNever = isLargePage ? secondLevelDescriptor.bit(15) : secondLevelDescriptor.bit(0)
-                try checkPermission(ap, access: access, executeNever: executeNever, isPage: true, virtualAddress: virtualAddress)
+                try checkPermission(ap, access: access, executeNever: executeNever, isPage: true, privileged: privileged, virtualAddress: virtualAddress)
             }
 
             return isLargePage
@@ -89,12 +104,12 @@ enum ARMv7MMU {
 
         default: // 0b10: section or supersection.
             let domain = Int(firstLevelDescriptor.bitField(8, 5))
-            let requiresPermissionCheck = try checkDomain(domain, isPage: false, cp15: cp15, virtualAddress: virtualAddress, isWrite: isWrite)
+            let requiresPermissionCheck = try checkDomain(domain, isPage: false, dacr: dacr, virtualAddress: virtualAddress, isWrite: isWrite)
 
             if requiresPermissionCheck {
                 let ap = sectionAccessPermission(firstLevelDescriptor)
                 let executeNever = firstLevelDescriptor.bit(4)
-                try checkPermission(ap, access: access, executeNever: executeNever, isPage: false, virtualAddress: virtualAddress)
+                try checkPermission(ap, access: access, executeNever: executeNever, isPage: false, privileged: privileged, virtualAddress: virtualAddress)
             }
 
             if firstLevelDescriptor.bit(18) {
@@ -127,8 +142,7 @@ enum ARMv7MMU {
     /// whether the caller still needs to run the AP/XN permission check
     /// (true for client, since manager returning normally isn't enough on
     /// its own to skip it).
-    private static func checkDomain(_ domain: Int, isPage: Bool, cp15: CP15State, virtualAddress: UInt32, isWrite: Bool) throws -> Bool {
-        let dacr = cp15.dacr
+    private static func checkDomain(_ domain: Int, isPage: Bool, dacr: UInt32, virtualAddress: UInt32, isWrite: Bool) throws -> Bool {
         let mode = (dacr >> (domain * 2)) & 0b11
         switch mode {
         case 0b11:
@@ -140,23 +154,22 @@ enum ARMv7MMU {
         }
     }
 
-    /// Table B3-8's permission model, checked as a privileged access (see
-    /// this type's doc comment for why). `0b000` denies every access, and
-    /// `0b100` is a reserved encoding the ARM ARM leaves UNPREDICTABLE —
-    /// treated here as denying access too, rather than guessing at
-    /// behavior the spec itself doesn't define. Every other AP value
-    /// grants at least privileged read, so the only remaining checks are
-    /// "read-only" AP values rejecting a write, and the XN bit rejecting
-    /// an execute.
-    private static func checkPermission(_ ap: UInt8, access: Access, executeNever: Bool, isPage: Bool, virtualAddress: UInt32) throws {
+    /// Table B3-8 (`AP[2:0]` = APX:AP[1:0]): 000 no access; 001 privileged
+    /// RW, user none; 010 privileged RW, user RO; 011 RW for both; 101
+    /// privileged RO, user none; 110/111 RO for both. `0b100` is reserved
+    /// (UNPREDICTABLE) and treated as no access. XN rejects any execute.
+    private static func checkPermission(_ ap: UInt8, access: Access, executeNever: Bool, isPage: Bool, privileged: Bool, virtualAddress: UInt32) throws {
         let fault = MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: .permissionFault(isPage: isPage), isWrite: access == .write)
         if ap == 0b000 || ap == 0b100 {
+            throw fault
+        }
+        if !privileged && (ap == 0b001 || ap == 0b101) {
             throw fault
         }
         if access == .execute && executeNever {
             throw fault
         }
-        let readOnly = ap == 0b101 || ap == 0b110 || ap == 0b111
+        let readOnly = privileged ? (ap == 0b101 || ap == 0b110 || ap == 0b111) : ap != 0b011
         if access == .write && readOnly {
             throw fault
         }

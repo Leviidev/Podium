@@ -204,4 +204,24 @@ final class ARMv7MMUTests: XCTestCase {
         let result = fault { try ARMv7MMU.translate(virtualAddress: 0x0080_0000, access: .read, cp15: cp15, memory: memory) }
         XCTAssertEqual(result?.reason, .domainFault(isPage: true))
     }
+
+    /// User-mode accesses get the user half of Table B3-8: AP 001 is
+    /// privileged-only, AP 010 is read-only for user code (how read-only
+    /// and copy-on-write user pages fault on write).
+    func testUserPermissionsFollowTableB38() throws {
+        let (memory, cp15) = makeMemoryAndCP15()
+        try memory.writeWord32(0x0010_0402, at: 0x4004) // AP 001: privileged RW, user none
+        try memory.writeWord32(0x0020_0802, at: 0x4008) // AP 010: privileged RW, user RO
+
+        XCTAssertEqual(try ARMv7MMU.translate(virtualAddress: 0x0010_0000, access: .read, cp15: cp15, memory: memory), 0x0010_0000)
+        XCTAssertThrowsError(try ARMv7MMU.translate(virtualAddress: 0x0010_0000, access: .read, cp15: cp15, memory: memory, privileged: false))
+
+        XCTAssertEqual(try ARMv7MMU.translate(virtualAddress: 0x0020_0000, access: .read, cp15: cp15, memory: memory, privileged: false), 0x0020_0000)
+        XCTAssertEqual(try ARMv7MMU.translate(virtualAddress: 0x0020_0000, access: .write, cp15: cp15, memory: memory), 0x0020_0000)
+        XCTAssertThrowsError(try ARMv7MMU.translate(virtualAddress: 0x0020_0000, access: .write, cp15: cp15, memory: memory, privileged: false)) { error in
+            guard case MemoryAccessError.translationFault(_, .permissionFault, true) = error else {
+                return XCTFail("Expected a write permission fault, got \(error)")
+            }
+        }
+    }
 }

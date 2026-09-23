@@ -1230,4 +1230,31 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers.pc, 4)
         XCTAssertEqual(cpu.cpsr.rawValue & 0x1F, ARMv7CPU.userModeBits)
     }
+
+    /// The TLB caches a translation until the guest invalidates it, as a
+    /// real one does: after a section is remapped, TLBIALL makes the next
+    /// load see the new mapping.
+    func testTLBInvalidationPicksUpARemappedSection() throws {
+        let cpu = makeCPU(program: [
+            0xEE02_0F10, // MCR p15, #0, r0, c2, c0, #0  (TTBR0 = r0)
+            0xEE03_2F10, // MCR p15, #0, r2, c3, c0, #0  (DACR = r2)
+            0xE580_1000, // STR r1, [r0]                 (table[0]: identity section for code and data)
+            0xEE01_3F10, // MCR p15, #0, r3, c1, c0, #0  (SCTLR.M = 1)
+            0xE595_4000, // LDR r4, [r5]                 (VA 0x00100000, section 1)
+            0xE580_6004, // STR r6, [r0, #4]             (remap section 1)
+            0xEE08_0F17, // MCR p15, #0, r0, c8, c7, #0  (TLBIALL)
+            0xE595_4000, // LDR r4, [r5]
+        ], memorySize: 0x30_0000)
+        try cpu.memory.writeWord32(0x0010_0C02, at: 0x4004)      // section 1 -> 0x00100000
+        try cpu.memory.writeWord32(0x1111_1111, at: 0x0010_0000)
+        try cpu.memory.writeWord32(0x2222_2222, at: 0x0020_0000)
+        cpu.loadInitialRegisters([
+            0x0000_4000, 0xC02, 1, 1, 0, 0x0010_0000, 0x0020_0C02, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+        for _ in 0..<5 { cpu.step() }
+        XCTAssertEqual(cpu.registers[4], 0x1111_1111)
+        for _ in 0..<3 { cpu.step() }
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[4], 0x2222_2222, "the invalidated TLB re-walked the table")
+    }
 }

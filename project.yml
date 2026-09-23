@@ -41,6 +41,12 @@ targets:
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         SWIFT_EMIT_LOC_STRINGS: "YES"
         ENABLE_PREVIEWS: "YES"
+      configs:
+        Release:
+          # The emulator's hot loop touches CPU state through class
+          # properties millions of times a second; the dynamic exclusivity
+          # checks were about a quarter of its host time.
+          SWIFT_ENFORCE_EXCLUSIVITY: unchecked
 
   PodiumTests:
     type: bundle.unit-test
