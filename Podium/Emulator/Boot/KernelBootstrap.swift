@@ -35,9 +35,14 @@ enum KernelBootstrap {
     private static let ramDiskAlignment: UInt32 = 0x10_0000
 
     /// The boot-args used with a root RAM disk: root on `md0`, and AMFI's
-    /// code-signing enforcement off (the trimmed root filesystem isn't the
-    /// signed original any more).
-    static let ramDiskBootArguments = "rd=md0 amfi_get_out_of_my_way=1 cs_enforcement_disable=1 -v"
+    /// code-signing/entitlement enforcement off (the trimmed root
+    /// filesystem isn't the signed original any more, so its binaries'
+    /// signatures and entitlement hashes no longer match what's recorded
+    /// for them — `amfi_get_out_of_my_way`/`cs_enforcement_disable` alone
+    /// still left AMFI killing every exec with "missing or invalid
+    /// entitlement hash", which put several daemons into a launchd
+    /// respawn loop; `amfi_allow_any_signature` covers that check too).
+    static let ramDiskBootArguments = "rd=md0 amfi_get_out_of_my_way=1 amfi_allow_any_signature=1 cs_enforcement_disable=1 -v"
 
     /// - Parameter peripheralBacking: wraps each plain-storage peripheral
     ///   region before it's added (a tracing wrapper, for instance).
