@@ -121,11 +121,13 @@ struct LoadStoreInstruction {
 /// between memory and every register named in `registerList`, in
 /// ascending register-number order regardless of `addOffset`/
 /// `preIndexed` (which only choose where in memory that ascending run
-/// starts — see `ARMv7CPU.executeBlockDataTransfer`). The `S`-bit form
-/// (user-bank register transfer, or CPSR-from-SPSR exception return when
-/// `PC` is in the list) isn't decoded — no processor-mode banking or
-/// SPSR exists for it to mean anything (see `CPSR`'s doc comment) — so
-/// it's refused rather than silently treated as the ordinary form.
+/// starts — see `ARMv7CPU.executeBlockDataTransfer`).
+///
+/// `userRegisters` is the `S` bit (`^`): without PC in a load's list, it
+/// transfers the User-mode bank instead of the current mode's (XNU saves
+/// and restores a user thread's registers this way — `stm sp, {r0-lr}^`
+/// on every exception from user mode); `LDM` with PC in the list is an
+/// exception return instead, restoring CPSR from SPSR.
 struct BlockDataTransferInstruction: Equatable {
     let condition: ARMCondition
     let isLoad: Bool
@@ -135,6 +137,34 @@ struct BlockDataTransferInstruction: Equatable {
     let rn: Int
     /// Bit *i* set means register *i* is included in the transfer.
     let registerList: UInt16
+    var userRegisters = false
+}
+
+/// `SVC #imm` (formerly `SWI`): the Supervisor Call exception — how user
+/// space makes system calls (`svc #0x80` in both instruction sets). The
+/// immediate is only for the handler, which reads it from the instruction.
+struct SupervisorCallInstruction: Equatable {
+    let condition: ARMCondition
+    let immediate: UInt32
+}
+
+/// `SRS{DA,IA,DB,IB} SP{!}, #mode`: stores the current mode's LR and SPSR
+/// to the stack of `mode` (ARM DDI 0406C B9.3.16). `increment`/`before`
+/// are the U and P bits of the addressing mode.
+struct StoreReturnStateInstruction: Equatable {
+    let increment: Bool
+    let before: Bool
+    let writeback: Bool
+    let mode: UInt32
+}
+
+/// `RFE{DA,IA,DB,IB} Rn{!}`: loads PC and CPSR from two consecutive words
+/// at `Rn` (B9.3.13) — the return path paired with `SRS`.
+struct ReturnFromExceptionInstruction: Equatable {
+    let increment: Bool
+    let before: Bool
+    let writeback: Bool
+    let rn: Int
 }
 
 /// The three "extra load/store" transfer widths/signednesses — `STRH`
@@ -347,10 +377,16 @@ struct MultiplyInstruction: Equatable {
     let rs: Int
 }
 
+/// `LDREX{B,H} Rt, [Rn{, #offset}]`: loads and opens the exclusive
+/// monitor on the address. `size` is 1, 2 or 4 bytes (zero-extended); the
+/// offset exists only in Thumb-2's word form (`imm8 * 4`), the ARM forms
+/// and the Thumb byte/halfword forms have none.
 struct LoadExclusiveInstruction: Equatable {
     let condition: ARMCondition
     let rt: Int
     let rn: Int
+    var size = 4
+    var offset: UInt32 = 0
 }
 
 /// `LDREXD Rt, Rt2, [Rn]`: loads a 64-bit value into the register pair
@@ -360,9 +396,13 @@ struct LoadExclusiveInstruction: Equatable {
 /// `LoadExclusiveInstruction`. Verified against a real `ldrexd r4, r5, [r2]`
 /// word from the actual kernel — distinguished from plain `LDREX` by
 /// bit[21] of the opcode (`0b101` vs `0b100` in bits[23:21]).
+///
+/// Thumb-2's `LDREXD` names `Rt2` separately (any register), so it's a
+/// field; the ARM decoder fills in `Rt + 1`.
 struct LoadExclusiveDoubleInstruction: Equatable {
     let condition: ARMCondition
     let rt: Int
+    let rt2: Int
     let rn: Int
 }
 
@@ -372,11 +412,14 @@ struct LoadExclusiveDoubleInstruction: Equatable {
 /// interrupt handler's own exclusive access or `CLREX` in between closes
 /// it, and the store then doesn't happen. Verified against a real `strex r3, r0, [ip]` word from the
 /// actual kernel, sharing `LoadExclusiveInstruction`'s decode gate.
+/// `size` and `offset` as in `LoadExclusiveInstruction`.
 struct StoreExclusiveInstruction: Equatable {
     let condition: ARMCondition
     let rd: Int
     let rt: Int
     let rn: Int
+    var size = 4
+    var offset: UInt32 = 0
 }
 
 /// `STREXD Rd, Rt, Rt2, [Rn]`: stores the register pair `Rt:Rt2`
@@ -386,10 +429,12 @@ struct StoreExclusiveInstruction: Equatable {
 /// `strexd r3, r8, sb, [r2]` word from the actual kernel — distinguished
 /// from plain `STREX` by bit[21] of the opcode, the same as
 /// `LoadExclusiveDoubleInstruction` vs `LoadExclusiveInstruction`.
+/// `rt2` as in `LoadExclusiveDoubleInstruction`.
 struct StoreExclusiveDoubleInstruction: Equatable {
     let condition: ARMCondition
     let rd: Int
     let rt: Int
+    let rt2: Int
     let rn: Int
 }
 
@@ -440,33 +485,6 @@ struct BitFieldExtractInstruction: Equatable {
     let rn: Int
     let lsb: Int
     let width: Int
-}
-
-/// `VRSHL.<type><size> Dd, Dm, Dn`: Advanced SIMD (NEON) vector rounding
-/// shift left — per lane, `Dd[i] = Dm[i] << SInt(Dn[i]<7:0>)` for a
-/// non-negative shift, or a rounding right shift by the negated amount
-/// otherwise (ARM DDI 0406C A8.8.316). `unsigned` selects a logical vs.
-/// arithmetic right shift for that rounding path (irrelevant for a plain
-/// left shift, which is the same bit pattern either way). Only this one
-/// opcode from NEON's large "three registers of the same length" space
-/// (opc bits[11:8]) is decoded, `Q`-register (128-bit) width isn't
-/// (bit6==0 required) — confirmed via Capstone against a real word from
-/// the actual kernel ("vrshl.u8 d16, d0, d5", the instruction that halted
-/// execution before any NEON encoding was decoded at all).
-struct VRSHLInstruction: Equatable {
-    enum ElementSize: UInt8 {
-        case bits8 = 0, bits16 = 1, bits32 = 2, bits64 = 3
-    }
-
-    let unsigned: Bool
-    let size: ElementSize
-    /// `Dd`, `Dm` (the value being shifted), `Dn` (the per-lane shift
-    /// amount) — named to match `VRSHL`'s own real assembly operand
-    /// order, not the raw encoding's `Vd`/`Vn`/`Vm` field letters (`Vn`
-    /// is the shift amount here, `Vm` the shifted value).
-    let vd: Int
-    let vm: Int
-    let vn: Int
 }
 
 /// Advanced SIMD "one register and a modified immediate" (ARM DDI 0406C
@@ -675,6 +693,27 @@ struct VFPTwoRegisterTransferInstruction: Equatable {
     let extensionRegister: Int
 }
 
+/// The architectural hints (ARM DDI 0406C A8.8.x), numbered by the hint
+/// field both instruction sets share.
+enum ProcessorHint: UInt16, Equatable {
+    case nop = 0
+    case yield = 1
+    case waitForEvent = 2
+    case waitForInterrupt = 3
+    case sendEvent = 4
+}
+
+/// `NOP`/`YIELD`/`WFE`/`WFI`/`SEV` (ARM state): the `MSR` (immediate)
+/// encoding with an empty field mask and `R == 0` (ARM DDI 0406C A5.2.11).
+/// Decoded apart from `MSR` because executing one as an `MSR` that writes
+/// nothing silently drops the `WFI` — real `cpu_idle_wfi` is ARM code
+/// (`dsb sy; wfi` at `0x80088C48`), so the idle loop never let virtual
+/// time skip ahead and an idle kernel cost as much host time as a busy one.
+struct HintInstruction: Equatable {
+    let condition: ARMCondition
+    let hint: ProcessorHint
+}
+
 enum ARMInstruction: Equatable {
     case dataProcessing(DataProcessingInstruction)
     case branch(BranchInstruction)
@@ -699,6 +738,10 @@ enum ARMInstruction: Equatable {
     case storeExclusive(StoreExclusiveInstruction)
     case loadExclusiveDouble(LoadExclusiveDoubleInstruction)
     case storeExclusiveDouble(StoreExclusiveDoubleInstruction)
+    case hint(HintInstruction)
+    case supervisorCall(SupervisorCallInstruction)
+    case storeReturnState(StoreReturnStateInstruction)
+    case returnFromException(ReturnFromExceptionInstruction)
     /// `DSB`/`DMB`/`ISB` (memory/instruction ordering barriers) and
     /// `PLD` (immediate, a cache-prefetch hint). Podium's interpreter
     /// executes everything strictly in program order with no caching,
@@ -709,7 +752,6 @@ enum ARMInstruction: Equatable {
     /// `CLREX`: clears the local exclusive monitor, so a pending
     /// `STREX` fails. XNU runs it on exception entry.
     case clearExclusive
-    case vectorRoundingShiftLeft(VRSHLInstruction)
     case bitwiseExclusiveOr(VEORInstruction)
     case neonModifiedImmediate(NEONModifiedImmediateInstruction)
     case bitwiseOr(VORRInstruction)
@@ -720,6 +762,10 @@ enum ARMInstruction: Equatable {
     case reverseElements(VREVInstruction)
     case extensionRegisterLoadStore(ExtensionRegisterLoadStoreInstruction)
     case vfpTwoRegisterTransfer(VFPTwoRegisterTransferInstruction)
+    case vfpDataProcessing(VFPDataProcessingInstruction)
+    case neon(NEONInstruction)
+    case media(MediaInstruction)
+    case neonStructureLoadStore(NEONStructureLoadStoreInstruction)
     /// A recognized-but-not-yet-implemented instruction family: multiply
     /// and the "extra load/store" SWP/reserved encodings (SH==00), the
     /// `S`-bit form of block data transfer (see

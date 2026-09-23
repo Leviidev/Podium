@@ -7,8 +7,9 @@ protocol DeviceEventHandler: AnyObject {
 
 /// The A4 (S5L8930X) SoC hardware that has real behavior, as opposed to
 /// the plain storage `DeviceTreeMemoryMap` backs every other peripheral
-/// with: the system timer, the power manager and the interrupt
-/// controller, wired to the CPU's IRQ/FIQ pins and to its virtual clock.
+/// with: the system timer, the power manager, the interrupt controller, and
+/// the IOP's and single-wire interface's handshakes, wired to the CPU's
+/// IRQ/FIQ pins and to its virtual clock.
 ///
 /// Time is virtual: the timebase counter advances one tick per
 /// `instructionsPerTimebaseTick` retired instructions (plus whatever WFI
@@ -25,12 +26,16 @@ final class S5L8930XPlatform: DeviceEventHandler {
     /// see `DeviceTreeMemoryMap` on why these SoCs expose both.
     static let pmgrBase: UInt32 = 0x3F10_0000
     static let vicBase: UInt32 = 0x3F20_0000
+    static let iopBase: UInt32 = 0x0630_0000
+    static let swiBase: UInt32 = 0x3F60_0000
     private static let aliasBit: UInt32 = 0x8000_0000
 
     private unowned let cpu: ARMv7CPU
     private(set) var interruptController: PL192InterruptController!
     private(set) var timer: S5L8930XTimer!
     let powerManager = S5L8930XPowerManager()
+    let iop = S5L8930XIOP()
+    let swi = S5L8930XSWI()
 
     init(cpu: ARMv7CPU) {
         self.cpu = cpu
@@ -58,6 +63,8 @@ final class S5L8930XPlatform: DeviceEventHandler {
             (timer, Self.pmgrBase + S5L8930XTimer.windowOffsetInPMGR, S5L8930XTimer.windowLength),
             (powerManager, Self.pmgrBase, S5L8930XPowerManager.windowLength),
             (interruptController, Self.vicBase, PL192InterruptController.windowLength),
+            (iop, Self.iopBase, S5L8930XIOP.windowLength),
+            (swi, Self.swiBase, S5L8930XSWI.windowLength),
         ]
         return windows.flatMap { device, base, length in
             [base, base | Self.aliasBit].map { MMIORegion(device: device, baseAddress: $0, length: length) }

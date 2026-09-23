@@ -59,4 +59,32 @@ final class FlatPhysicalMemoryTests: XCTestCase {
             XCTAssertEqual(error as? MemoryAccessError, .outOfBounds(address: 0xFFFF_FFFE, length: 4))
         }
     }
+
+    /// A file mapped over part of the region reads back through it,
+    /// copy-on-write: guest writes change memory, never the file.
+    func testMapFileIsCopyOnWrite() throws {
+        let page = Int(getpagesize())
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("podium-mapfile-\(UUID().uuidString)")
+        var contents = Data(repeating: 0xAB, count: page)
+        contents[0] = 0x11
+        try contents.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let memory = FlatPhysicalMemory(length: page * 4, baseAddress: 0x4000_0000)
+        try memory.writeByte(0x55, at: 0x4000_0000)
+        let address = 0x4000_0000 + UInt32(page)
+        XCTAssertEqual(try memory.mapFile(url, at: address), page)
+        XCTAssertEqual(try memory.readByte(at: address), 0x11)
+        XCTAssertEqual(try memory.readByte(at: address + 1), 0xAB)
+        XCTAssertEqual(try memory.readByte(at: 0x4000_0000), 0x55, "memory outside the mapping is untouched")
+
+        try memory.writeByte(0x22, at: address)
+        XCTAssertEqual(try memory.readByte(at: address), 0x22)
+        XCTAssertEqual(try Data(contentsOf: url)[0], 0x11, "the file itself never changes")
+    }
+
+    func testMapFileRejectsMisalignedAddress() {
+        let memory = FlatPhysicalMemory(length: Int(getpagesize()) * 2)
+        XCTAssertThrowsError(try memory.mapFile(URL(fileURLWithPath: "/dev/null"), at: 1))
+    }
 }

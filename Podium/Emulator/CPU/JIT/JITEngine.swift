@@ -163,13 +163,11 @@ final class JITEngine {
         return compiled
     }
 
-    /// Reads directly through `memory` (physical addresses), not through
-    /// the CPU's MMU translation — `JITEngine` only has a `MemoryBus`,
-    /// not the CPU's CP15/MMU state needed to translate. Only safe while
-    /// `pc` is identity-mapped (virtBase==physBase), which holds for this
-    /// kernel's early boot; a future caller running after the guest
-    /// enables a non-identity mapping would need this reworked to route
-    /// through the CPU's own translation instead.
+    /// `address` is physical: the CPU translates the pc before asking
+    /// (see `ARMv7CPU.jitPhysicalAddress`), and only asks for code in
+    /// physically contiguous memory, so reading straight through `memory`
+    /// is correct for the whole run. Blocks are cached by physical
+    /// address too, which keeps them valid across address spaces.
     private func discoverEligibleARMRun(startingAt address: UInt32, memory: MemoryBus) -> [ARMJITEligibleInstruction] {
         var instructions: [ARMJITEligibleInstruction] = []
         var cursor = address

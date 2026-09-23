@@ -3,15 +3,11 @@ import Foundation
 /// The System Control Coprocessor (CP15) register file, as far as
 /// `MCR`/`MRC` transfers are concerned.
 ///
-/// Real CP15 registers configure and control cache behavior, the MMU/TLB,
-/// and other low-level hardware state — none of which this CPU
-/// implements (no MMU, no cache model). This type exists so guest code
-/// that reads/writes CP15 registers (which real ARM boot code does
-/// almost immediately — cache maintenance, barrier-adjacent operations)
-/// gets a real, addressable place to write to and read back from,
-/// instead of Podium refusing to execute the instruction at all. It is
-/// explicitly *not* a claim that cache/MMU behavior is emulated: writes
-/// are stored, not acted on.
+/// The registers the MMU walk reads — SCTLR, TTBR0, TTBR1, TTBCR, DACR —
+/// are acted on (see `ARMv7MMU`) and kept in dedicated fields, since
+/// they're read on every translated access and instruction fetch. Every
+/// other register (cache/TLB maintenance, ID registers, thread IDs, ...)
+/// is stored and read back, not acted on.
 struct CP15State {
     private struct Key: Hashable {
         let coprocessor: Int
@@ -21,9 +17,25 @@ struct CP15State {
         let opc2: Int
     }
 
+    private(set) var sctlr: UInt32 = 0
+    private(set) var ttbr0: UInt32 = 0
+    private(set) var ttbr1: UInt32 = 0
+    private(set) var ttbcr: UInt32 = 0
+    private(set) var dacr: UInt32 = 0
+
     private var storage: [Key: UInt32] = [:]
 
     mutating func write(coprocessor: Int, opc1: Int, crn: Int, crm: Int, opc2: Int, value: UInt32) {
+        if coprocessor == 15, opc1 == 0, crm == 0 {
+            switch (crn, opc2) {
+            case (1, 0): sctlr = value; return
+            case (2, 0): ttbr0 = value; return
+            case (2, 1): ttbr1 = value; return
+            case (2, 2): ttbcr = value; return
+            case (3, 0): dacr = value; return
+            default: break
+            }
+        }
         storage[Key(coprocessor: coprocessor, opc1: opc1, crn: crn, crm: crm, opc2: opc2)] = value
     }
 
@@ -32,6 +44,16 @@ struct CP15State {
     /// state (e.g. a populated cache-type or feature-ID register) that
     /// isn't actually backed by anything.
     func read(coprocessor: Int, opc1: Int, crn: Int, crm: Int, opc2: Int) -> UInt32 {
-        storage[Key(coprocessor: coprocessor, opc1: opc1, crn: crn, crm: crm, opc2: opc2)] ?? 0
+        if coprocessor == 15, opc1 == 0, crm == 0 {
+            switch (crn, opc2) {
+            case (1, 0): return sctlr
+            case (2, 0): return ttbr0
+            case (2, 1): return ttbr1
+            case (2, 2): return ttbcr
+            case (3, 0): return dacr
+            default: break
+            }
+        }
+        return storage[Key(coprocessor: coprocessor, opc1: opc1, crn: crn, crm: crm, opc2: opc2)] ?? 0
     }
 }

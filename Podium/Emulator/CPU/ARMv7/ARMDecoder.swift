@@ -57,6 +57,17 @@ enum ARMDecoder {
         }
     }
 
+    /// The LDREX/STREX family's bits[23:21]: word, byte, halfword (the
+    /// doubleword form, `101`, has its own instruction type).
+    private static func exclusiveAccessSize(_ op: UInt32) -> Int? {
+        switch op {
+        case 0b100: return 4
+        case 0b110: return 1
+        case 0b111: return 2
+        default: return nil
+        }
+    }
+
     private static func decodeDataProcessingBlock(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
         // BX Rm / BLX Rm: bits[27:4] are a fixed pattern (0x12FFF1 for
         // BX, 0x12FFF3 for BLX — see BranchExchangeInstruction's doc
@@ -99,30 +110,26 @@ enum ARMDecoder {
             // ("strh r1, [r0, #2]" at 0x8007d3e4).
             let sh = word.bitField(6, 5)
             guard sh != 0 else {
-                // Synchronization primitives (SWP/LDREX/STREX family) —
-                // only LDREX's and STREX's exact bit patterns are
-                // decoded so far, not the rest (SWP, LDREXB/H/D, etc).
-                if word.bitField(27, 20) == 0b0001_1001, word.bitField(11, 8) == 0b1111, word.bitField(3, 0) == 0b1111 {
-                    return .loadExclusive(LoadExclusiveInstruction(
-                        condition: condition, rt: Int(word.bitField(15, 12)), rn: Int(word.bitField(19, 16))
-                    ))
+                // Synchronization primitives: the LDREX/STREX family
+                // (bits[23:21] 100 word, 101 doubleword, 110 byte, 111
+                // halfword; bit20 L). SWP isn't decoded.
+                if word.bitField(27, 24) == 0b0001, word.bit(23), word.bit(20), word.bitField(11, 8) == 0b1111, word.bitField(3, 0) == 0b1111 {
+                    let rt = Int(word.bitField(15, 12)), rn = Int(word.bitField(19, 16))
+                    if word.bitField(23, 21) == 0b101 {
+                        return .loadExclusiveDouble(LoadExclusiveDoubleInstruction(condition: condition, rt: rt, rt2: rt + 1, rn: rn))
+                    }
+                    if let size = exclusiveAccessSize(word.bitField(23, 21)) {
+                        return .loadExclusive(LoadExclusiveInstruction(condition: condition, rt: rt, rn: rn, size: size))
+                    }
                 }
-                if word.bitField(27, 20) == 0b0001_1011, word.bitField(11, 8) == 0b1111, word.bitField(3, 0) == 0b1111 {
-                    return .loadExclusiveDouble(LoadExclusiveDoubleInstruction(
-                        condition: condition, rt: Int(word.bitField(15, 12)), rn: Int(word.bitField(19, 16))
-                    ))
-                }
-                if word.bitField(27, 20) == 0b0001_1000, word.bitField(11, 4) == 0b1111_1001 {
-                    return .storeExclusive(StoreExclusiveInstruction(
-                        condition: condition, rd: Int(word.bitField(15, 12)),
-                        rt: Int(word.bitField(3, 0)), rn: Int(word.bitField(19, 16))
-                    ))
-                }
-                if word.bitField(27, 20) == 0b0001_1010, word.bitField(11, 4) == 0b1111_1001 {
-                    return .storeExclusiveDouble(StoreExclusiveDoubleInstruction(
-                        condition: condition, rd: Int(word.bitField(15, 12)),
-                        rt: Int(word.bitField(3, 0)), rn: Int(word.bitField(19, 16))
-                    ))
+                if word.bitField(27, 24) == 0b0001, word.bit(23), !word.bit(20), word.bitField(11, 4) == 0b1111_1001 {
+                    let rd = Int(word.bitField(15, 12)), rt = Int(word.bitField(3, 0)), rn = Int(word.bitField(19, 16))
+                    if word.bitField(23, 21) == 0b101 {
+                        return .storeExclusiveDouble(StoreExclusiveDoubleInstruction(condition: condition, rd: rd, rt: rt, rt2: rt + 1, rn: rn))
+                    }
+                    if let size = exclusiveAccessSize(word.bitField(23, 21)) {
+                        return .storeExclusive(StoreExclusiveInstruction(condition: condition, rd: rd, rt: rt, rn: rn, size: size))
+                    }
                 }
                 if word.bitField(27, 24) == 0, word.bitField(7, 4) == 0b1001 {
                     // See MultiplyInstruction's doc comment.
@@ -211,6 +218,13 @@ enum ARMDecoder {
                 return .clz(ClzInstruction(condition: condition, rd: rd, rm: Int(word.bitField(3, 0))))
             }
 
+            // Halfword multiplies (bit7 set, bit4 clear) and QADD/QSUB/
+            // QDADD/QDSUB (bits[7:4] 0101) share this shape too.
+            if !immediateOperand, (word.bit(7) && !word.bit(4)) || word.bitField(7, 4) == 0b0101,
+               let media = MediaDecoder.decodeMiscellaneous(word, condition: condition) {
+                return media
+            }
+
             // TST/TEQ/CMP/CMN with S==0 isn't that comparison — this
             // encoding (bits[24:23]=="10", true for all four of those
             // opcodes) is where MRS/MSR (status register access) live.
@@ -224,6 +238,14 @@ enum ARMDecoder {
 
             if word.bit(21) {
                 let fieldMask = UInt8(word.bitField(19, 16))
+                // An empty-mask CPSR MSR (immediate) is the hint space
+                // instead: NOP/YIELD/WFE/WFI/SEV in bits[7:0].
+                if immediateOperand, !isSPSR, fieldMask == 0 {
+                    guard word.bitField(15, 8) == 0xF0, let hint = ProcessorHint(rawValue: UInt16(word.bitField(7, 0))) else {
+                        return .unsupported(rawWord: word)
+                    }
+                    return .hint(HintInstruction(condition: condition, hint: hint))
+                }
                 let source: MSRSource
                 if immediateOperand {
                     let rotateAmount = word.bitField(11, 8) * 2
@@ -327,13 +349,9 @@ enum ARMDecoder {
 
     private static func decodeBranchOrBlockTransfer(_ word: UInt32, condition: ARMCondition) -> ARMInstruction {
         guard word.bit(25) else {
-            // Block data transfer (LDM/STM). The `S` bit (bit22) selects
-            // user-bank/exception-return semantics this CPU doesn't model
-            // (see `BlockDataTransferInstruction`'s doc comment) — refused
-            // rather than silently treated as the ordinary form.
-            guard !word.bit(22) else {
-                return .unsupported(rawWord: word)
-            }
+            // Block data transfer (LDM/STM); the `S` bit (bit22) is the
+            // user-bank / exception-return form (see
+            // `BlockDataTransferInstruction`'s doc comment).
             return .blockDataTransfer(BlockDataTransferInstruction(
                 condition: condition,
                 isLoad: word.bit(20),
@@ -341,7 +359,8 @@ enum ARMDecoder {
                 addOffset: word.bit(23),
                 writeback: word.bit(21),
                 rn: Int(word.bitField(19, 16)),
-                registerList: UInt16(word.bitField(15, 0))
+                registerList: UInt16(word.bitField(15, 0)),
+                userRegisters: word.bit(22)
             ))
         }
 
@@ -388,7 +407,7 @@ enum ARMDecoder {
                 width: Int(msb - lsb + 1)
             ))
         }
-        if word.bitField(27, 21) == 0b0111111, word.bitField(6, 4) == 0b101 {
+        if word.bitField(27, 21) == 0b0111111, word.bitField(6, 4) == 0b101, word.bitField(11, 7) + word.bitField(20, 16) < 32 {
             // UBFX (ARM state): verified against a real `ubfx r3, r0,
             // #3, #0xa` word from the actual kernel (see
             // `BitFieldExtractInstruction`'s doc comment).
@@ -401,7 +420,7 @@ enum ARMDecoder {
                 width: Int(widthMinus1 + 1)
             ))
         }
-        return .unsupported(rawWord: word)
+        return MediaDecoder.decode(word, condition: condition) ?? .unsupported(rawWord: word)
     }
 
     /// The coprocessor space: VFP/NEON extension-register load/store for
@@ -414,6 +433,15 @@ enum ARMDecoder {
         // bits[11:9]==101.
         if word.bitField(27, 25) == 0b110, word.bitField(11, 9) == 0b101 {
             return decodeExtensionRegisterLoadStore(word, condition: condition)
+        }
+
+        if word.bitField(27, 24) == 0b1111 {
+            return .supervisorCall(SupervisorCallInstruction(condition: condition, immediate: word.bitField(23, 0)))
+        }
+
+        // VFP data processing: bit4 clear, coprocessor 10/11.
+        if word.bitField(27, 24) == 0b1110, !word.bit(4), word.bitField(11, 9) == 0b101 {
+            return VFPDecoder.decodeDataProcessing(word, condition: condition)
         }
 
         guard word.bitField(27, 24) == 0b1110, word.bit(4) else {
@@ -445,6 +473,19 @@ enum ARMDecoder {
         // a no-op, since this CPU has no cache model for it to hint to.
         if word.bitField(27, 24) == 0b0101, !word.bit(21), word.bit(20), word.bitField(15, 12) == 0b1111 {
             return .memoryBarrier
+        }
+
+        // SRS: 1111 100P U1W0 1101 0000 0101 000 mode.
+        if word & 0x0E5F_FFE0 == 0x084D_0500 {
+            return .storeReturnState(StoreReturnStateInstruction(
+                increment: word.bit(23), before: word.bit(24), writeback: word.bit(21), mode: word.bitField(4, 0)
+            ))
+        }
+        // RFE: 1111 100P U0W1 Rn 0000 1010 0000 0000.
+        if word & 0x0E50_FFFF == 0x0810_0A00 {
+            return .returnFromException(ReturnFromExceptionInstruction(
+                increment: word.bit(23), before: word.bit(24), writeback: word.bit(21), rn: Int(word.bitField(19, 16))
+            ))
         }
 
         // BLX (immediate): bits[27:25] == 0b101 (fixed) — always an
@@ -508,15 +549,6 @@ enum ARMDecoder {
             return decodeNEONModifiedImmediate(word)
         }
 
-        // VRSHL (NEON "three registers of the same length" family,
-        // bits[31:25]==0b1111001, opc bits[11:8]==0b0101): field layout
-        // (U/D/size/Vn/Vd/N/Q/M/Vm, and which disassembly operand each
-        // maps to) empirically confirmed by varying each field one at a
-        // time through Capstone against the real halting word
-        // (0xF3450500 = "vrshl.u8 d16, d0, d5"), not read off a manual
-        // table from memory. Only opc==0b0101 (VRSHL) and Q==0 (D-register
-        // width) are decoded; every other opcode/width in this same shape
-        // stays `.unsupported` until a real word confirms one is needed.
         // VLD1/VST1 (multiple single elements): bits[27:23]==0b01000 and
         // bit20==0 (fixed for this "Advanced SIMD element or structure
         // load/store" sub-family), bit21 selects load(1)/store(0). See
@@ -530,7 +562,7 @@ enum ARMDecoder {
             case 0b1010: registerCount = 2
             case 0b0110: registerCount = 3
             case 0b0010: registerCount = 4
-            default: return .unsupported(rawWord: word)
+            default: return NEONDecoder.decodeStructureLoadStore(word)
             }
             let rm = word.bitField(3, 0)
             let writeback: ElementLoadStoreInstruction.Writeback
@@ -540,6 +572,8 @@ enum ARMDecoder {
             default: writeback = .register(Int(rm))
             }
             let d = word.bit(22) ? 1 << 4 : 0
+            // A list running past d31 is UNPREDICTABLE.
+            guard (d | Int(word.bitField(15, 12))) + registerCount <= 32 else { return .undefined(rawWord: word) }
             return .elementLoadStore(ElementLoadStoreInstruction(
                 isLoad: word.bit(21),
                 rn: Int(word.bitField(19, 16)),
@@ -547,6 +581,11 @@ enum ARMDecoder {
                 registerCount: registerCount,
                 writeback: writeback
             ))
+        }
+
+        // Single structure to one lane / to all lanes (A = 1).
+        if word.bitField(27, 23) == 0b01001, !word.bit(20) {
+            return NEONDecoder.decodeStructureLoadStore(word)
         }
 
         // VREV16/VREV32/VREV64: "two registers, miscellaneous" NEON
@@ -578,16 +617,6 @@ enum ARMDecoder {
             ))
         }
 
-        if word.bitField(31, 25) == 0b1111_001, !word.bit(23), word.bitField(11, 8) == 0b0101, !word.bit(6) {
-            guard let size = VRSHLInstruction.ElementSize(rawValue: UInt8(word.bitField(21, 20))) else {
-                return .unsupported(rawWord: word)
-            }
-            let vd = Int((word.bit(22) ? 1 << 4 : 0) | word.bitField(15, 12))
-            let vm = Int((word.bit(5) ? 1 << 4 : 0) | word.bitField(3, 0))
-            let vn = Int((word.bit(7) ? 1 << 4 : 0) | word.bitField(19, 16))
-            return .vectorRoundingShiftLeft(VRSHLInstruction(unsigned: word.bit(24), size: size, vd: vd, vm: vm, vn: vn))
-        }
-
         // VEOR/VORR: same "three registers of the same length" outer
         // shape as VRSHL above, but from the "bitwise operations" sub-
         // space (opc==0b0001) — see VEORInstruction's/VORRInstruction's
@@ -603,7 +632,9 @@ enum ARMDecoder {
         // without this check, a real `vext.64 ...` word (imm4==0b1000)
         // would misdecode as VADD, since imm4 and VADD's opc share the
         // same bit position and can coincide.
-        if word.bitField(31, 25) == 0b1111_001, !word.bit(23), word.bitField(11, 8) == 0b0001 {
+        if word.bitField(31, 25) == 0b1111_001, !word.bit(23), word.bitField(11, 8) == 0b0001, word.bit(4) {
+            // bit4 set: the bitwise group. With it clear, opc 0001 is
+            // VRHADD — which this once misdecoded as VEOR/VORR.
             let isQuad = word.bit(6)
             let dField = Int((word.bit(22) ? 1 << 4 : 0) | word.bitField(15, 12))
             let nField = Int((word.bit(7) ? 1 << 4 : 0) | word.bitField(19, 16))
@@ -617,7 +648,7 @@ enum ARMDecoder {
             if !word.bit(24), word.bitField(21, 20) == 0b10 {
                 return .bitwiseOr(VORRInstruction(vd: vd, vn: vn, vm: vm, isQuad: isQuad))
             }
-            return .unsupported(rawWord: word)
+            return NEONDecoder.decodeDataProcessing(word)
         }
 
         // VADD.I<size>: same "three registers of the same length" outer
@@ -627,9 +658,9 @@ enum ARMDecoder {
         // supported here since the real halting word needs it. bit23==0
         // required — see the VEOR/VORR comment above on why (this is the
         // exact collision that motivated adding the check).
-        if word.bitField(31, 25) == 0b1111_001, !word.bit(23), word.bitField(11, 8) == 0b1000, !word.bit(24) {
+        if word.bitField(31, 25) == 0b1111_001, !word.bit(23), word.bitField(11, 8) == 0b1000, !word.bit(24), !word.bit(4) {
             guard let size = VADDInstruction.ElementSize(rawValue: UInt8(word.bitField(21, 20))) else {
-                return .unsupported(rawWord: word)
+                return NEONDecoder.decodeDataProcessing(word)
             }
             let isQuad = word.bit(6)
             let dField = Int((word.bit(22) ? 1 << 4 : 0) | word.bitField(15, 12))
@@ -669,7 +700,9 @@ enum ARMDecoder {
         // VEXT's doc comment on the bit4 disambiguation). See
         // VectorShiftImmediateInstruction's doc comment for the opc/imm6
         // decoding.
-        if word.bitField(31, 25) == 0b1111_001, word.bit(23), word.bit(4) {
+        if word.bitField(31, 25) == 0b1111_001, word.bit(23), word.bit(4), !word.bit(7) {
+            // L (bit7) set means 64-bit elements, handled by the generic
+            // decoder (once misread here as 32-bit).
             let opc = word.bitField(11, 8)
             let unsigned = word.bit(24)
             let direction: VectorShiftImmediateInstruction.Direction
@@ -678,7 +711,7 @@ enum ARMDecoder {
             } else if opc == 0b0000 {
                 direction = .right
             } else {
-                return .unsupported(rawWord: word)
+                return NEONDecoder.decodeDataProcessing(word)
             }
             let imm6 = Int(word.bitField(21, 16))
             let elementBits: Int
@@ -689,8 +722,8 @@ enum ARMDecoder {
             } else if imm6 & 0b00_1000 != 0 {
                 elementBits = 8
             } else {
-                // size==64 (the L-bit encoding) isn't decoded yet.
-                return .unsupported(rawWord: word)
+                // size==64 (the L-bit encoding): the generic decoder.
+                return NEONDecoder.decodeDataProcessing(word)
             }
             let shiftAmount = direction == .left ? imm6 - elementBits : 2 * elementBits - imm6
             let isQuad = word.bit(6)
@@ -705,6 +738,11 @@ enum ARMDecoder {
                 vm: isQuad ? mField >> 1 : mField,
                 isQuad: isQuad
             ))
+        }
+
+        // Everything else in the Advanced SIMD data-processing space.
+        if word.bitField(31, 25) == 0b1111_001 {
+            return NEONDecoder.decodeDataProcessing(word)
         }
 
         return .unsupported(rawWord: word)

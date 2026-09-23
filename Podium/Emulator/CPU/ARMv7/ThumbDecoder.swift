@@ -17,9 +17,8 @@ import Foundation
 /// 5-bit immediate (format 9), halfword load-store with a 5-bit
 /// immediate (format 10), SP-relative (format
 /// 11), `ADD Rd,PC/SP,#imm` (format 12), SP adjustment (format 13),
-/// `PUSH`/`POP` (format 14), `LDMIA` (format 15 — the load form only;
-/// `STMIA`, same top-level shape with the load bit clear, isn't
-/// decoded since no real word has confirmed it), `SXTH`/`SXTB`/`UXTH`/
+/// `PUSH`/`POP` (format 14), `LDMIA`/`STMIA` (format 15), `CPS`,
+/// `SXTH`/`SXTB`/`UXTH`/
 /// `UXTB`, conditional and unconditional branch (formats 16/18),
 /// `CBZ`/`CBNZ`, and `IT`.
 /// Covers (32-bit): `MOVW`/`MOVT`, `UBFX`, `ADDW`, `BFI`/`BFC`, and
@@ -64,7 +63,12 @@ enum ThumbDecoder {
 
     static func decode(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
         if isThirtyTwoBitFirstHalfword(hw0) {
-            return decode32(hw0, hw1)
+            let decoded = decode32(hw0, hw1)
+            // The media/DSP operations share one ARM-form implementation.
+            if case .unsupported = decoded, let media = MediaDecoder.decodeThumb(hw0, hw1) {
+                return .armEquivalent(media)
+            }
+            return decoded
         }
         return decode16(hw0)
     }
@@ -208,6 +212,16 @@ enum ThumbDecoder {
                 isLoad: true, isIncrement: true, writeback: !registerList.bit16(rn), rn: rn, registerList: registerList
             ))
         }
+        // The store form always writes back (`Rn` in the list stores its
+        // original value when it's the lowest register; anything else is
+        // UNPREDICTABLE). Kexts use it all over for struct copies.
+        if hw0.bitField16(15, 11) == 0b11000 {
+            let registerList = UInt16(hw0.bitField16(7, 0))
+            guard registerList != 0 else { return .unsupported(rawHalfword: hw0, secondHalfword: nil) }
+            return .blockDataTransfer(ThumbBlockDataTransferInstruction(
+                isLoad: false, isIncrement: true, writeback: true, rn: Int(hw0.bitField16(10, 8)), registerList: registerList
+            ))
+        }
 
         // The whole 1011-prefixed "miscellaneous" space: format 13 (SP
         // adjust), format 14 (PUSH/POP), CBZ/CBNZ, IT. Disambiguated by
@@ -244,24 +258,30 @@ enum ThumbDecoder {
             case 0b1111: // IT, or a NOP-compatible hint when mask == 0.
                 let mask = hw0.bitField16(3, 0)
                 guard mask != 0 else {
-                    guard let hint = ThumbHint(rawValue: UInt16(hw0.bitField16(7, 4))) else {
+                    guard let hint = ProcessorHint(rawValue: UInt16(hw0.bitField16(7, 4))) else {
                         return .unsupported(rawHalfword: hw0, secondHalfword: nil)
                     }
                     return .hint(hint)
                 }
                 return .it(ThumbItInstruction(firstCondition: UInt8(hw0.bitField16(7, 4)), mask: UInt8(mask)))
+            case 0b0110:
+                // CPS (16-bit): `0110 011 im 0 A I F`, never a mode change.
+                guard hw0.bitField16(7, 5) == 0b011, !hw0.bit16(3) else {
+                    return .unsupported(rawHalfword: hw0, secondHalfword: nil)
+                }
+                return .armEquivalent(.changeProcessorState(ChangeProcessorStateInstruction(
+                    enable: !hw0.bit16(4), affectsAbort: hw0.bit16(2), affectsIRQ: hw0.bit16(1), affectsFIQ: hw0.bit16(0),
+                    changesMode: false, mode: 0
+                )))
             case 0b1010:
-                // REV/REV16 (Thumb16 form) — bit[6] selects (0=REV,
-                // 1=REV16), verified against a real `rev r0, r0` word
-                // from the actual kernel by flipping individual bits.
-                // Bit[7] must stay clear here — `REVSH` (and any other
-                // bit[7]==1 shape) isn't decoded, since no real word has
-                // confirmed it.
-                guard !hw0.bit16(7) else {
+                // REV/REV16/REVSH (Thumb16 form) — bits[7:6] select
+                // (00 REV, 01 REV16, 11 REVSH; 10 is undefined), verified
+                // against a real `rev r0, r0` word from the actual kernel.
+                guard let kind = ThumbReverseBytesInstruction.Kind(rawValue: UInt8(hw0.bitField16(7, 6))) else {
                     return .unsupported(rawHalfword: hw0, secondHalfword: nil)
                 }
                 return .reverseBytes(ThumbReverseBytesInstruction(
-                    isHalfwordWise: hw0.bit16(6), rd: Int(hw0.bitField16(2, 0)), rm: Int(hw0.bitField16(5, 3))
+                    kind: kind, rd: Int(hw0.bitField16(2, 0)), rm: Int(hw0.bitField16(5, 3))
                 ))
             default:
                 return .unsupported(rawHalfword: hw0, secondHalfword: nil)
@@ -271,7 +291,10 @@ enum ThumbDecoder {
         // Format 16: conditional branch.
         if hw0.bitField16(15, 12) == 0b1101 {
             let condBits = hw0.bitField16(11, 8)
-            guard condBits != 0b1110, condBits != 0b1111 else { // UDF / SWI space.
+            if condBits == 0b1111 { // SVC #imm8
+                return .armEquivalent(.supervisorCall(SupervisorCallInstruction(condition: .always, immediate: UInt32(hw0 & 0xFF))))
+            }
+            guard condBits != 0b1110 else { // UDF
                 return .unsupported(rawHalfword: hw0, secondHalfword: nil)
             }
             let imm8 = hw0.bitField16(7, 0)
@@ -325,6 +348,11 @@ enum ThumbDecoder {
             case 0b11:
                 if hw0.bitField16(11, 8) == 0b1110, hw1.bit16(4) {
                     return decode32Coprocessor(hw0, hw1)
+                }
+                // VFP data processing: the ARM word with cond AL, which
+                // `0xEExx` already is.
+                if hw0.bitField16(11, 8) == 0b1110, hw1.bitField16(11, 9) == 0b101 {
+                    return decode32AdvancedSIMD(armForm: UInt32(hw0) << 16 | UInt32(hw1), hw0, hw1)
                 }
                 if hw0.bitField16(11, 8) == 0b1111 {
                     return decode32AdvancedSIMD(armForm: advancedSIMDDataProcessingARMForm(hw0, hw1), hw0, hw1)
@@ -476,7 +504,22 @@ enum ThumbDecoder {
         switch hw0.bitField16(8, 7) {
         case 0b01: isIncrement = true
         case 0b10: isIncrement = false
-        default: return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+        default:
+            // SRSDB/RFEDB (`00`) and SRSIA/RFEIA (`11`): the ARM forms,
+            // run by the ARM executor (ARM DDI 0406C A6.3.5).
+            let increment = hw0.bitField16(8, 7) == 0b11
+            let writeback = hw0.bit16(5)
+            if !hw0.bit16(4), hw0.bitField16(3, 0) == 0b1101, hw1 & 0xFFE0 == 0xC000 {
+                return .armEquivalent(.storeReturnState(StoreReturnStateInstruction(
+                    increment: increment, before: !increment, writeback: writeback, mode: UInt32(hw1 & 0x1F)
+                )))
+            }
+            if hw0.bit16(4), hw1 == 0xC000 {
+                return .armEquivalent(.returnFromException(ReturnFromExceptionInstruction(
+                    increment: increment, before: !increment, writeback: writeback, rn: Int(hw0.bitField16(3, 0))
+                )))
+            }
+            return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
         }
         return .blockDataTransfer(ThumbBlockDataTransferInstruction(
             isLoad: hw0.bit16(4), isIncrement: isIncrement, writeback: hw0.bit16(5),
@@ -488,13 +531,16 @@ enum ThumbDecoder {
     /// `tbh [pc, r1, lsl #1]` word) and `LDRD`/`STRD` (immediate,
     /// verified against a real `strd r0, r1, [r8]` word) — both live in
     /// this bit[6]==1 sub-family (bits[15:9] == `1110100`, guaranteed
-    /// by the caller). `LDREX`/`STREX` (the third member of this space)
-    /// aren't decoded, since no real word has confirmed either.
+    /// by the caller), as do the exclusive loads/stores (`LDREX`/`STREX`
+    /// and their B/H/D forms), which run as their ARM equivalents.
     private static func decode32TableBranch(_ hw0: UInt16, _ hw1: UInt16) -> ThumbInstruction {
         if hw0.bitField16(15, 4) == 0b1110_1000_1101, hw1.bitField16(15, 5) == 0b111_1000_0000 {
             return .tableBranch(ThumbTableBranchInstruction(
                 rn: Int(hw0.bitField16(3, 0)), rm: Int(hw1.bitField16(3, 0)), isHalfword: hw1.bit16(4)
             ))
+        }
+        if let exclusive = decode32Exclusive(hw0, hw1) {
+            return .armEquivalent(exclusive)
         }
         // LDRD/STRD (immediate): P (bit8), U (bit7), fixed 1 (bit6,
         // already known true here), W (bit5), L (bit4, 1 = LDRD).
@@ -516,6 +562,52 @@ enum ThumbDecoder {
             writeback: hw0.bit16(5),
             offset: UInt32(hw1.bitField16(7, 0)) * 4
         ))
+    }
+
+    /// `LDREX`/`STREX` (`E85x`/`E84x`, word, `imm8 * 4` offset) and
+    /// `LDREXB/H/D`/`STREXB/H/D` (`E8Dx`/`E8Cx`, hw1 bits[7:4] `0100` byte,
+    /// `0101` halfword, `0111` doubleword) — ARM DDI 0406C A6.3.16.
+    private static func decode32Exclusive(_ hw0: UInt16, _ hw1: UInt16) -> ARMInstruction? {
+        let rn = Int(hw0.bitField16(3, 0))
+        let rt = Int(hw1.bitField16(15, 12))
+        let field = Int(hw1.bitField16(11, 8))
+        switch hw0.bitField16(15, 4) {
+        case 0b1110_1000_0101:
+            guard field == 0b1111 else { return nil }
+            return .loadExclusive(LoadExclusiveInstruction(
+                condition: .always, rt: rt, rn: rn, size: 4, offset: UInt32(hw1.bitField16(7, 0)) * 4
+            ))
+        case 0b1110_1000_0100:
+            return .storeExclusive(StoreExclusiveInstruction(
+                condition: .always, rd: field, rt: rt, rn: rn, size: 4, offset: UInt32(hw1.bitField16(7, 0)) * 4
+            ))
+        case 0b1110_1000_1101:
+            guard hw1.bitField16(3, 0) == 0b1111 else { return nil }
+            switch hw1.bitField16(7, 4) {
+            case 0b0100 where field == 0b1111:
+                return .loadExclusive(LoadExclusiveInstruction(condition: .always, rt: rt, rn: rn, size: 1))
+            case 0b0101 where field == 0b1111:
+                return .loadExclusive(LoadExclusiveInstruction(condition: .always, rt: rt, rn: rn, size: 2))
+            case 0b0111:
+                return .loadExclusiveDouble(LoadExclusiveDoubleInstruction(condition: .always, rt: rt, rt2: field, rn: rn))
+            default:
+                return nil
+            }
+        case 0b1110_1000_1100:
+            let rd = Int(hw1.bitField16(3, 0))
+            switch hw1.bitField16(7, 4) {
+            case 0b0100 where field == 0b1111:
+                return .storeExclusive(StoreExclusiveInstruction(condition: .always, rd: rd, rt: rt, rn: rn, size: 1))
+            case 0b0101 where field == 0b1111:
+                return .storeExclusive(StoreExclusiveInstruction(condition: .always, rd: rd, rt: rt, rn: rn, size: 2))
+            case 0b0111:
+                return .storeExclusiveDouble(StoreExclusiveDoubleInstruction(condition: .always, rd: rd, rt: rt, rt2: field, rn: rn))
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
     }
 
     /// `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/`STRH` (immediate), and the
@@ -728,6 +820,12 @@ enum ThumbDecoder {
         if hw0.bitField16(7, 4) == 0b1001, hw1.bitField16(7, 4) == 0b1010 {
             return .rbit(ThumbRbitInstruction(rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0))))
         }
+        // REV.W/REV16.W/REVSH.W: RBIT's siblings (hw1 bits[7:4] 1000,
+        // 1001, 1011 — ARM DDI 0406C A6.3.20), same as the 16-bit forms.
+        if hw0.bitField16(7, 4) == 0b1001, hw1.bitField16(7, 6) == 0b10,
+           let kind = ThumbReverseBytesInstruction.Kind(rawValue: UInt8(hw1.bitField16(5, 4))) {
+            return .reverseBytes(ThumbReverseBytesInstruction(kind: kind, rd: Int(hw1.bitField16(11, 8)), rm: Int(hw1.bitField16(3, 0))))
+        }
         // Extend family: op1 (hw0 bits[7:4]) 0000-0101, hw1 bits[7:6] == 10
         // with bits[5:4] the rotation. `Rn == 1111` is the plain extend;
         // any other `Rn` is the accumulating form.
@@ -846,19 +944,20 @@ enum ThumbDecoder {
                         rd: Int(hw1.bitField16(11, 8)), rn: Int(hw0.bitField16(3, 0)), lsb: lsb, width: widthMinus1 + 1
                     ))
                 }
-                if opField == 0b100000 {
-                    // ADDW; Rn == 1111 is ADR (see ThumbAdrInstruction's
-                    // doc comment).
+                if opField == 0b100000 || opField == 0b101010 {
+                    // ADDW/SUBW; Rn == 1111 is ADR (see
+                    // ThumbAdrInstruction's doc comment).
+                    let subtract = opField == 0b101010
                     let rn = hw0.bitField16(3, 0)
                     let i = hw0.bit16(10) ? UInt32(1) : 0
                     let imm3 = hw1.bitField16(14, 12)
                     let imm8 = hw1.bitField16(7, 0)
                     let imm12 = (i << 11) | (UInt32(imm3) << 8) | UInt32(imm8)
                     if rn == 0b1111 {
-                        return .adr(ThumbAdrInstruction(rd: Int(hw1.bitField16(11, 8)), imm12: UInt16(imm12)))
+                        return .adr(ThumbAdrInstruction(rd: Int(hw1.bitField16(11, 8)), imm12: UInt16(imm12), subtract: subtract))
                     }
                     return .addWide(ThumbAddWideInstruction(
-                        rd: Int(hw1.bitField16(11, 8)), rn: Int(rn), imm12: UInt16(imm12)
+                        rd: Int(hw1.bitField16(11, 8)), rn: Int(rn), imm12: UInt16(imm12), subtract: subtract
                     ))
                 }
                 if opField == 0b110110 {
@@ -929,6 +1028,13 @@ enum ThumbDecoder {
                 }
                 if hw0 == 0xF3BF, hw1 == 0x8F2F {
                     return .clearExclusive
+                }
+                // Hints (T2 `.W` forms): `F3AF`, then `10.0 .000 hint8`.
+                if hw0 == 0xF3AF, hw1 & 0xD700 == 0x8000 {
+                    guard hw1 & 0xFF <= 4, let hint = ProcessorHint(rawValue: hw1 & 0xFF) else {
+                        return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
+                    }
+                    return .hint(hint)
                 }
                 return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
             }

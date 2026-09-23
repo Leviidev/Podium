@@ -14,6 +14,8 @@ final class ARMv7CPUTests: XCTestCase {
         }
         let cpu = ARMv7CPU(memory: memory)
         cpu.reset()
+        // The VFP/NEON tests need the unit on (it resets disabled).
+        cpu.fpexc = ARMv7CPU.fpexcEnableBit
         return cpu
     }
 
@@ -256,10 +258,11 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertEqual(cpu.registers[4], 99)
     }
 
-    func testFetchingFromAnUnmappedRegionAfterEnablingTheMMUFaultsHonestly() {
+    func testFetchingFromAnUnmappedRegionRaisesAPrefetchAbort() {
         // Same setup as above, but the program then branches to a VA
         // whose first-level slot was never written — a real translation
-        // fault, not a silent continuation past untranslated memory.
+        // fault, which the guest's own Prefetch Abort handler gets (demand
+        // paging of user code depends on it).
         let cpu = makeCPU(program: [
             0xEE02_0F10, // MCR p15, #0, r0, c2, c0, #0  (TTBR0 = r0)
             0xEE03_2F10, // MCR p15, #0, r2, c3, c0, #0  (DACR = r2)
@@ -273,13 +276,13 @@ final class ARMv7CPUTests: XCTestCase {
 
         for _ in 0..<6 { cpu.step() } // 5 real instructions + the faulting fetch at the branch target
 
-        guard case .memoryFault(let underlying, let address) = cpu.lastError else {
-            return XCTFail("Expected .memoryFault, got \(String(describing: cpu.lastError))")
-        }
-        guard case .translationFault = underlying else {
-            return XCTFail("Expected .translationFault, got \(underlying)")
-        }
-        XCTAssertEqual(address, 0x0070_0000)
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.cpsr.rawValue & 0x1F, ARMv7CPU.abortModeBits)
+        XCTAssertEqual(cpu.registers.pc, 0x0C, "Prefetch Abort vector (low vectors)")
+        XCTAssertEqual(cpu.registers.lr, 0x0070_0004, "LR_abt = faulting address + 4")
+        XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 6, crm: 0, opc2: 2), 0x0070_0000, "IFAR")
+        XCTAssertEqual(cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 5, crm: 0, opc2: 1), 0b00101, "IFSR: section translation fault")
+        XCTAssertTrue(cpu.cpsr.irqDisabled)
     }
 
     func testEnablingSCTLRAccessFlagEnableHaltsHonestlyRatherThanMisreadingAPBits() {
@@ -1113,5 +1116,118 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertNil(toCore.lastError)
         XCTAssertEqual(toCore.registers[0], 0x3333_4444)
         XCTAssertEqual(toCore.registers[1], 0x1111_2222)
+    }
+
+    /// ARM-state `WFI` with nothing pending skips virtual time straight to
+    /// the next device event, exactly like the Thumb form.
+    func testARMWaitForInterruptSkipsToNextDeviceEvent() {
+        let cpu = makeCPU(program: [0xE320_F003]) // wfi
+        cpu.nextDeviceEventAt = 5_000
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers.pc, 4)
+        XCTAssertEqual(cpu.idleInstructionsSkipped, 5_000)
+    }
+
+    /// WFI wakes on the pin even while the interrupt is masked (CPSR.I
+    /// set, as in XNU's `cpu_idle`), so a pending IRQ means no skip.
+    func testARMWaitForInterruptDoesNotSkipWithMaskedInterruptPending() {
+        let cpu = makeCPU(program: [0xE320_F003]) // wfi
+        cpu.cpsr.irqDisabled = true
+        cpu.irqAsserted = true
+        cpu.nextDeviceEventAt = 5_000
+        cpu.step()
+        XCTAssertEqual(cpu.idleInstructionsSkipped, 0)
+    }
+
+    func testConditionalWaitForInterruptNotTakenDoesNotSkip() {
+        let cpu = makeCPU(program: [0x0320_F003]) // wfieq
+        cpu.cpsr.zero = false
+        cpu.nextDeviceEventAt = 5_000
+        cpu.step()
+        XCTAssertEqual(cpu.idleInstructionsSkipped, 0)
+    }
+
+    /// `LDREXD`/`STREXD` obey their condition like every other ARM
+    /// instruction: a failed `strexdne` must leave memory, the status
+    /// register and the monitor alone.
+    func testConditionalExclusiveDoubleNotTakenHasNoEffect() {
+        let cpu = makeCPU(program: [
+            0x11B2_2F9F, // ldrexdne r2, r3, [r2] — skipped
+            0x11A0_1F92, // strexdne r1, r2, r3, [r0] — skipped
+        ])
+        cpu.cpsr.zero = true
+        cpu.registers[0] = 0x80
+        cpu.registers[1] = 0xAAAA_AAAA
+        cpu.registers[2] = 0x40
+        cpu.step(); cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers[1], 0xAAAA_AAAA)
+        XCTAssertEqual(cpu.registers[2], 0x40)
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x80), 0)
+    }
+
+    /// `svc #0x80` from User mode: SVC mode, LR_svc = next instruction,
+    /// SPSR_svc = the User CPSR, vector 0x08 — how every syscall enters.
+    func testSupervisorCallFromUserMode() {
+        let cpu = makeCPU(program: [0xEF00_0080], memorySize: 0x1000)
+        cpu.cpsr.rawValue = ARMv7CPU.userModeBits
+        cpu.registers.sp = 0x800
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.cpsr.rawValue & 0x1F, ARMv7CPU.svcModeBits)
+        XCTAssertEqual(cpu.registers.lr, 4)
+        XCTAssertEqual(cpu.registers.pc, 0x08)
+        XCTAssertTrue(cpu.cpsr.irqDisabled)
+        XCTAssertEqual(cpu.savedProgramStatus(forModeBits: ARMv7CPU.svcModeBits).map { $0 & 0x1F }, ARMv7CPU.userModeBits)
+    }
+
+    /// `stm r0, {sp, lr}^` in SVC mode stores the *User* SP and LR, and
+    /// `ldm sp!, {r0, pc}^` returns to User mode through SPSR.
+    func testUserBankTransferAndExceptionReturn() throws {
+        let cpu = makeCPU(program: [
+            0xEF00_0000, // svc #0 (from User mode)
+            0xE8C0_6000, // at 0x08 (the SVC vector): stm r0, {sp, lr}^
+            0xE8FD_8001, // ldm sp!, {r0, pc}^
+        ], memorySize: 0x1000)
+        cpu.cpsr.rawValue = ARMv7CPU.userModeBits
+        cpu.registers.sp = 0x1111
+        cpu.registers.lr = 0x2222
+        cpu.step() // svc: now in SVC mode at 0x08
+        // Put the stm/ldm at the vector.
+        try cpu.memory.writeWord32(0xE8C0_6000, at: 0x08)
+        try cpu.memory.writeWord32(0xE8FD_8001, at: 0x0C)
+        cpu.registers[0] = 0x400
+        cpu.registers.sp = 0x800
+        try cpu.memory.writeWord32(0xAAAA, at: 0x800)
+        try cpu.memory.writeWord32(0x0100, at: 0x804)
+        cpu.step() // stm ... ^
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x400), 0x1111, "User SP, not SVC SP")
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x404), 0x2222, "User LR, not SVC LR")
+        cpu.step() // ldm sp!, {r0, pc}^
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.cpsr.rawValue & 0x1F, ARMv7CPU.userModeBits)
+        XCTAssertEqual(cpu.registers.pc, 0x100)
+        XCTAssertEqual(cpu.registers[0], 0xAAAA)
+        XCTAssertEqual(cpu.registers.sp, 0x1111, "back on the User stack")
+    }
+
+    /// `srsdb sp!, #0x13` then `rfeia sp!`: the return state goes to the
+    /// SVC stack and comes back as PC and CPSR.
+    func testStoreReturnStateAndReturnFromException() throws {
+        let cpu = makeCPU(program: [0xEF00_0000], memorySize: 0x1000) // svc #0 from User
+        cpu.cpsr.rawValue = ARMv7CPU.userModeBits
+        cpu.step()
+        try cpu.memory.writeWord32(0xF96D_0513, at: 0x08) // srsdb sp!, #0x13
+        try cpu.memory.writeWord32(0xF8BD_0A00, at: 0x0C) // rfeia sp!
+        cpu.registers.sp = 0x800
+        cpu.step()
+        XCTAssertEqual(cpu.registers.sp, 0x7F8)
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x7F8), 4, "LR_svc")
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x7FC) & 0x1F, ARMv7CPU.userModeBits, "SPSR_svc")
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.registers.pc, 4)
+        XCTAssertEqual(cpu.cpsr.rawValue & 0x1F, ARMv7CPU.userModeBits)
     }
 }

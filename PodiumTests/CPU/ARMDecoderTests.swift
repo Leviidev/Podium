@@ -327,7 +327,7 @@ final class ARMDecoderTests: XCTestCase {
         // (CPS, barriers, ...). An encoding within that space this
         // decoder doesn't recognize is honestly "not decoded yet"
         // (.unsupported), not "genuinely invalid" (.undefined).
-        let word: UInt32 = 0xF3A0_0005
+        let word: UInt32 = 0xF101_0200 // setend be
         if case .unsupported = ARMDecoder.decode(word) {
             // expected
         } else {
@@ -399,14 +399,11 @@ final class ARMDecoderTests: XCTestCase {
         // all. Field-to-operand mapping empirically confirmed via
         // Capstone (see ARMDecoder's decode-site comment), not read off a
         // manual table from memory.
-        guard case .vectorRoundingShiftLeft(let instr) = ARMDecoder.decode(0xF345_0500) else {
-            return XCTFail("Expected vectorRoundingShiftLeft")
+        // VRSHL Dd, Dm, Dn: Dm shifted by Dn — so n is the shift, m the value.
+        guard case .neon(let instr) = ARMDecoder.decode(0xF345_0500) else {
+            return XCTFail("Expected neon")
         }
-        XCTAssertTrue(instr.unsigned)
-        XCTAssertEqual(instr.size, .bits8)
-        XCTAssertEqual(instr.vd, 16)
-        XCTAssertEqual(instr.vm, 0)
-        XCTAssertEqual(instr.vn, 5)
+        XCTAssertEqual(instr, NEONInstruction(operation: .same(.roundingShiftLeft), esize: 8, unsigned: true, isQuad: false, d: 16, n: 5, m: 0))
     }
 
     func testDecodesVpushFromRealKernel() {
@@ -653,15 +650,24 @@ final class ARMDecoderTests: XCTestCase {
         XCTAssertEqual(instr.registerList, 0x80F0)
     }
 
-    func testBlockDataTransferWithSBitIsUnsupported() {
-        // Same shape as the real push above, but with bit22 (S) set —
-        // user-bank/exception-return semantics, not modeled.
-        let word: UInt32 = 0xE92D_40F0 | (1 << 22)
-        if case .unsupported = ARMDecoder.decode(word) {
-            // expected
-        } else {
-            XCTFail("Expected .unsupported for the S-bit block transfer form")
+    func testBlockDataTransferSBitSelectsUserRegisters() {
+        // stm sp, {r0-lr}^ — XNU's save of a user thread's registers on
+        // exception entry (0x80084274 in the real kernel).
+        guard case .blockDataTransfer(let instr) = ARMDecoder.decode(0xE8CD_7FFF) else {
+            return XCTFail("Expected blockDataTransfer")
         }
+        XCTAssertTrue(instr.userRegisters)
+        XCTAssertFalse(instr.isLoad)
+        XCTAssertEqual(instr.registerList, 0x7FFF)
+    }
+
+    func testDecodesSVCSRSAndRFE() {
+        guard case .supervisorCall(let svc) = ARMDecoder.decode(0xEF00_0080) else { return XCTFail("Expected svc") }
+        XCTAssertEqual(svc.immediate, 0x80)
+        guard case .storeReturnState(let srs) = ARMDecoder.decode(0xF8CD_0513) else { return XCTFail("Expected srs") }
+        XCTAssertEqual(srs, StoreReturnStateInstruction(increment: true, before: false, writeback: false, mode: 0x13))
+        guard case .returnFromException(let rfe) = ARMDecoder.decode(0xF8BD_0A00) else { return XCTFail("Expected rfe") }
+        XCTAssertEqual(rfe, ReturnFromExceptionInstruction(increment: true, before: false, writeback: true, rn: 13))
     }
 
     func testDecodesStrhFromRealKernel() {
@@ -776,6 +782,36 @@ final class ARMDecoderTests: XCTestCase {
             XCTAssertEqual(instr.vd, c.vd, String(format: "0x%08x", c.word))
             XCTAssertEqual(instr.isQuad, c.isQuad, String(format: "0x%08x", c.word))
             XCTAssertEqual(instr.imm64, c.imm64, String(format: "0x%08x", c.word))
+        }
+    }
+
+    /// The hints live in `MSR` (immediate)'s encoding with an empty field
+    /// mask; `0xE320F003` is the real `wfi` in the kernel's
+    /// `cpu_idle_wfi` (`0x80088C4C`). A non-empty mask is still an `MSR`.
+    func testDecodesHintsApartFromMSRImmediate() {
+        let cases: [(word: UInt32, condition: ARMCondition, hint: ProcessorHint)] = [
+            (0xE320_F000, .always, .nop),
+            (0xE320_F001, .always, .yield),
+            (0xE320_F002, .always, .waitForEvent),
+            (0xE320_F003, .always, .waitForInterrupt),
+            (0xE320_F004, .always, .sendEvent),
+            (0x1320_F003, .notEqual, .waitForInterrupt),
+        ]
+        for c in cases {
+            guard case .hint(let instr) = ARMDecoder.decode(c.word) else {
+                XCTFail(String(format: "Expected hint for 0x%08x", c.word))
+                continue
+            }
+            XCTAssertEqual(instr, HintInstruction(condition: c.condition, hint: c.hint), String(format: "0x%08x", c.word))
+        }
+        // msr CPSR_c, #0x13
+        guard case .moveToStatusRegister(let msr) = ARMDecoder.decode(0xE321_F013) else {
+            return XCTFail("Expected moveToStatusRegister")
+        }
+        XCTAssertEqual(msr.fieldMask, 1)
+        // DBG #0 (hint 0xF0) isn't one this CPU implements.
+        guard case .unsupported = ARMDecoder.decode(0xE320_F0F0) else {
+            return XCTFail("Expected unsupported")
         }
     }
 }

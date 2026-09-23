@@ -52,7 +52,7 @@ extension ARMv7CPU {
             let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
             hw0 = try memory.readWord16(at: physicalAddress)
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: instructionAddress)
+            if !raisePrefetchAbort(memoryError) { lastError = .memoryFault(memoryError, address: instructionAddress) }
             return
         } catch {
             lastError = .memoryFault(.unmappedAddress(instructionAddress), address: instructionAddress)
@@ -66,7 +66,7 @@ extension ARMv7CPU {
                 let physicalAddress2 = try translatedAddress(instructionAddress &+ 2, access: .execute)
                 hw1 = try memory.readWord16(at: physicalAddress2)
             } catch let memoryError as MemoryAccessError {
-                lastError = .memoryFault(memoryError, address: instructionAddress &+ 2)
+                if !raisePrefetchAbort(memoryError) { lastError = .memoryFault(memoryError, address: instructionAddress &+ 2) }
                 return
             } catch {
                 lastError = .memoryFault(.unmappedAddress(instructionAddress &+ 2), address: instructionAddress &+ 2)
@@ -186,6 +186,8 @@ extension ARMv7CPU {
             executeThumbMul(instr)
         case .advancedSIMD(let simd):
             execute(simd.instruction, rawWord: simd.armFormWord, instructionAddress: instructionAddress)
+        case .armEquivalent(let instruction):
+            execute(instruction, rawWord: 0, instructionAddress: instructionAddress)
         case .smmul(let instr):
             executeThumbSmmul(instr)
         case .packHalfword(let instr):
@@ -484,19 +486,16 @@ extension ARMv7CPU {
     private func executeThumbLoadStoreImmediate(_ instr: ThumbLoadStoreImmediateInstruction) {
         let address = registers[instr.rn] &+ instr.offset
         do {
-            let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
+            let width: Int
+            switch instr.size {
+            case .word: width = 4
+            case .byte: width = 1
+            case .halfword: width = 2
+            }
             if instr.isLoad {
-                switch instr.size {
-                case .word: registers[instr.rt] = try memory.readWord32(at: physicalAddress)
-                case .byte: registers[instr.rt] = UInt32(try memory.readByte(at: physicalAddress))
-                case .halfword: registers[instr.rt] = UInt32(try memory.readWord16(at: physicalAddress))
-                }
+                registers[instr.rt] = try readData(address, width: width)
             } else {
-                switch instr.size {
-                case .word: try memory.writeWord32(registers[instr.rt], at: physicalAddress)
-                case .byte: try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
-                case .halfword: try memory.writeWord16(UInt16(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
-                }
+                try writeData(registers[instr.rt], address, width: width)
             }
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -527,18 +526,17 @@ extension ARMv7CPU {
         let address = registers[instr.rn] &+ registers[instr.rm]
         do {
             let isLoad = instr.op != .str && instr.op != .strh && instr.op != .strb
-            let physicalAddress = try translatedAddress(address, access: isLoad ? .read : .write)
             switch instr.op {
-            case .str: try memory.writeWord32(registers[instr.rd], at: physicalAddress)
-            case .strh: try memory.writeWord16(UInt16(truncatingIfNeeded: registers[instr.rd]), at: physicalAddress)
-            case .strb: try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rd]), at: physicalAddress)
-            case .ldr: registers[instr.rd] = try memory.readWord32(at: physicalAddress)
-            case .ldrh: registers[instr.rd] = UInt32(try memory.readWord16(at: physicalAddress))
-            case .ldrb: registers[instr.rd] = UInt32(try memory.readByte(at: physicalAddress))
+            case .str: try writeData(registers[instr.rd], address, width: 4)
+            case .strh: try writeData(registers[instr.rd], address, width: 2)
+            case .strb: try writeData(registers[instr.rd], address, width: 1)
+            case .ldr: registers[instr.rd] = try readData(address, width: 4)
+            case .ldrh: registers[instr.rd] = try readData(address, width: 2)
+            case .ldrb: registers[instr.rd] = try readData(address, width: 1)
             case .ldrsb:
-                registers[instr.rd] = UInt32(bitPattern: Int32(Int8(bitPattern: try memory.readByte(at: physicalAddress))))
+                registers[instr.rd] = UInt32(bitPattern: Int32(Int8(bitPattern: UInt8(truncatingIfNeeded: try readData(address, width: 1)))))
             case .ldrsh:
-                registers[instr.rd] = UInt32(bitPattern: Int32(Int16(bitPattern: try memory.readWord16(at: physicalAddress))))
+                registers[instr.rd] = UInt32(bitPattern: Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: try readData(address, width: 2)))))
             }
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -635,10 +633,9 @@ extension ARMv7CPU {
 
         let tableValue: UInt32
         do {
-            let physicalAddress = try translatedAddress(indexAddress, access: .read)
             tableValue = instr.isHalfword
-                ? UInt32(try memory.readWord16(at: physicalAddress))
-                : UInt32(try memory.readByte(at: physicalAddress))
+                ? try readData(indexAddress, width: 2)
+                : try readData(indexAddress, width: 1)
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: indexAddress) { lastError = .memoryFault(memoryError, address: indexAddress) }
             return
@@ -710,9 +707,14 @@ extension ARMv7CPU {
     private func executeThumbReverseBytes(_ instr: ThumbReverseBytesInstruction) {
         let value = registers[instr.rm]
         let b0 = value & 0xFF, b1 = (value >> 8) & 0xFF, b2 = (value >> 16) & 0xFF, b3 = (value >> 24) & 0xFF
-        registers[instr.rd] = instr.isHalfwordWise
-            ? (b2 << 24) | (b3 << 16) | (b0 << 8) | b1
-            : (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        switch instr.kind {
+        case .word:
+            registers[instr.rd] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        case .halfwordWise:
+            registers[instr.rd] = (b2 << 24) | (b3 << 16) | (b0 << 8) | b1
+        case .signedHalfword:
+            registers[instr.rd] = UInt32(bitPattern: Int32(Int16(bitPattern: UInt16((b0 << 8) | b1))))
+        }
     }
 
     private func executeThumbMul(_ instr: ThumbMulInstruction) {
@@ -804,7 +806,8 @@ extension ARMv7CPU {
     }
 
     private func executeThumbAddWide(_ instr: ThumbAddWideInstruction) {
-        registers[instr.rd] = registers[instr.rn] &+ UInt32(instr.imm12)
+        let imm = UInt32(instr.imm12)
+        registers[instr.rd] = instr.subtract ? registers[instr.rn] &- imm : registers[instr.rn] &+ imm
     }
 
     /// `ADR` (`ADDW`-based T3 form): `Rd = Align(PC, 4) + imm12`, the
@@ -812,7 +815,7 @@ extension ARMv7CPU {
     /// (`executeThumbAddress`) uses.
     private func executeThumbAdr(_ instr: ThumbAdrInstruction, instructionAddress: UInt32) {
         let base = (instructionAddress &+ 4) & ~UInt32(0b11)
-        registers[instr.rd] = base &+ UInt32(instr.imm12)
+        registers[instr.rd] = instr.subtract ? base &- UInt32(instr.imm12) : base &+ UInt32(instr.imm12)
     }
 
     /// `BFI`/`BFC`: `sourceRegister == nil` (`BFC`) inserts zero.
@@ -943,15 +946,14 @@ extension ARMv7CPU {
         let transferAddress = instr.preIndexed ? offsetAddress : base
 
         do {
-            let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
                 var value: UInt32
                 if instr.isByte {
-                    value = UInt32(try memory.readByte(at: physicalAddress))
+                    value = try readData(transferAddress, width: 1)
                 } else if instr.isHalfword {
-                    value = UInt32(try memory.readWord16(at: physicalAddress))
+                    value = try readData(transferAddress, width: 2)
                 } else {
-                    value = try memory.readWord32(at: physicalAddress)
+                    value = try readData(transferAddress, width: 4)
                 }
                 if instr.isSigned {
                     value = instr.isHalfword
@@ -965,11 +967,11 @@ extension ARMv7CPU {
                     registers[instr.rt] = value
                 }
             } else if instr.isByte {
-                try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+                try writeData(registers[instr.rt], transferAddress, width: 1)
             } else if instr.isHalfword {
-                try memory.writeWord16(UInt16(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+                try writeData(registers[instr.rt], transferAddress, width: 2)
             } else {
-                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+                try writeData(registers[instr.rt], transferAddress, width: 4)
             }
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }
@@ -999,15 +1001,14 @@ extension ARMv7CPU {
         let address = registers[instr.rn] &+ offset
 
         do {
-            let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
                 var value: UInt32
                 if instr.isByte {
-                    value = UInt32(try memory.readByte(at: physicalAddress))
+                    value = try readData(address, width: 1)
                 } else if instr.isHalfword {
-                    value = UInt32(try memory.readWord16(at: physicalAddress))
+                    value = try readData(address, width: 2)
                 } else {
-                    value = try memory.readWord32(at: physicalAddress)
+                    value = try readData(address, width: 4)
                 }
                 if instr.isSigned {
                     value = instr.isHalfword
@@ -1021,11 +1022,11 @@ extension ARMv7CPU {
                     registers[instr.rt] = value
                 }
             } else if instr.isByte {
-                try memory.writeByte(UInt8(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+                try writeData(registers[instr.rt], address, width: 1)
             } else if instr.isHalfword {
-                try memory.writeWord16(UInt16(truncatingIfNeeded: registers[instr.rt]), at: physicalAddress)
+                try writeData(registers[instr.rt], address, width: 2)
             } else {
-                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+                try writeData(registers[instr.rt], address, width: 4)
             }
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }

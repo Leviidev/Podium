@@ -14,6 +14,8 @@ final class ThumbExecutionTests: XCTestCase {
         let cpu = ARMv7CPU(memory: memory)
         cpu.reset()
         cpu.cpsr.thumbState = true
+        // The VFP/NEON tests need the unit on (it resets disabled).
+        cpu.fpexc = ARMv7CPU.fpexcEnableBit
         return cpu
     }
 
@@ -1206,5 +1208,97 @@ final class ThumbExecutionTests: XCTestCase {
         cpu.step()
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers.pc, 4)
+    }
+
+    /// Instructions the kernelcache sweep found the decoder missing.
+    private func runThumb(_ halfwords: [UInt16], setup: (ARMv7CPU) -> Void = { _ in }) -> ARMv7CPU {
+        let cpu = makeThumbCPU(program: halfwords, memorySize: 0x400)
+        setup(cpu)
+        var steps = 0
+        while cpu.registers.pc < UInt32(halfwords.count * 2), steps < 64 {
+            cpu.step()
+            steps += 1
+        }
+        XCTAssertNil(cpu.lastError)
+        return cpu
+    }
+
+    func testSubwAndSubtractingAdr() {
+        // subw r4, r4, #0xa0c (0x80A51AB4 in the real kexts); subw r2, pc, #0x40c
+        let cpu = runThumb([0xF6A4, 0x240C, 0xF2AF, 0x420C]) { $0.registers[4] = 0x1000 }
+        XCTAssertEqual(cpu.registers[4], 0x1000 - 0xA0C)
+        XCTAssertEqual(cpu.registers[2], 0x8 &- 0x40C, "Align(PC, 4) - imm12, PC = 4 + 4")
+    }
+
+    func testSixteenBitStmiaStoresAndWritesBack() {
+        let cpu = runThumb([0xC00C]) { cpu in // stm r0!, {r2, r3}
+            cpu.registers[0] = 0x200
+            cpu.registers[2] = 0x1111_1111
+            cpu.registers[3] = 0x2222_2222
+        }
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x200), 0x1111_1111)
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x204), 0x2222_2222)
+        XCTAssertEqual(cpu.registers[0], 0x208)
+    }
+
+    func testReverseByteFamilies() {
+        // revsh r4, r5; rev.w r9, r3; rev16.w r10, r3 (rev16.w sb -> use r10 via its own word)
+        let cpu = runThumb([0xBAEC, 0xFA93, 0xF983]) { cpu in
+            cpu.registers[5] = 0x0000_80FF
+            cpu.registers[3] = 0x1122_3344
+        }
+        XCTAssertEqual(cpu.registers[4], 0xFFFF_FF80, "0x80FF byte-swapped is 0xFF80, sign-extended")
+        XCTAssertEqual(cpu.registers[9], 0x4433_2211)
+        guard case .reverseBytes(let rev16) = ThumbDecoder.decode(0xFA93, 0xF993) else {
+            return XCTFail("Expected rev16.w")
+        }
+        XCTAssertEqual(rev16.kind, .halfwordWise)
+    }
+
+    func testSixteenBitCPS() {
+        let cpu = runThumb([0xB662, 0xB676]) { cpu in // cpsie i; cpsid ai
+            cpu.cpsr.rawValue = (cpu.cpsr.rawValue & ~0x1F) | ARMv7CPU.svcModeBits
+            cpu.cpsr.irqDisabled = true
+        }
+        XCTAssertTrue(cpu.cpsr.irqDisabled, "cpsid ai re-masked IRQs")
+        XCTAssertNotEqual(cpu.cpsr.rawValue & ARMv7CPU.asyncAbortDisabledBit, 0)
+    }
+
+    func testThumbExclusivesPairAndFailAfterClear() {
+        // ldrex r1, [r0, #4]; strex r2, r1, [r0, #4] would need a word; use:
+        // ldrex r1, [r0]; adds r1, #1; strex r2, r1, [r0]
+        let cpu = runThumb([0xE850, 0x1F00, 0x3101, 0xE840, 0x1200]) { cpu in
+            cpu.registers[0] = 0x300
+            try! cpu.memory.writeWord32(41, at: 0x300)
+        }
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x300), 42)
+        XCTAssertEqual(cpu.registers[2], 0, "strex succeeded")
+
+        // A strex with no ldrex before it fails and stores nothing.
+        let lonely = runThumb([0xE840, 0x1200]) { cpu in
+            cpu.registers[0] = 0x300
+            cpu.registers[1] = 7
+        }
+        XCTAssertEqual(lonely.registers[2], 1)
+        XCTAssertEqual(try lonely.memory.readWord32(at: 0x300), 0)
+    }
+
+    func testThumbByteAndDoublewordExclusives() {
+        // ldrexb r1, [r0]; strexb r2, r1, [r0, #0] at 0x301; ldrexd r2, r3, [r0]; strexd r4, r2, r3, [r0]
+        let cpu = runThumb([0xE8D0, 0x1F4F, 0xE8C0, 0x1F42, 0xE8D0, 0x237F, 0xE8C0, 0x2374]) { cpu in
+            cpu.registers[0] = 0x300
+            try! cpu.memory.writeWord32(0x1234_56AB, at: 0x300)
+            try! cpu.memory.writeWord32(0xCAFE_BABE, at: 0x304)
+        }
+        XCTAssertEqual(cpu.registers[1], 0xAB, "ldrexb zero-extends one byte")
+        XCTAssertEqual(cpu.registers[2], 0x1234_56AB, "ldrexd low word into Rt")
+        XCTAssertEqual(cpu.registers[3], 0xCAFE_BABE, "ldrexd high word into Rt2")
+        XCTAssertEqual(cpu.registers[4], 0, "strexd succeeded")
+    }
+
+    func testWideWaitForInterruptDecodes() {
+        guard case .hint(.waitForInterrupt) = ThumbDecoder.decode(0xF3AF, 0x8003) else {
+            return XCTFail("Expected wfi.w")
+        }
     }
 }

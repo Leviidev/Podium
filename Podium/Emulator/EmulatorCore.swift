@@ -33,33 +33,13 @@ final class EmulatorCore {
     let networkInterface: NetworkInterface
     let inputController: InputController
 
-    /// The iPod touch 4's actual RAM size (Section 9 of the project spec).
-    static let physicalMemorySize = 256 * 1024 * 1024
-
-    /// Physical RAM base address for this SoC (S5L8930X / n81ap).
-    /// Not a guess: the real iPod4,1 6.1.6 kernel's `__TEXT` segment is
-    /// linked at 0x80001000, which only makes sense if physical RAM
-    /// starts at (or just below) 0x80000000 — observed directly via
-    /// `otool -l` on the actual decrypted kernelcache, not assumed from
-    /// documentation (Apple doesn't publish this).
-    static let physicalMemoryBaseAddress: UInt32 = 0x8000_0000
-
-    /// The iPod touch 4's actual panel resolution (Section 9 of the
-    /// project spec) and the framebuffer's assumed pixel format — 32
-    /// bits/pixel, no rotation (`BootVideoInfo.depth`'s low byte).
-    /// Nothing confirms this is the exact byte order the real kernel
-    /// draws in; `GuestFramebuffer` copies whatever bytes are actually
-    /// there rather than assuming this guess is correct.
-    static let framebufferWidth = 960
-    static let framebufferHeight = 640
-    private static let framebufferBytesPerPixel = 4
-    private static let framebufferRowBytes = UInt32(framebufferWidth * framebufferBytesPerPixel)
-    private static let framebufferSize = framebufferRowBytes * UInt32(framebufferHeight)
-    /// Reserved at the very top of the 256 MB RAM window, well above
-    /// where the kernel image/device tree/`pram` region load from the
-    /// bottom (see `attemptBoot`) — disjoint from that bottom-up layout
-    /// by construction, not by coincidence.
-    static let framebufferPhysicalAddress: UInt32 = physicalMemoryBaseAddress &+ UInt32(physicalMemorySize) &- framebufferSize
+    /// See `GuestMemoryLayout` for the real S5L8930X address map these
+    /// come from.
+    static let physicalMemorySize = GuestMemoryLayout.ramSize
+    static let physicalMemoryBaseAddress = GuestMemoryLayout.ramPhysicalBase
+    static let framebufferWidth = GuestMemoryLayout.framebufferWidth
+    static let framebufferHeight = GuestMemoryLayout.framebufferHeight
+    static let framebufferPhysicalAddress = GuestMemoryLayout.framebufferPhysicalAddress
 
     /// Caps a single boot attempt so unsupported guest code halts the
     /// attempt instead of running forever with no way to observe where it
@@ -113,6 +93,7 @@ final class EmulatorCore {
         // `DeviceTreeMemoryMap`).
         let bus = SegmentedMemoryBus(regions: [ram, lowSRAM])
         let armCPU = ARMv7CPU(memory: bus, jit: JITEngine())
+        armCPU.linearMap = (GuestMemoryLayout.kernelVirtualBase, GuestMemoryLayout.ramPhysicalBase, UInt32(GuestMemoryLayout.ramSize))
         armCPU.reset()
 
         memory = ram
@@ -142,7 +123,7 @@ final class EmulatorCore {
     /// expected, honest outcome, not a bug in the loader.
     func attemptBoot(firmware: ImportedFirmware, storedAt fileURL: URL) async {
         activateCoreIfNeeded()
-        guard let armCPU = cpu as? ARMv7CPU, let memory else { return }
+        guard let armCPU = cpu as? ARMv7CPU else { return }
 
         Self.resetLogFile()
         status = .booting
@@ -181,9 +162,19 @@ final class EmulatorCore {
             appendLog("Device tree extraction skipped: \(error.localizedDescription)")
         }
 
-        let image: LoadedKernelImage
+        // Devices with real behavior go on the bus first, so they take
+        // precedence over the plain-storage backing KernelBootstrap adds for
+        // the same peripheral windows.
+        guard let segmentedBus else { return }
+        let platform = S5L8930XPlatform(cpu: armCPU)
+        for region in platform.regions {
+            segmentedBus.addRegion(region)
+        }
+        self.platform = platform
+
+        let prepared: KernelBootstrap.Prepared
         do {
-            image = try MachOLoader.load(machO, into: memory)
+            prepared = try KernelBootstrap.prepare(kernel: machO, deviceTree: deviceTree, on: segmentedBus)
         } catch let error as FriendlyError {
             status = .error(error.userMessage)
             appendLog("Kernel load failed: \(error.developerDetail)")
@@ -193,139 +184,33 @@ final class EmulatorCore {
             appendLog("Kernel load failed: \(error.localizedDescription)")
             return
         }
-
-        // XNU's ARM entry code expects r0 to hold a boot_args pointer —
-        // normally filled in and passed by iBoot, which Podium doesn't
-        // run. Placed on the next page boundary past the kernel's own
-        // highest used address, which MachOLoader reports precisely
-        // rather than this guessing at a gap that's big enough.
-        let bootArgsAddress = (image.highestAddressUsed + 0xFFF) & ~UInt32(0xFFF)
-        // The real kernel's own boot code reads topOfKernelData straight
-        // into TTBR0 (confirmed via llvm-objdump: `ldr r4, [r0, #0x10]`
-        // then `mcr p15, #0, r5, c2, c0, #0` with r5 built from r4) —
-        // and TTBR0's low 14 bits are architecturally reserved/ignored
-        // (ARM DDI 0406C B4.1.154), so a real MMU walk always masks them
-        // off. A topOfKernelData that isn't itself 16KB-aligned would
-        // silently have its own first-level table address rounded down
-        // to some earlier, unrelated 16KB boundary — on real hardware
-        // this can't happen because iBoot always hands the kernel an
-        // aligned value, so this rounds up the same way rather than
-        // reproducing an address a real bootloader would never produce.
-        // The device tree, if extracted, is placed on its own page right
-        // after boot_args — real iBoot page-aligns each component it
-        // hands the kernel, and `topOfKernelData` below is computed to
-        // cover it, so there's no risk of the kernel's own early
-        // allocator reusing this range.
-        // The shipped device tree is the unpopulated IPSW template —
-        // iBoot never ran to patch in real clock/serial data. A
-        // handful of clock properties, left at their shipped 4-byte
-        // `0`, make the real kernel dereference `0` as a pointer (a
-        // genuine quirk of how a Thumb IT block's flags interact here
-        // — see DeviceTreePatcher's doc comment). Patching happens
-        // before any size-dependent layout below, since expanding
-        // those properties to their real 8-byte encoding changes the
-        // tree's total length.
-        // Devices with real behavior go on the bus first, so they take
-        // precedence over the plain-storage backing added below for the
-        // same peripheral windows.
-        let platform = S5L8930XPlatform(cpu: armCPU)
-        for region in platform.regions {
-            segmentedBus?.addRegion(region)
+        if let deviceTreeAddress = prepared.deviceTreeAddress {
+            appendLog("Device tree written at 0x\(deviceTreeAddress.hexString8) (\(Int64(prepared.deviceTreeLength).formattedByteCount)).")
         }
-        self.platform = platform
-
-        if deviceTree != nil {
-            DeviceTreePatcher.patchClockPlaceholders(&deviceTree!)
-            DeviceTreePatcher.patchNVRAMProxyData(&deviceTree!)
-            DeviceTreePatcher.patchClockFrequencies(&deviceTree!)
-
-            // Real SoC peripheral registers this specific firmware's
-            // device tree declares (see `DeviceTreeMemoryMap`'s doc
-            // comment) — backed now, once actually known, rather than
-            // guessed at when the bus was first stood up.
-            let ramRange = Self.physicalMemoryBaseAddress..<(Self.physicalMemoryBaseAddress &+ UInt32(Self.physicalMemorySize))
-            for region in DeviceTreeMemoryMap.peripheralRegions(in: deviceTree!, excluding: ramRange) {
-                segmentedBus?.addRegion(FlatPhysicalMemory(length: Int(region.size), baseAddress: region.address))
-            }
-        }
-
-        let deviceTreeAddress = (bootArgsAddress + UInt32(BootArgsBuilder.structSize) + 0xFFF) & ~UInt32(0xFFF)
-        let deviceTreeLength = UInt32(deviceTree?.count ?? 0)
-
-        // The `pram` node's `reg` property (see `DeviceTreePatcher
-        // .patchPramRegion`'s doc comment) needs to point at real,
-        // backed physical memory for the real kernel's panic-log
-        // mapping to succeed — reserved on its own page right after
-        // the device tree, same as every other component here.
-        let pramAddress = (deviceTreeAddress + deviceTreeLength + 0xFFF) & ~UInt32(0xFFF)
-        let pramSize: UInt32 = 0x1000
-        if deviceTree != nil {
-            DeviceTreePatcher.patchPramRegion(&deviceTree!, physicalAddress: pramAddress, size: pramSize)
-        }
-
-        let topOfKernelData = (pramAddress + pramSize + 0x3FFF) & ~UInt32(0x3FFF)
-        // v_display: iBoot's convention on real hardware is 1 for the
-        // main LCD — unconfirmed against this specific kernel's own
-        // code (unlike every other field here), so this is a real
-        // physical framebuffer either way; only this one field's exact
-        // value is a reasonable default rather than a traced fact.
-        let video = BootVideoInfo(
-            baseAddress: Self.framebufferPhysicalAddress,
-            display: 1,
-            rowBytes: Self.framebufferRowBytes,
-            width: UInt32(Self.framebufferWidth),
-            height: UInt32(Self.framebufferHeight),
-            depth: 32
-        )
-        let bootArgs = BootArgsBuilder.build(
-            virtBase: Self.physicalMemoryBaseAddress,
-            physBase: Self.physicalMemoryBaseAddress,
-            memSize: UInt32(Self.physicalMemorySize),
-            topOfKernelData: topOfKernelData,
-            deviceTreeP: deviceTree != nil ? deviceTreeAddress : 0,
-            deviceTreeLength: deviceTreeLength,
-            video: video
-        )
-        do {
-            try memory.writeBytes(bootArgs, at: bootArgsAddress)
-            if let deviceTree {
-                try memory.writeBytes(deviceTree, at: deviceTreeAddress)
-                appendLog("Device tree written at 0x\(deviceTreeAddress.hexString8) (\(Int64(deviceTree.count).formattedByteCount)).")
-            }
-        } catch {
-            status = .error("Podium couldn't set up this firmware's boot arguments.")
-            appendLog("boot_args write failed: \(error)")
-            return
-        }
-
-        var initialRegisters = image.initialRegisters
-        initialRegisters[0] = bootArgsAddress
 
         armCPU.reset()
-        armCPU.loadInitialRegisters(initialRegisters)
-        appendLog("boot_args written at 0x\(bootArgsAddress.hexString8) (virtBase=physBase=0x\(Self.physicalMemoryBaseAddress.hexString8), memSize=\(Int64(Self.physicalMemorySize).formattedByteCount)); r0 points there.")
-        appendLog("Kernel loaded. Entry point: 0x\(image.entryPointPC.hexString8). Starting execution…")
+        armCPU.loadInitialRegisters(prepared.initialRegisters)
+        appendLog("boot_args written at 0x\(prepared.bootArgsAddress.hexString8) (physBase=0x\(GuestMemoryLayout.ramPhysicalBase.hexString8), virtBase=0x\(GuestMemoryLayout.kernelVirtualBase.hexString8), memSize=\(Int64(prepared.memorySizeGivenToKernel).formattedByteCount)); r0 points there.")
+        appendLog("Kernel loaded. Entry point: 0x\(prepared.entryPoint.hexString8) (physical). Starting execution…")
 
-        // Run in chunks rather than one big `run(maxUnits:)` so this loop
-        // can watch for the CPU actually reaching the real kernel's
-        // `_panic` entry point (0x80017c10, confirmed via `nm` on the
-        // decrypted kernelcache) mid-execution. Real device runs so far
-        // reach a kernel panic well before any unsupported/undefined
-        // instruction or memory fault trips `armCPU.lastError`, so without
-        // this, Podium reports a misleadingly generic "still running"
-        // status instead of the actual panic.
-        let panicEntryAddress: UInt32 = 0x8001_7c10
+        // Breakpoints on the kernel's two panic entries (addresses from
+        // `nm` on the decrypted kernelcache): `_panic(fmt, ...)` and the
+        // unexported `panic_context(reason, ctx, fmt, ...)` exception
+        // handlers use, which jumps into `_panic`'s tail and so never
+        // passes its entry. Real runs reach a panic long before any
+        // unsupported instruction trips `lastError`; without these,
+        // Podium would only report a generic "still running".
+        let panicEntries: [UInt32: Int] = [0x8001_7c10: 0, 0x8001_7f28: 2] // entry -> register holding the format string
+        armCPU.breakpoints = Set(panicEntries.keys)
         let chunkSize = 200_000
         let stepBudget = Self.maxBootUnits
-        // With `maxBootUnits` raised into the billions, a single boot
-        // attempt can run for a long time with nothing to show for it in
-        // the log until it finally halts — this periodic line lets
-        // progress be checked (e.g. by pulling the persisted log file off
-        // the device mid-run) without waiting for that.
+        // With `maxBootUnits` in the billions, a single boot attempt can run
+        // a long time; this periodic line lets progress be checked (e.g. by
+        // pulling the persisted log file off the device mid-run).
         let progressLogInterval = 50_000_000
         var unitsSinceProgressLog = 0
         var unitsRun = 0
-        var hitPanic = false
+        var panicFormatRegister: Int?
         while unitsRun < stepBudget {
             let ran = await Task.detached(priority: .userInitiated) {
                 armCPU.run(maxUnits: min(chunkSize, stepBudget - unitsRun))
@@ -334,10 +219,10 @@ final class EmulatorCore {
             unitsSinceProgressLog += ran
             if unitsSinceProgressLog >= progressLogInterval {
                 unitsSinceProgressLog = 0
-                appendLog("Still running: \(unitsRun) instruction groups so far, PC now 0x\(armCPU.registers.pc.hexString8).")
+                appendLog("Still running: \(armCPU.retiredInstructionCount) instructions so far, PC now 0x\(armCPU.registers.pc.hexString8).")
             }
-            if armCPU.registers.pc == panicEntryAddress {
-                hitPanic = true
+            if let hit = armCPU.hitBreakpoint {
+                panicFormatRegister = panicEntries[hit]
                 break
             }
             if ran == 0 || armCPU.lastError != nil {
@@ -345,24 +230,24 @@ final class EmulatorCore {
             }
         }
 
-        if hitPanic {
-            let message = Self.readCString(from: memory, at: armCPU.registers[0], maxLength: 512)
-            status = .error("Kernel panic after \(unitsRun) instruction group\(unitsRun == 1 ? "" : "s"): \(message)")
-            appendLog("Kernel reached _panic (0x\(panicEntryAddress.hexString8)). Format string at 0x\(armCPU.registers[0].hexString8): \(message)")
+        let instructions = armCPU.retiredInstructionCount
+        if let register = panicFormatRegister {
+            let format = armCPU.registers[register]
+            let message = Self.readCString(from: segmentedBus, at: GuestMemoryLayout.physical(fromKernelVirtual: format), maxLength: 512)
+            status = .error("Kernel panic after \(instructions) instructions: \(message)")
+            appendLog("Kernel panicked (entry 0x\(armCPU.registers.pc.hexString8)). Format string at 0x\(format.hexString8): \(message)")
         } else if let error = armCPU.lastError {
-            status = .error("Halted after \(unitsRun) instruction group\(unitsRun == 1 ? "" : "s"): \(Self.describe(error)).")
+            status = .error("Halted after \(instructions) instructions: \(Self.describe(error)).")
             appendLog("Execution halted: \(error)")
         } else {
             status = .running
-            appendLog("Ran \(unitsRun) instruction groups without hitting an unimplemented instruction (step budget reached). PC now 0x\(armCPU.registers.pc.hexString8).")
+            appendLog("Ran \(instructions) instructions without hitting an unimplemented instruction (step budget reached). PC now 0x\(armCPU.registers.pc.hexString8).")
         }
 
-        // The `pram` region (see the comment above `pramAddress`) is where
-        // the real kernel's panic path writes its fully-rendered log —
-        // varargs substituted, unlike the raw format string at r0 above —
-        // so a real device run's crash log survives even if panic
-        // detection above ever misses the exact entry address.
-        if let pramText = Self.readPrintableText(from: memory, at: pramAddress, length: Int(pramSize)), !pramText.isEmpty {
+        // The `pram` region is where the kernel's panic path writes its
+        // fully-rendered log (varargs substituted, unlike the raw format
+        // string above), so a device run's crash log survives either way.
+        if let pramText = Self.readPrintableText(from: segmentedBus, at: prepared.pramAddress, length: Int(prepared.pramSize)), !pramText.isEmpty {
             appendLog("pram (panic log) region contents: \(pramText)")
         }
     }

@@ -27,9 +27,9 @@ struct LoadedKernelImage {
     /// against).
     let initialRegisters: [UInt32]
 
-    /// One past the highest address any `LC_SEGMENT` occupies (`vmaddr +
-    /// vmsize`, not just the file-backed portion — a segment's zero-fill
-    /// tail still claims that address range). Lets callers place
+    /// One past the highest *physical* address any `LC_SEGMENT` occupies
+    /// (`vmaddr + vmsize` after mapping, not just the file-backed portion —
+    /// a segment's zero-fill tail still claims that range). Lets callers place
     /// anything else they need in guest memory (like a `boot_args`
     /// struct) somewhere that's provably past the loaded kernel, instead
     /// of guessing a gap is big enough.
@@ -39,8 +39,11 @@ struct LoadedKernelImage {
 }
 
 /// Parses a 32-bit ARM Mach-O (`MH_MAGIC` / `CPU_TYPE_ARM`) and loads its
-/// `LC_SEGMENT`s into guest physical memory at their linked addresses —
-/// exactly the two things Podium's first boot attempt needs. There's no
+/// `LC_SEGMENT`s into guest physical memory — at their linked (virtual)
+/// addresses mapped through `physicalAddressForVirtual`, the way iBoot
+/// places the kernel in DRAM before handing it control with the MMU still
+/// off. The entry point is mapped the same way, since the CPU starts
+/// executing at a physical address. There's no
 /// dynamic linking, no symbol resolution, nothing past what gets bytes
 /// into memory at the right addresses and finds where to start executing.
 ///
@@ -58,7 +61,10 @@ enum MachOLoader {
     private static let machHeaderSize = 28
     private static let segmentCommandSize = 56
 
-    static func load(_ machO: Data, into memory: MemoryBus) throws -> LoadedKernelImage {
+    static func load(
+        _ machO: Data, into memory: MemoryBus,
+        physicalAddressForVirtual: (UInt32) -> UInt32 = { $0 }
+    ) throws -> LoadedKernelImage {
         guard machO.count >= machHeaderSize else { throw MachOLoaderError.notMachO }
         guard machO.readUInt32LE(at: 0) == machHeaderMagic32 else { throw MachOLoaderError.notMachO }
         guard Int32(bitPattern: machO.readUInt32LE(at: 4)) == cpuTypeARM else { throw MachOLoaderError.not32BitARM }
@@ -76,7 +82,7 @@ enum MachOLoader {
 
             switch cmd {
             case lcSegment:
-                let segmentEnd = try loadSegment(machO, commandOffset: offset, into: memory)
+                let segmentEnd = try loadSegment(machO, commandOffset: offset, into: memory, physicalAddressForVirtual: physicalAddressForVirtual)
                 highestAddressUsed = max(highestAddressUsed, segmentEnd)
             case lcUnixThread:
                 initialRegisters = readUnixThreadRegisters(machO, commandOffset: offset, cmdSize: cmdSize)
@@ -87,18 +93,23 @@ enum MachOLoader {
             offset += cmdSize
         }
 
-        guard let registers = initialRegisters else { throw MachOLoaderError.noEntryPoint }
+        guard var registers = initialRegisters else { throw MachOLoaderError.noEntryPoint }
+        registers[Registers.pcIndex] = physicalAddressForVirtual(registers[Registers.pcIndex])
         return LoadedKernelImage(initialRegisters: registers, highestAddressUsed: highestAddressUsed)
     }
 
-    /// Loads one segment's file-backed bytes into memory and returns
-    /// `vmaddr + vmsize` — the address one past everything this segment
-    /// claims, including any zero-fill tail beyond what's file-backed.
+    /// Loads one segment's file-backed bytes into memory and returns the
+    /// physical address one past everything this segment claims,
+    /// including any zero-fill tail beyond what's file-backed.
     @discardableResult
-    private static func loadSegment(_ machO: Data, commandOffset offset: Int, into memory: MemoryBus) throws -> UInt32 {
+    private static func loadSegment(
+        _ machO: Data, commandOffset offset: Int, into memory: MemoryBus,
+        physicalAddressForVirtual: (UInt32) -> UInt32
+    ) throws -> UInt32 {
         guard offset + segmentCommandSize <= machO.count else { return 0 }
 
         let vmaddr = machO.readUInt32LE(at: offset + 24)
+        let physicalAddress = physicalAddressForVirtual(vmaddr)
         let vmsize = machO.readUInt32LE(at: offset + 28)
         let fileoff = Int(machO.readUInt32LE(at: offset + 32))
         let filesize = Int(machO.readUInt32LE(at: offset + 36))
@@ -107,7 +118,7 @@ enum MachOLoader {
             let start = machO.startIndex + fileoff
             let segmentData = machO.subdata(in: start..<(start + filesize))
             do {
-                try memory.writeBytes(segmentData, at: vmaddr)
+                try memory.writeBytes(segmentData, at: physicalAddress)
             } catch let error as MemoryAccessError {
                 throw MachOLoaderError.memoryWriteFailed(error)
             }
@@ -117,7 +128,7 @@ enum MachOLoader {
         // everywhere, so there's nothing further to write for that gap —
         // it still counts toward highestAddressUsed below, though.
 
-        return vmaddr &+ vmsize
+        return physicalAddress &+ vmsize
     }
 
     private static func readUnixThreadRegisters(_ machO: Data, commandOffset offset: Int, cmdSize: Int) -> [UInt32]? {

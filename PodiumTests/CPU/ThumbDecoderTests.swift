@@ -627,7 +627,7 @@ final class ThumbDecoderTests: XCTestCase {
         guard case .reverseBytes(let instr) = ThumbDecoder.decode(0xba00, 0) else {
             return XCTFail("Expected reverseBytes")
         }
-        XCTAssertFalse(instr.isHalfwordWise)
+        XCTAssertEqual(instr.kind, .word)
         XCTAssertEqual(instr.rd, 0)
         XCTAssertEqual(instr.rm, 0)
     }
@@ -800,5 +800,14 @@ final class ThumbDecoderTests: XCTestCase {
         XCTAssertTrue(instr.addOffset)
         XCTAssertFalse(instr.writeback)
         XCTAssertEqual(instr.offset, 0)
+    }
+
+    func testDecodesWideHints() {
+        guard case .hint(.waitForInterrupt) = ThumbDecoder.decode(0xF3AF, 0x8003) else {
+            return XCTFail("Expected wfi.w")
+        }
+        guard case .hint(.nop) = ThumbDecoder.decode(0xF3AF, 0x8000) else {
+            return XCTFail("Expected nop.w")
+        }
     }
 }

@@ -186,4 +186,40 @@ final class DeviceTreePatcherTests: XCTestCase {
         let common = String(decoding: image[16..<64], as: UTF8.self)
         XCTAssertTrue(common.hasPrefix("auto-boot=true\0boot-args=debug=0x8\0"))
     }
+
+    /// `addProperty` appends to the right node, after its existing
+    /// properties and before its children, and bumps the node's count.
+    func testAddRAMDiskAppendsToMemoryMap() {
+        func property(_ name: String, value: Data) -> Data {
+            var data = Data(count: 32)
+            data.replaceSubrange(0..<name.utf8.count, with: Array(name.utf8))
+            var length = Data(count: 4)
+            length.writeUInt32LE(UInt32(value.count), at: 0)
+            return data + length + value + Data(count: (4 - value.count % 4) % 4)
+        }
+        func node(_ properties: [Data], children: [Data]) -> Data {
+            var header = Data(count: 8)
+            header.writeUInt32LE(UInt32(properties.count), at: 0)
+            header.writeUInt32LE(UInt32(children.count), at: 4)
+            return header + properties.reduce(Data(), +) + children.reduce(Data(), +)
+        }
+        let memoryMap = node([property("name", value: Data("memory-map\u{0}".utf8))], children: [])
+        let chosen = node([property("name", value: Data("chosen\u{0}".utf8))], children: [memoryMap])
+        let after = node([property("name", value: Data("after\u{0}".utf8))], children: [])
+        var tree = node([], children: [chosen, after])
+        let originalCount = tree.count
+
+        DeviceTreePatcher.addRAMDisk(&tree, physicalAddress: 0x4100_0000, size: 0x2000_0000)
+
+        XCTAssertEqual(tree.count, originalCount + 32 + 4 + 8)
+        guard let offset = valueOffset(of: "RAMDisk", in: tree) else { return XCTFail("no RAMDisk property") }
+        XCTAssertEqual(tree.readUInt32LE(at: offset), 0x4100_0000)
+        XCTAssertEqual(tree.readUInt32LE(at: offset + 4), 0x2000_0000)
+        XCTAssertEqual(tree.readUInt32LE(at: offset - 4), 8, "length field")
+        // memory-map's header: now two properties.
+        let memoryMapOffset = tree.range(of: Data("memory-map".utf8))!.lowerBound - tree.startIndex - 36 - 8
+        XCTAssertEqual(tree.readUInt32LE(at: memoryMapOffset), 2)
+        XCTAssertNotNil(tree.range(of: Data("after".utf8)), "the node after is intact")
+        XCTAssertGreaterThan(tree.range(of: Data("after".utf8))!.lowerBound, tree.startIndex + offset)
+    }
 }

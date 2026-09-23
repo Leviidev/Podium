@@ -325,25 +325,29 @@ struct ThumbBitFieldExtractInstruction: Equatable {
 /// `Rn == 1111` is `ADR` instead, not decoded here). `imm12 =
 /// i:imm3:imm8`, the same construction `MOVW`'s `imm16` uses minus its
 /// `imm4` field. Verified against a real `addw r0, r4, #0x4d4` word
-/// from the actual kernel. Doesn't affect flags.
+/// from the actual kernel. Doesn't affect flags. `SUBW` is the same
+/// encoding with op `0b101010`, `subtract` set — the kernel's kexts use
+/// it (`subw r4, r4, #0xa0c` at `0x80A51AB4`).
 struct ThumbAddWideInstruction: Equatable {
     let rd: Int
     let rn: Int
     let imm12: UInt16
+    let subtract: Bool
 }
 
 /// `ADR Rd, <label>` (Thumb-2, `ADDW`-based T3 form, `Rn == 1111`):
 /// `Rd = Align(PC, 4) + imm12`, the same `Align(PC, 4)` PC-relative base
 /// format 12's `ADD Rd, PC, #imm8*4` (`ThumbAddressInstruction`) uses,
 /// just with a plain (non-×4-scaled) 12-bit immediate and no `SP`
-/// option. The subtracting `SUBW`-based T2 `ADR` form isn't decoded
-/// (no real word has confirmed it). Verified against a real
+/// option. `subtract` is the `SUBW`-based T2 form, `Align(PC, 4) -
+/// imm12`. Verified against a real
 /// `addw r2, pc, #0x16` word (Capstone's literal disassembly of the
 /// `ADDW` encoding; architecturally this *is* `ADR`) from the actual
 /// kernel.
 struct ThumbAdrInstruction: Equatable {
     let rd: Int
     let imm12: UInt16
+    let subtract: Bool
 }
 
 /// `BFI Rd, Rn, #lsb, #width` / `BFC Rd, #lsb, #width` (Thumb-2,
@@ -635,11 +639,18 @@ struct ThumbMlsInstruction: Equatable {
 /// (`isHalfwordWise == true`) reverses each halfword independently
 /// (`Rd.byte[0]=Rm.byte[1]`, `Rd.byte[1]=Rm.byte[0]`,
 /// `Rd.byte[2]=Rm.byte[3]`, `Rd.byte[3]=Rm.byte[2]`) — never
-/// flag-setting. Verified against a real `rev r0, r0` word from the
-/// actual kernel; `REVSH` (a third variant in this same encoding space)
-/// isn't decoded, since no real word has confirmed it.
+/// flag-setting. `REVSH` swaps the low halfword's bytes and sign-extends
+/// it. Verified against a real `rev r0, r0` word from the actual kernel.
+/// The raw values are the 16-bit form's bits[7:6]; the 32-bit `.W` forms
+/// share them (hw1 bits[5:4]).
 struct ThumbReverseBytesInstruction: Equatable {
-    let isHalfwordWise: Bool
+    enum Kind: UInt8 {
+        case word = 0b00
+        case halfwordWise = 0b01
+        case signedHalfword = 0b11
+    }
+
+    let kind: Kind
     let rd: Int
     let rm: Int
 }
@@ -658,14 +669,6 @@ struct ThumbLoadStoreDualInstruction: Equatable {
     let addOffset: Bool
     let writeback: Bool
     let offset: UInt32
-}
-
-enum ThumbHint: UInt16, Equatable {
-    case nop = 0
-    case yield = 1
-    case waitForEvent = 2
-    case waitForInterrupt = 3
-    case sendEvent = 4
 }
 
 struct ThumbTableBranchInstruction: Equatable {
@@ -713,9 +716,10 @@ enum ThumbInstruction: Equatable {
     case memoryBarrier
     /// `CLREX` (Thumb-2, `F3BF 8F2F`) — see `ARMInstruction.clearExclusive`.
     case clearExclusive
-    /// The 16-bit hints sharing `IT`'s encoding space with a zero mask
-    /// (ARM DDI 0406C A6.2.5): `NOP`/`YIELD`/`WFE`/`WFI`/`SEV`.
-    case hint(ThumbHint)
+    /// `NOP`/`YIELD`/`WFE`/`WFI`/`SEV`: the 16-bit forms share `IT`'s
+    /// encoding space with a zero mask (ARM DDI 0406C A6.2.5), the 32-bit
+    /// `.W` forms are `F3AF 80xx` in the miscellaneous-control sub-table.
+    case hint(ProcessorHint)
     case it(ThumbItInstruction)
     case movWide(ThumbMovWideInstruction)
     case bitFieldExtract(ThumbBitFieldExtractInstruction)
@@ -736,6 +740,11 @@ enum ThumbInstruction: Equatable {
     case mla(ThumbMlaInstruction)
     case mul(ThumbMulInstruction)
     case advancedSIMD(ThumbAdvancedSIMDInstruction)
+    /// A Thumb-2 instruction whose operation the ARM-state executor
+    /// already implements, decoded straight into that ARM form (always
+    /// condition AL — an enclosing IT block is applied before execution):
+    /// the exclusive loads/stores so far.
+    case armEquivalent(ARMInstruction)
     case smmul(ThumbSmmulInstruction)
     case packHalfword(ThumbPackHalfwordInstruction)
     case rbit(ThumbRbitInstruction)

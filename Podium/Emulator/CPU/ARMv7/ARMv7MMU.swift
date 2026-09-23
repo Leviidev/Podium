@@ -26,10 +26,6 @@ enum ARMv7MMU {
         case execute
     }
 
-    private static let ttbr0Key = (opc1: 0, crn: 2, crm: 0, opc2: 0)
-    private static let ttbr1Key = (opc1: 0, crn: 2, crm: 0, opc2: 1)
-    private static let ttbcrKey = (opc1: 0, crn: 2, crm: 0, opc2: 2)
-    private static let dacrKey = (opc1: 0, crn: 3, crm: 0, opc2: 0)
 
     static func translate(
         virtualAddress: UInt32,
@@ -37,14 +33,14 @@ enum ARMv7MMU {
         cp15: CP15State,
         memory: MemoryBus
     ) throws -> UInt32 {
-        let ttbcr = read(cp15, ttbcrKey)
+        let ttbcr = cp15.ttbcr
         let n = Int(ttbcr.bitField(2, 0))
 
         // ARM DDI 0406C B3.5.4: with N==0, TTBR0 covers the whole 4GB
         // space. With N>0, TTBR0 covers VA[31:32-N] == 0 and TTBR1 covers
         // everything else.
         let useTTBR1 = n > 0 && (virtualAddress >> (32 - n)) != 0
-        let ttbr = read(cp15, useTTBR1 ? ttbr1Key : ttbr0Key)
+        let ttbr = useTTBR1 ? cp15.ttbr1 : cp15.ttbr0
 
         // TTBR1's table (and TTBR0's when N==0) is always the full
         // 4096-entry, 16KB table indexed by VA[31:20]. TTBR0's table
@@ -132,7 +128,7 @@ enum ARMv7MMU {
     /// (true for client, since manager returning normally isn't enough on
     /// its own to skip it).
     private static func checkDomain(_ domain: Int, isPage: Bool, cp15: CP15State, virtualAddress: UInt32, isWrite: Bool) throws -> Bool {
-        let dacr = read(cp15, dacrKey)
+        let dacr = cp15.dacr
         let mode = (dacr >> (domain * 2)) & 0b11
         switch mode {
         case 0b11:
@@ -166,7 +162,4 @@ enum ARMv7MMU {
         }
     }
 
-    private static func read(_ cp15: CP15State, _ key: (opc1: Int, crn: Int, crm: Int, opc2: Int)) -> UInt32 {
-        cp15.read(coprocessor: 15, opc1: key.opc1, crn: key.crn, crm: key.crm, opc2: key.opc2)
-    }
 }

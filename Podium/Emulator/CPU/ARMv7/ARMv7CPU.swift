@@ -67,6 +67,10 @@ final class ARMv7CPU: CPU {
     var lastError: CPUError?
     var cp15 = CP15State()
     var neon = NEONRegisters()
+    /// VFP system registers — see `ARMv7CPU+VFP.swift`. Both reset to 0:
+    /// FPEXC.EN clear, so the unit starts disabled, as on real hardware.
+    var fpscr: UInt32 = 0
+    var fpexc: UInt32 = 0
 
     /// Addresses `run(maxUnits:)` stops at (before executing the
     /// instruction there), leaving `registers` exactly as they were on
@@ -104,14 +108,15 @@ final class ARMv7CPU: CPU {
     static let abortModeBits: UInt32 = 0b10111
     static let irqModeBits: UInt32 = 0b10010
     static let fiqModeBits: UInt32 = 0b10001
+    static let undefinedModeBits: UInt32 = 0b11011
 
     /// SP/LR banked per processor mode (ARM DDI 0406C B1.3.3) — User and
     /// System share one bank (key `userModeBits`), the other five modes
     /// each have their own. Populated lazily: a mode's bank simply reads
     /// back 0 until either the guest's own boot code switches into it (via
     /// `MSR CPSR_c`) to set up its stack, or exception entry visits it.
-    private var bankedSP: [UInt32: UInt32] = [:]
-    private var bankedLR: [UInt32: UInt32] = [:]
+    private(set) var bankedSP: [UInt32: UInt32] = [:]
+    private(set) var bankedLR: [UInt32: UInt32] = [:]
 
     /// SPSR per mode (ARM DDI 0406C B1.3.3) — only FIQ/IRQ/SVC/Abort/Undef
     /// have one; User/System don't and are never keyed here. Written by
@@ -158,8 +163,8 @@ final class ARMv7CPU: CPU {
         }
     }
 
-    private var fiqR8toR12 = [UInt32](repeating: 0, count: 5)
-    private var sharedR8toR12 = [UInt32](repeating: 0, count: 5)
+    private(set) var fiqR8toR12 = [UInt32](repeating: 0, count: 5)
+    private(set) var sharedR8toR12 = [UInt32](repeating: 0, count: 5)
 
     // MARK: - Interrupts and device time
 
@@ -229,7 +234,7 @@ final class ARMv7CPU: CPU {
         registers.pc = exceptionVectorBaseAddress &+ (isFIQ ? 0x1C : 0x18)
     }
 
-    private static let asyncAbortDisabledBit: UInt32 = 1 << 8
+    static let asyncAbortDisabledBit: UInt32 = 1 << 8
 
     /// WFI: nothing happens until an interrupt is asserted (masked or
     /// not — WFI wakes on the pin, ARM DDI 0406C B1.8.13). With nothing
@@ -331,12 +336,13 @@ final class ARMv7CPU: CPU {
 
         let instructionAddress = registers.pc
         currentInstructionAddress = instructionAddress
+        currentInstructionITState = 0
         let word: UInt32
         do {
             let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
             word = try memory.readWord32(at: physicalAddress)
         } catch let memoryError as MemoryAccessError {
-            lastError = .memoryFault(memoryError, address: instructionAddress)
+            if !raisePrefetchAbort(memoryError) { lastError = .memoryFault(memoryError, address: instructionAddress) }
             return
         } catch {
             lastError = .memoryFault(.unmappedAddress(instructionAddress), address: instructionAddress)
@@ -388,6 +394,45 @@ final class ARMv7CPU: CPU {
         isRunning = false
     }
 
+    /// The kernel's linear map of DRAM: XNU maps all of it contiguously
+    /// from `virtBase` (see `GuestMemoryLayout`). The JIT relies on it — a
+    /// compiled block reads its code, and its loads/stores go straight to
+    /// host memory, without a page-table walk, so with the MMU on the JIT
+    /// only runs code inside this window and only fast-paths accesses
+    /// inside it, where virtual and physical addresses differ by a
+    /// constant. Everything else (user space, `kernel_map` allocations)
+    /// takes the interpreter's real translation.
+    var linearMap: (virtualBase: UInt32, physicalBase: UInt32, length: UInt32)? {
+        didSet { linearMapHostPointer = nil }
+    }
+    private var linearMapHostPointer: UnsafeMutableRawPointer?
+
+    /// Where the JIT may find the code at virtual `address`: the same
+    /// address while the MMU is off, its linear-map image while it's on;
+    /// `nil` (interpret) outside the linear window.
+    @inline(__always)
+    private func jitPhysicalAddress(_ address: UInt32) -> UInt32? {
+        guard mmuEnabled else { return address }
+        guard let map = linearMap, address &- map.virtualBase < map.length else { return nil }
+        return address &- map.virtualBase &+ map.physicalBase
+    }
+
+    /// The RAM window a compiled load/store may access directly, in the
+    /// addresses the code uses: physical DRAM while the MMU is off, the
+    /// linear map's virtual window while it's on.
+    private func fastPathWindow() -> (pointer: UnsafeMutableRawPointer, guestBase: UInt32, length: UInt32)? {
+        guard let map = linearMap else {
+            guard !mmuEnabled, let region = memory.fastPathRegion(for: registers.pc) else { return nil }
+            return (region.pointer, region.regionBaseAddress, UInt32(region.regionLength))
+        }
+        if linearMapHostPointer == nil, let region = memory.fastPathRegion(for: map.physicalBase),
+           UInt64(map.physicalBase - region.regionBaseAddress) + UInt64(map.length) <= UInt64(region.regionLength) {
+            linearMapHostPointer = region.pointer + Int(map.physicalBase - region.regionBaseAddress)
+        }
+        guard let pointer = linearMapHostPointer else { return nil }
+        return (pointer, mmuEnabled ? map.virtualBase : map.physicalBase, map.length)
+    }
+
     private func runOneUnit() {
         // `JITEngine` picks the right decoder/translator internally based
         // on `thumbState` (ARM-state `DataProcessingInstruction`s via
@@ -420,27 +465,17 @@ final class ARMv7CPU: CPU {
         // IT block that the JIT executed anyway). Falling back to the
         // interpreter for the (at most 4) instructions an IT block can
         // cover is a small, bounded cost next to getting this wrong.
-        if let jit, itState == 0, let block = jit.block(at: registers.pc, thumbState: cpsr.thumbState, memory: memory),
+        if let jit, itState == 0, let codeAddress = jitPhysicalAddress(registers.pc),
+           let block = jit.block(at: codeAddress, thumbState: cpsr.thumbState, memory: memory),
            virtualTime &+ UInt64(block.instructionCount) <= nextDeviceEventAt {
-            // The fast-path region (if any) covering the *current* pc —
-            // queried fresh each unit rather than cached, since which
-            // region (or whether one exists at all) can only be answered
-            // for a specific address. Gated on `containsMemoryAccess`:
-            // most compiled blocks are register-only and never read
-            // `x1`/`w2`/`w3` at all, so resolving a region for them was
-            // pure waste — measured as a real, if modest, per-unit cost
-            // (`SegmentedMemoryBus.fastPathRegion` walks its region list)
-            // that, paid on every single cache hit regardless of whether
-            // the block could ever use it, was enough to turn this
-            // session's load/store rollout into a net *slowdown* before
-            // this check was added.
+            // Gated on `containsMemoryAccess`: most compiled blocks are
+            // register-only and never read `x1`/`w2`/`w3` at all.
             let completed: Int
             if block.containsMemoryAccess {
-                let startPC = registers.pc
-                let fastPath = memory.fastPathRegion(for: registers.pc)
+                let window = fastPathWindow()
                 completed = registers.withUnsafeMutableStorage { regPtr in
                     withUnsafeMutablePointer(to: &cpsr.rawValue) { cpsrPtr in
-                        block.run(registers: regPtr, ramHostPointer: fastPath?.pointer, ramGuestBase: fastPath?.regionBaseAddress ?? 0, ramGuestLength: UInt32(fastPath?.regionLength ?? 0), cpsr: cpsrPtr)
+                        block.run(registers: regPtr, ramHostPointer: window?.pointer, ramGuestBase: window?.guestBase ?? 0, ramGuestLength: window?.length ?? 0, cpsr: cpsrPtr)
                     }
                 }
                 // See `JITEngine.reportMemoryBlockOutcome`'s doc comment: a
@@ -448,7 +483,7 @@ final class ARMv7CPU: CPU {
                 // the fast-path region (`completed == 0` every time) costs
                 // more than it saves, so this reports the outcome back for
                 // eviction bookkeeping.
-                jit.reportMemoryBlockOutcome(at: startPC, thumbState: cpsr.thumbState, madeProgress: completed > 0)
+                jit.reportMemoryBlockOutcome(at: codeAddress, thumbState: cpsr.thumbState, madeProgress: completed > 0)
             } else {
                 completed = registers.withUnsafeMutableStorage { regPtr in
                     withUnsafeMutablePointer(to: &cpsr.rawValue) { cpsrPtr in
@@ -483,6 +518,11 @@ final class ARMv7CPU: CPU {
     /// Internal (not private) so Thumb's Advanced SIMD instructions, which
     /// decode to their ARM-state form, run through this same executor.
     func execute(_ instruction: ARMInstruction, rawWord: UInt32, instructionAddress: UInt32) {
+        // See ARMv7CPU+VFP.swift on XNU's lazy VFP switching.
+        if fpexc & Self.fpexcEnableBit == 0, let condition = instruction.floatingPointUnitCondition {
+            if cpsr.isSatisfied(condition) { raiseUndefinedInstruction() }
+            return
+        }
         switch instruction {
         case .dataProcessing(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
@@ -560,9 +600,12 @@ final class ARMv7CPU: CPU {
             executeClz(instr)
 
         case .loadExclusiveDouble(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
             executeLoadExclusiveDouble(instr)
         case .storeExclusiveDouble(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
             executeStoreExclusiveDouble(instr)
+
         case .loadExclusive(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeLoadExclusive(instr)
@@ -578,8 +621,6 @@ final class ARMv7CPU: CPU {
         case .clearExclusive:
             exclusiveMonitorAddress = nil
 
-        case .vectorRoundingShiftLeft(let instr):
-            executeVectorRoundingShiftLeft(instr)
 
         case .bitwiseExclusiveOr(let instr):
             executeBitwiseExclusiveOr(instr)
@@ -611,6 +652,35 @@ final class ARMv7CPU: CPU {
         case .vfpTwoRegisterTransfer(let instr):
             guard cpsr.isSatisfied(instr.condition) else { return }
             executeVFPTwoRegisterTransfer(instr)
+
+        case .vfpDataProcessing(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeVFPDataProcessing(instr)
+
+        case .neon(let instr):
+            executeNEON(instr)
+
+        case .media(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            executeMedia(instr)
+
+        case .neonStructureLoadStore(let instr):
+            executeNEONStructureLoadStore(instr)
+
+        case .hint(let instr):
+            // WFE/SEV only matter between cores; see the Thumb executor.
+            guard cpsr.isSatisfied(instr.condition), instr.hint == .waitForInterrupt else { return }
+            waitForInterrupt()
+
+        case .supervisorCall(let instr):
+            guard cpsr.isSatisfied(instr.condition) else { return }
+            takeSupervisorCall()
+
+        case .storeReturnState(let instr):
+            executeStoreReturnState(instr)
+
+        case .returnFromException(let instr):
+            executeReturnFromException(instr)
 
         case .unsupported:
             lastError = .unsupportedInstruction(rawWord: rawWord, address: instructionAddress)
@@ -695,13 +765,66 @@ final class ARMv7CPU: CPU {
     /// keeps a plain CP15 write (`cp15.write` below) sufficient to turn
     /// the MMU on or off, exactly like real hardware.
     var mmuEnabled: Bool {
-        cp15.read(coprocessor: Self.sctlrCoprocessor, opc1: Self.sctlrOpc1, crn: Self.sctlrCRn, crm: Self.sctlrCRm, opc2: Self.sctlrOpc2)
-            & Self.sctlrMMUEnableBit != 0
+        cp15.sctlr & Self.sctlrMMUEnableBit != 0
     }
 
     func translatedAddress(_ virtualAddress: UInt32, access: ARMv7MMU.Access) throws -> UInt32 {
         guard mmuEnabled else { return virtualAddress }
         return try ARMv7MMU.translate(virtualAddress: virtualAddress, access: access, cp15: cp15, memory: memory)
+    }
+
+    // MARK: - Data accesses that may cross a page
+
+    /// Physical addresses for each byte of a `width`-byte access at
+    /// `virtualAddress`. An unaligned access (legal for LDR/STR/LDRH/STRH
+    /// with SCTLR.A clear) can straddle a 4 KB page boundary, and the next
+    /// virtual page is almost never the next physical one — translating
+    /// only the first byte read or wrote the tail in the wrong page. That
+    /// silently corrupted the kernel's zlib output (its inflate reads the
+    /// input with unaligned loads), so exec of launchd failed with
+    /// "failed to inflate in one pass". Every page is translated (and
+    /// permission-checked) before anything is written.
+    @inline(__always)
+    private func splitsAcrossPages(_ virtualAddress: UInt32, width: Int) -> Bool {
+        mmuEnabled && Int(virtualAddress & 0xFFF) + width > 0x1000
+    }
+
+    private func bytePhysicalAddresses(_ virtualAddress: UInt32, width: Int, access: ARMv7MMU.Access) throws -> [UInt32] {
+        let first = try translatedAddress(virtualAddress, access: access)
+        let boundary = 0x1000 - Int(virtualAddress & 0xFFF)
+        let second = try translatedAddress(virtualAddress &+ UInt32(boundary), access: access)
+        return (0..<width).map { $0 < boundary ? first &+ UInt32($0) : second &+ UInt32($0 - boundary) }
+    }
+
+    func readData(_ virtualAddress: UInt32, width: Int) throws -> UInt32 {
+        if splitsAcrossPages(virtualAddress, width: width) {
+            var value: UInt32 = 0
+            for (i, physical) in try bytePhysicalAddresses(virtualAddress, width: width, access: .read).enumerated() {
+                value |= UInt32(try memory.readByte(at: physical)) << UInt32(8 * i)
+            }
+            return value
+        }
+        let physical = try translatedAddress(virtualAddress, access: .read)
+        switch width {
+        case 1: return UInt32(try memory.readByte(at: physical))
+        case 2: return UInt32(try memory.readWord16(at: physical))
+        default: return try memory.readWord32(at: physical)
+        }
+    }
+
+    func writeData(_ value: UInt32, _ virtualAddress: UInt32, width: Int) throws {
+        if splitsAcrossPages(virtualAddress, width: width) {
+            for (i, physical) in try bytePhysicalAddresses(virtualAddress, width: width, access: .write).enumerated() {
+                try memory.writeByte(UInt8(truncatingIfNeeded: value >> UInt32(8 * i)), at: physical)
+            }
+            return
+        }
+        let physical = try translatedAddress(virtualAddress, access: .write)
+        switch width {
+        case 1: try memory.writeByte(UInt8(truncatingIfNeeded: value), at: physical)
+        case 2: try memory.writeWord16(UInt16(truncatingIfNeeded: value), at: physical)
+        default: try memory.writeWord32(value, at: physical)
+        }
     }
 
     /// SCTLR.V (bit 13): selects the real ARM low-vectors (0x00000000) or
@@ -712,6 +835,168 @@ final class ARMv7CPU: CPU {
     var exceptionVectorBaseAddress: UInt32 {
         let sctlr = cp15.read(coprocessor: Self.sctlrCoprocessor, opc1: Self.sctlrOpc1, crn: Self.sctlrCRn, crm: Self.sctlrCRm, opc2: Self.sctlrOpc2)
         return sctlr & Self.sctlrHighVectorsBit != 0 ? 0xFFFF_0000 : 0x0000_0000
+    }
+
+    /// Supervisor Call exception entry (ARM DDI 0406C B1.9.4): SVC mode,
+    /// `LR_svc` = the next instruction (the call has completed — so SPSR
+    /// gets the IT state already advanced past it), IRQs masked, ARM state,
+    /// vector +0x08.
+    func takeSupervisorCall() {
+        let savedCPSR = Self.cpsr(cpsr.rawValue, withITState: cpsr.thumbState ? itState : 0)
+        switchProcessorMode(from: savedCPSR & Self.modeBitsMask, to: Self.svcModeBits)
+        setSavedProgramStatus(savedCPSR, forModeBits: Self.svcModeBits)
+        registers.lr = registers.pc
+        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask & ~Self.itBitsMask) | Self.svcModeBits
+        itState = 0
+        cpsr.thumbState = false
+        cpsr.irqDisabled = true
+        registers.pc = exceptionVectorBaseAddress &+ 0x08
+    }
+
+    /// Exception return: CPSR (mode, flags, masks, T, ITSTATE) from
+    /// `savedCPSR`, banking in the restored mode's registers, then a
+    /// jump to `address` aligned for the restored instruction set.
+    private func returnFromException(to address: UInt32, restoring savedCPSR: UInt32) {
+        let oldModeBits = cpsr.rawValue & Self.modeBitsMask
+        cpsr.rawValue = savedCPSR & ~Self.itBitsMask
+        itState = Self.itState(fromCPSR: savedCPSR)
+        switchProcessorMode(from: oldModeBits, to: cpsr.rawValue & Self.modeBitsMask)
+        registers.pc = address & (cpsr.thumbState ? ~UInt32(1) : ~UInt32(3))
+    }
+
+    /// The User/System-mode copy of a register while executing in another
+    /// mode — what `STM`/`LDM` with `^` transfer. r13/r14 live in the
+    /// User bank; r8-r12 are banked away only while in FIQ mode.
+    private func userBankRegister(_ index: Int) -> UInt32 {
+        let mode = cpsr.rawValue & Self.modeBitsMask
+        guard Self.bankKey(forModeBits: mode) != Self.userModeBits else { return registers[index] }
+        switch index {
+        case 13: return bankedSP[Self.userModeBits] ?? 0
+        case 14: return bankedLR[Self.userModeBits] ?? 0
+        case 8...12 where mode == Self.fiqModeBits: return sharedR8toR12[index - 8]
+        default: return registers[index]
+        }
+    }
+
+    private func setUserBankRegister(_ index: Int, _ value: UInt32) {
+        let mode = cpsr.rawValue & Self.modeBitsMask
+        guard Self.bankKey(forModeBits: mode) != Self.userModeBits else {
+            registers[index] = value
+            return
+        }
+        switch index {
+        case 13: bankedSP[Self.userModeBits] = value
+        case 14: bankedLR[Self.userModeBits] = value
+        case 8...12 where mode == Self.fiqModeBits: sharedR8toR12[index - 8] = value
+        default: registers[index] = value
+        }
+    }
+
+    /// A mode's stack pointer, whether or not that mode is current.
+    private func stackPointer(forMode modeBits: UInt32) -> UInt32 {
+        Self.bankKey(forModeBits: modeBits) == Self.bankKey(forModeBits: cpsr.rawValue & Self.modeBitsMask)
+            ? registers.sp : bankedSP[Self.bankKey(forModeBits: modeBits)] ?? 0
+    }
+
+    private func setStackPointer(_ value: UInt32, forMode modeBits: UInt32) {
+        if Self.bankKey(forModeBits: modeBits) == Self.bankKey(forModeBits: cpsr.rawValue & Self.modeBitsMask) {
+            registers.sp = value
+        } else {
+            bankedSP[Self.bankKey(forModeBits: modeBits)] = value
+        }
+    }
+
+    /// The first address an `SRS`/`RFE` transfers, for its two words.
+    private static func returnStateAddress(base: UInt32, increment: Bool, before: Bool) -> UInt32 {
+        increment ? (before ? base &+ 4 : base) : (before ? base &- 8 : base &- 4)
+    }
+
+    /// `SRS`: see `StoreReturnStateInstruction`. UNPREDICTABLE in User and
+    /// System modes (no SPSR) — ignored there.
+    private func executeStoreReturnState(_ instr: StoreReturnStateInstruction) {
+        let currentMode = cpsr.rawValue & Self.modeBitsMask
+        guard let spsr = savedProgramStatus(forModeBits: currentMode) else { return }
+        let base = stackPointer(forMode: instr.mode)
+        let address = Self.returnStateAddress(base: base, increment: instr.increment, before: instr.before)
+        do {
+            try memory.writeWord32(registers.lr, at: try translatedAddress(address, access: .write))
+            try memory.writeWord32(spsr, at: try translatedAddress(address &+ 4, access: .write))
+        } catch {
+            let memoryError = error as? MemoryAccessError ?? .unmappedAddress(address)
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
+            return
+        }
+        if instr.writeback {
+            setStackPointer(instr.increment ? base &+ 8 : base &- 8, forMode: instr.mode)
+        }
+    }
+
+    /// `RFE`: see `ReturnFromExceptionInstruction`.
+    private func executeReturnFromException(_ instr: ReturnFromExceptionInstruction) {
+        guard cpsr.rawValue & Self.modeBitsMask != Self.userModeBits else { return }
+        let base = registers[instr.rn]
+        let address = Self.returnStateAddress(base: base, increment: instr.increment, before: instr.before)
+        let newPC: UInt32, newCPSR: UInt32
+        do {
+            newPC = try memory.readWord32(at: try translatedAddress(address, access: .read))
+            newCPSR = try memory.readWord32(at: try translatedAddress(address &+ 4, access: .read))
+        } catch {
+            let memoryError = error as? MemoryAccessError ?? .unmappedAddress(address)
+            if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
+            return
+        }
+        if instr.writeback {
+            registers[instr.rn] = instr.increment ? base &+ 8 : base &- 8
+        }
+        returnFromException(to: newPC, restoring: newCPSR)
+    }
+
+    /// Undefined Instruction exception entry (ARM DDI 0406C B1.9.6):
+    /// Undefined mode, `LR_und` = the instruction's address + 4 in ARM
+    /// state and + 2 in Thumb state whatever the instruction's width (so
+    /// for a 32-bit Thumb instruction it points at the second halfword —
+    /// the handler reads `[LR-2]` to find it), SPSR_und with the
+    /// instruction's own ITSTATE, IRQs masked, ARM state, vector +0x04.
+    /// Raised for VFP/Advanced SIMD instructions while FPEXC.EN is clear.
+    func raiseUndefinedInstruction() {
+        let thumb = cpsr.thumbState
+        let savedCPSR = Self.cpsr(cpsr.rawValue, withITState: thumb ? currentInstructionITState : 0)
+        switchProcessorMode(from: savedCPSR & Self.modeBitsMask, to: Self.undefinedModeBits)
+        setSavedProgramStatus(savedCPSR, forModeBits: Self.undefinedModeBits)
+        registers.lr = currentInstructionAddress &+ (thumb ? 2 : 4)
+        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask & ~Self.itBitsMask) | Self.undefinedModeBits
+        itState = 0
+        cpsr.thumbState = false
+        cpsr.irqDisabled = true
+        registers.pc = exceptionVectorBaseAddress &+ 0x04
+    }
+
+    /// Prefetch Abort exception entry (ARM DDI 0406C B1.9.7) for an
+    /// instruction fetch the MMU refused: Abort mode, `LR_abt` = the
+    /// instruction's address + 4 in either state, IFSR/IFAR (CP15 c5/c6,
+    /// opc2 1/2) describing the fault, IRQs and asynchronous aborts
+    /// masked, vector +0x0C. The same conditions as `raiseDataAbort`
+    /// decide whether it's raised at all. `faultAddress` is the halfword
+    /// that failed (the second one, for a 32-bit Thumb instruction
+    /// straddling a page boundary).
+    func raisePrefetchAbort(_ error: MemoryAccessError) -> Bool {
+        guard case .translationFault(let virtualAddress, let reason, _) = error else { return false }
+        guard mmuEnabled else { return false }
+
+        let savedCPSR = Self.cpsr(cpsr.rawValue, withITState: cpsr.thumbState ? currentInstructionITState : 0)
+        switchProcessorMode(from: savedCPSR & Self.modeBitsMask, to: Self.abortModeBits)
+        setSavedProgramStatus(savedCPSR, forModeBits: Self.abortModeBits)
+        registers.lr = currentInstructionAddress &+ 4
+        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask & ~Self.itBitsMask) | Self.abortModeBits | Self.asyncAbortDisabledBit
+        itState = 0
+        cpsr.thumbState = false
+        cpsr.irqDisabled = true
+
+        cp15.write(coprocessor: 15, opc1: 0, crn: 6, crm: 0, opc2: 2, value: virtualAddress)
+        cp15.write(coprocessor: 15, opc1: 0, crn: 5, crm: 0, opc2: 1, value: Self.dataFaultStatus(for: reason))
+
+        registers.pc = exceptionVectorBaseAddress &+ 0x0C
+        return true
     }
 
     /// A real ARMv7 Data Abort exception entry (ARM DDI 0406C B1.6.10,
@@ -746,7 +1031,7 @@ final class ARMv7CPU: CPU {
         setSavedProgramStatus(savedCPSR, forModeBits: Self.abortModeBits)
 
         registers.lr = currentInstructionAddress &+ 8
-        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask & ~Self.itBitsMask) | Self.abortModeBits
+        cpsr.rawValue = (savedCPSR & ~Self.modeBitsMask & ~Self.itBitsMask) | Self.abortModeBits | Self.asyncAbortDisabledBit
         itState = 0
         cpsr.thumbState = false
         cpsr.irqDisabled = true
@@ -783,6 +1068,7 @@ final class ARMv7CPU: CPU {
     // happened in the caller before this runs, in both states, so
     // there's real logic worth sharing here rather than duplicating.
     func executeCoprocessorRegisterTransfer(_ instr: CoprocessorRegisterTransferInstruction, instructionAddress: UInt32) {
+        if executeVFPRegisterTransfer(instr) { return }
         if instr.isLoad {
             let value = cp15.read(coprocessor: instr.coprocessor, opc1: instr.opc1, crn: instr.crn, crm: instr.crm, opc2: instr.opc2)
             if instr.rt == Registers.pcIndex {
@@ -818,11 +1104,16 @@ final class ARMv7CPU: CPU {
     }
 
     private func executeChangeProcessorState(_ instr: ChangeProcessorStateInstruction) {
+        // A NOP in User mode (ARM DDI 0406C B9.3.2): unprivileged code
+        // can't touch the masks or the mode.
+        guard cpsr.rawValue & Self.modeBitsMask != Self.userModeBits else { return }
         if instr.affectsIRQ { cpsr.irqDisabled = !instr.enable }
         if instr.affectsFIQ { cpsr.fiqDisabled = !instr.enable }
-        // affectsAbort (the 'A' bit) isn't modeled: CPSR doesn't expose
-        // an abort mask bit yet, and nothing raises an abort exception
-        // for it to gate.
+        // Nothing raises an asynchronous abort, but the A bit itself is
+        // real CPSR state (saved to SPSR and read back by MRS).
+        if instr.affectsAbort {
+            cpsr.rawValue = instr.enable ? cpsr.rawValue & ~Self.asyncAbortDisabledBit : cpsr.rawValue | Self.asyncAbortDisabledBit
+        }
 
         // Real ARM boot code's per-mode-stack-setup idiom: `CPS #<mode>`
         // (mode-only) or `CPSID if, #<mode>` (masks + mode together) to
@@ -852,34 +1143,6 @@ final class ARMv7CPU: CPU {
 
     private func executeRev(_ instr: RevInstruction) {
         registers[instr.rd] = registers[instr.rm].byteSwapped
-    }
-
-    private func executeVectorRoundingShiftLeft(_ instr: VRSHLInstruction) {
-        let laneBits: Int
-        switch instr.size {
-        case .bits8: laneBits = 8
-        case .bits16: laneBits = 16
-        case .bits32: laneBits = 32
-        case .bits64: laneBits = 64
-        }
-        let laneCount = 64 / laneBits
-        let laneMask: UInt64 = laneBits == 64 ? .max : (UInt64(1) << laneBits) - 1
-
-        let shiftedValue = neon[instr.vm]
-        let shiftAmounts = neon[instr.vn]
-        var result: UInt64 = 0
-        for lane in 0..<laneCount {
-            let offset = laneBits * lane
-            let element = (shiftedValue >> offset) & laneMask
-            // The shift amount for every lane, regardless of element
-            // size, is always just the low 8 bits of that lane's own
-            // corresponding value in the shift-amount operand, read as
-            // signed (ARM DDI 0406C A8.8.316).
-            let shiftAmount = Int(Int8(bitPattern: UInt8((shiftAmounts >> offset) & 0xFF)))
-            let shifted = Self.roundingShiftLeft(element, by: shiftAmount, laneBits: laneBits, unsigned: instr.unsigned)
-            result |= (shifted & laneMask) << offset
-        }
-        neon[instr.vd] = result
     }
 
     /// `VLD1`/`VST1` (multiple single elements). See
@@ -1186,10 +1449,14 @@ final class ARMv7CPU: CPU {
     /// `LDREX`: a word load that also opens the local exclusive monitor
     /// on `address` — see `exclusiveMonitorAddress`.
     private func executeLoadExclusive(_ instr: LoadExclusiveInstruction) {
-        let address = operandValue(for: instr.rn)
+        let address = operandValue(for: instr.rn) &+ instr.offset
         do {
             let physicalAddress = try translatedAddress(address, access: .read)
-            registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+            switch instr.size {
+            case 1: registers[instr.rt] = UInt32(try memory.readByte(at: physicalAddress))
+            case 2: registers[instr.rt] = UInt32(try memory.readWord16(at: physicalAddress))
+            default: registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+            }
             exclusiveMonitorAddress = address
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -1208,7 +1475,7 @@ final class ARMv7CPU: CPU {
             let lowPhysicalAddress = try translatedAddress(address, access: .read)
             let highPhysicalAddress = try translatedAddress(address &+ 4, access: .read)
             registers[instr.rt] = try memory.readWord32(at: lowPhysicalAddress)
-            registers[instr.rt + 1] = try memory.readWord32(at: highPhysicalAddress)
+            registers[instr.rt2] = try memory.readWord32(at: highPhysicalAddress)
             exclusiveMonitorAddress = address
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -1220,14 +1487,19 @@ final class ARMv7CPU: CPU {
     /// See `exclusiveMonitorAddress`: stores and reports 0 only if the
     /// monitor is still open on this address, otherwise reports 1.
     private func executeStoreExclusive(_ instr: StoreExclusiveInstruction) {
-        let address = operandValue(for: instr.rn)
+        let address = operandValue(for: instr.rn) &+ instr.offset
         guard takeExclusiveMonitor(for: address) else {
             registers[instr.rd] = 1
             return
         }
         do {
             let physicalAddress = try translatedAddress(address, access: .write)
-            try memory.writeWord32(registers[instr.rt], at: physicalAddress)
+            let value = registers[instr.rt]
+            switch instr.size {
+            case 1: try memory.writeByte(UInt8(truncatingIfNeeded: value), at: physicalAddress)
+            case 2: try memory.writeWord16(UInt16(truncatingIfNeeded: value), at: physicalAddress)
+            default: try memory.writeWord32(value, at: physicalAddress)
+            }
             registers[instr.rd] = 0
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -1247,7 +1519,7 @@ final class ARMv7CPU: CPU {
             let lowPhysicalAddress = try translatedAddress(address, access: .write)
             let highPhysicalAddress = try translatedAddress(address &+ 4, access: .write)
             try memory.writeWord32(registers[instr.rt], at: lowPhysicalAddress)
-            try memory.writeWord32(registers[instr.rt + 1], at: highPhysicalAddress)
+            try memory.writeWord32(registers[instr.rt2], at: highPhysicalAddress)
             registers[instr.rd] = 0
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -1422,6 +1694,12 @@ final class ARMv7CPU: CPU {
             startAddress = instr.preIndexed ? baseValue &- transferSize : baseValue &- transferSize &+ 4
         }
 
+        // `^`: with PC loaded it's an exception return; otherwise the
+        // transfer uses the User-mode registers.
+        let isExceptionReturn = instr.userRegisters && instr.isLoad && instr.registerList & (1 << Registers.pcIndex) != 0
+        let usesUserBank = instr.userRegisters && !isExceptionReturn
+        var loadedPC: UInt32?
+
         var address = startAddress
         do {
             for index in 0..<16 {
@@ -1430,16 +1708,14 @@ final class ARMv7CPU: CPU {
                 if instr.isLoad {
                     let value = try memory.readWord32(at: physicalAddress)
                     if index == Registers.pcIndex {
-                        // Real interworking, same as BX — see
-                        // `ARMv7CPU+Thumb.swift`'s `executeThumbBlockDataTransfer`
-                        // for the Thumb-side `LDM`-into-PC equivalent.
-                        cpsr.thumbState = value.bit(0)
-                        registers.pc = value & ~UInt32(0b1)
+                        loadedPC = value
+                    } else if usesUserBank {
+                        setUserBankRegister(index, value)
                     } else {
                         registers[index] = value
                     }
                 } else {
-                    try memory.writeWord32(operandValue(for: index), at: physicalAddress)
+                    try memory.writeWord32(usesUserBank ? userBankRegister(index) : operandValue(for: index), at: physicalAddress)
                 }
                 address = address &+ 4
             }
@@ -1453,6 +1729,19 @@ final class ARMv7CPU: CPU {
 
         if instr.writeback {
             registers[instr.rn] = instr.addOffset ? baseValue &+ transferSize : baseValue &- transferSize
+        }
+
+        if let loadedPC {
+            let currentMode = cpsr.rawValue & Self.modeBitsMask
+            if isExceptionReturn, let spsr = savedProgramStatus(forModeBits: currentMode) {
+                returnFromException(to: loadedPC, restoring: spsr)
+            } else {
+                // Real interworking, same as BX — see
+                // `ARMv7CPU+Thumb.swift`'s `executeThumbBlockDataTransfer`
+                // for the Thumb-side `LDM`-into-PC equivalent.
+                cpsr.thumbState = loadedPC.bit(0)
+                registers.pc = loadedPC & ~UInt32(0b1)
+            }
         }
     }
 
@@ -1470,11 +1759,8 @@ final class ARMv7CPU: CPU {
         let transferAddress = instr.preIndexed ? offsetAddress : base
 
         do {
-            let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
-                let value = instr.isByte
-                    ? UInt32(try memory.readByte(at: physicalAddress))
-                    : try memory.readWord32(at: physicalAddress)
+                let value = try readData(transferAddress, width: instr.isByte ? 1 : 4)
                 if instr.rd == Registers.pcIndex {
                     // LDRWritePC: real interworking, same as BX.
                     cpsr.thumbState = value.bit(0)
@@ -1483,12 +1769,7 @@ final class ARMv7CPU: CPU {
                     registers[instr.rd] = value
                 }
             } else {
-                let value = operandValue(for: instr.rd)
-                if instr.isByte {
-                    try memory.writeByte(UInt8(truncatingIfNeeded: value), at: physicalAddress)
-                } else {
-                    try memory.writeWord32(value, at: physicalAddress)
-                }
+                try writeData(operandValue(for: instr.rd), transferAddress, width: instr.isByte ? 1 : 4)
             }
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }
@@ -1524,22 +1805,19 @@ final class ARMv7CPU: CPU {
         let transferAddress = instr.preIndexed ? offsetAddress : base
 
         do {
-            let physicalAddress = try translatedAddress(transferAddress, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
                 let value: UInt32
                 switch instr.kind {
                 case .unsignedHalfword:
-                    value = UInt32(try memory.readWord16(at: physicalAddress))
+                    value = try readData(transferAddress, width: 2)
                 case .signedByte:
-                    let raw = try memory.readByte(at: physicalAddress)
-                    value = UInt32(bitPattern: Int32(Int8(bitPattern: raw)))
+                    value = UInt32(bitPattern: Int32(Int8(truncatingIfNeeded: try readData(transferAddress, width: 1))))
                 case .signedHalfword:
-                    let raw = try memory.readWord16(at: physicalAddress)
-                    value = UInt32(bitPattern: Int32(Int16(bitPattern: raw)))
+                    value = UInt32(bitPattern: Int32(Int16(truncatingIfNeeded: try readData(transferAddress, width: 2))))
                 }
                 registers[instr.rd] = value
             } else {
-                try memory.writeWord16(UInt16(truncatingIfNeeded: operandValue(for: instr.rd)), at: physicalAddress)
+                try writeData(operandValue(for: instr.rd), transferAddress, width: 2)
             }
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }

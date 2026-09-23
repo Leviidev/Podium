@@ -171,6 +171,91 @@ enum DeviceTreePatcher {
         }
     }
 
+    /// Records a RAM disk in `/chosen/memory-map` as iBoot does for a
+    /// restore ramdisk: a `RAMDisk` property holding `{physical address,
+    /// size}` (32-bit words). With `rd=md0` in the boot-args, the kernel's
+    /// `IOFindBSDRoot` turns it into memory device `md0` and roots on it.
+    static func addRAMDisk(_ deviceTree: inout Data, physicalAddress: UInt32, size: UInt32) {
+        var value = Data(count: 8)
+        value.writeUInt32LE(physicalAddress, at: 0)
+        value.writeUInt32LE(size, at: 4)
+        addProperty(&deviceTree, path: ["chosen", "memory-map"], name: "RAMDisk", value: value)
+    }
+
+    /// The root node's `secure-root-prefix` (`"md"` in the shipped tree)
+    /// marks memory-device roots as ones a restore-mode verifier has to
+    /// vouch for: after mounting root, XNU's `IOSecureBSDRoot` asks the
+    /// platform expert about `SecureRootName`, and for a root matching the
+    /// prefix the platform waits — forever — for a `SecureRootCallBack`
+    /// from whatever registered through `SecureRoot`. Nothing does when
+    /// Podium roots on its own RAM disk, so the kernel hung right after
+    /// mounting root. Without the property the platform treats the root as
+    /// trusted and returns at once. Renamed in place (same 32-byte name
+    /// field), so nothing in the tree moves.
+    static func disableSecureRootCheck(_ deviceTree: inout Data) {
+        renameProperty(&deviceTree, path: [], from: "secure-root-prefix", to: "podium-unused-secure-root")
+    }
+
+    /// Renames a property of the node at `path` without changing its size.
+    static func renameProperty(_ deviceTree: inout Data, path: [String], from oldName: String, to newName: String) {
+        guard let location = findProperties(in: deviceTree, path: path, propertyNames: [oldName]).first else { return }
+        let nameOffset = location.lengthFieldOffset - propertyNameSize
+        var field = Data(count: propertyNameSize)
+        for (index, byte) in newName.utf8.prefix(propertyNameSize - 1).enumerated() {
+            field[index] = byte
+        }
+        deviceTree.replaceSubrange(deviceTree.startIndex + nameOffset..<deviceTree.startIndex + nameOffset + propertyNameSize, with: field)
+    }
+
+    /// Appends a property to the node at `path` (after its existing
+    /// properties, before its children), growing the tree. Does nothing if
+    /// the node isn't there.
+    static func addProperty(_ deviceTree: inout Data, path: [String], name: String, value: Data) {
+        guard let node = nodeOffset(in: deviceTree, path: path) else { return }
+        let nProperties = Int(deviceTree.readUInt32LE(at: node))
+        var cursor = node + nodeHeaderSize
+        for _ in 0..<nProperties {
+            let realLength = Int(deviceTree.readUInt32LE(at: cursor + propertyNameSize) & 0x7FFF_FFFF)
+            cursor += propertyHeaderSize + ((realLength + 3) & ~3)
+        }
+        var property = Data(count: propertyHeaderSize + ((value.count + 3) & ~3))
+        for (index, byte) in name.utf8.prefix(propertyNameSize - 1).enumerated() {
+            property[index] = byte
+        }
+        property.writeUInt32LE(UInt32(value.count), at: propertyNameSize)
+        property.replaceSubrange(propertyHeaderSize..<propertyHeaderSize + value.count, with: value)
+        deviceTree.insert(contentsOf: property, at: deviceTree.startIndex + cursor)
+        deviceTree.writeUInt32LE(UInt32(nProperties + 1), at: node)
+    }
+
+    /// The offset of the node reached by descending `path` (by `name`
+    /// property) from the root.
+    private static func nodeOffset(in data: Data, path: [String]) -> Int? {
+        var offset = 0
+        for segment in path {
+            guard offset + nodeHeaderSize <= data.count else { return nil }
+            let nProperties = Int(data.readUInt32LE(at: offset))
+            let nChildren = Int(data.readUInt32LE(at: offset + 4))
+            var cursor = offset + nodeHeaderSize
+            for _ in 0..<nProperties {
+                let realLength = Int(data.readUInt32LE(at: cursor + propertyNameSize) & 0x7FFF_FFFF)
+                cursor += propertyHeaderSize + ((realLength + 3) & ~3)
+            }
+            var found: Int?
+            for _ in 0..<nChildren {
+                if peekName(data, offset: cursor) == segment {
+                    found = cursor
+                    break
+                }
+                guard let end = skipNode(data, offset: cursor) else { return nil }
+                cursor = end
+            }
+            guard let child = found else { return nil }
+            offset = child
+        }
+        return offset
+    }
+
     /// A CHRP-style NVRAM image as `IODTNVRAM::initNVRAMImage` reads it:
     /// 16-byte partition headers (signature, checksum, length in 16-byte
     /// units as a native little-endian `UInt16`, 12-byte name).
