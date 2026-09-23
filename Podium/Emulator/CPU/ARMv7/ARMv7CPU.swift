@@ -440,19 +440,6 @@ final class ARMv7CPU: CPU {
         return (pointer, mmuEnabled ? map.virtualBase : map.physicalBase, map.length)
     }
 
-    /// Advances exactly one unit (one interpreted instruction, or one
-    /// JIT-compiled block) via the same dispatch `run(maxUnits:)` uses,
-    /// but without consulting `breakpoints` first — for a debug harness
-    /// that just handled a breakpoint hit and needs to step past it: `pc`
-    /// is still sitting exactly on that address, so `run(maxUnits:)`'s own
-    /// breakpoint check would fire again immediately, before executing
-    /// anything. `step()` (the plain interpreter) would also get past it,
-    /// but forces the slow path for every such instruction; this instead
-    /// gives it the same JIT-or-interpret treatment as anywhere else.
-    func runOneUnitIgnoringBreakpoints() {
-        runOneUnit()
-    }
-
     private func runOneUnit() {
         // `JITEngine` picks the right decoder/translator internally based
         // on `thumbState` (ARM-state `DataProcessingInstruction`s via
