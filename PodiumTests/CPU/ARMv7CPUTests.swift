@@ -1304,4 +1304,88 @@ final class ARMv7CPUTests: XCTestCase {
         setUpAddressSpace(tableA, asid: 1)
         XCTAssertEqual(try cpu.translatedAddress(0x10_0000, access: .read), 0x20_0000, "back on A: A's mapping, not B's")
     }
+
+    /// A VST1/VLD1 word straddling a page boundary must be translated per
+    /// page. Two adjacent virtual sections map to non-adjacent physical
+    /// memory here, with a sentinel right after the first one's physical
+    /// end: a store translated only at its first byte would spill into
+    /// that sentinel — the real bug, where a NEON memset two bytes before
+    /// a page boundary zeroed another process's page.
+    func testVST1AcrossPageBoundaryTranslatesEachPage() throws {
+        let cpu = makeCPU(program: [
+            0xF401_070F, // vst1.8 {d0}, [r1]
+            0xF421_170F, // vld1.8 {d1}, [r1]
+        ], memorySize: 0x60_0000)
+        let table: UInt32 = 0x1_0000
+        try cpu.memory.writeWord32(0x0000_0C02, at: table)       // VA 0x000000 -> PA 0x000000
+        try cpu.memory.writeWord32(0x0020_0C02, at: table + 4)   // VA 0x100000 -> PA 0x200000
+        try cpu.memory.writeWord32(0x0040_0C02, at: table + 8)   // VA 0x200000 -> PA 0x400000
+        try cpu.memory.writeWord32(0xCCCC_CCCC, at: 0x30_0000)   // physically right after VA 0x1FFFFF
+        cpu.cp15.write(coprocessor: 15, opc1: 0, crn: 2, crm: 0, opc2: 0, value: table)
+        cpu.cp15.write(coprocessor: 15, opc1: 0, crn: 3, crm: 0, opc2: 0, value: 1)
+        cpu.cp15.write(coprocessor: 15, opc1: 0, crn: 1, crm: 0, opc2: 0, value: 1)
+        cpu.registers[1] = 0x1F_FFFE
+        cpu.neon[0] = 0x1122_3344_5566_7788
+
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(try cpu.memory.readByte(at: 0x2F_FFFE), 0x88)
+        XCTAssertEqual(try cpu.memory.readByte(at: 0x2F_FFFF), 0x77)
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x40_0000), 0x3344_5566, "the rest goes to the second page's own physical memory")
+        XCTAssertEqual(try cpu.memory.readWord32(at: 0x30_0000), 0xCCCC_CCCC, "nothing spills into the physically adjacent page")
+
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.neon[1], 0x1122_3344_5566_7788, "VLD1 reads back across the same boundary")
+    }
+
+    /// A user process running a word this CPU can't execute gets the
+    /// Undefined Instruction exception, like real hardware, instead of
+    /// halting the whole emulator. 0xF04F2116 is the real case: Thumb
+    /// `movs r1,#0x16; mov.w sl,#0` from libsystem_c, run as ARM after a
+    /// daemon jumped through a corrupted function pointer — cond=1111 with
+    /// op1=0000100 is architecturally UNDEFINED in ARM state.
+    func testUserModeUnexecutableInstructionTakesUndefinedException() {
+        let cpu = makeCPU(program: [0xF04F_2116])
+        cpu.cpsr.rawValue = (cpu.cpsr.rawValue & ~0x1F) | ARMv7CPU.userModeBits
+        var reported: (UInt32, UInt32)?
+        cpu.userUndefinedInstructionHandler = { reported = ($0, $1) }
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.cpsr.rawValue & 0x1F, ARMv7CPU.undefinedModeBits)
+        XCTAssertEqual(cpu.registers.pc, 0x04)
+        XCTAssertEqual(cpu.registers.lr, 4, "LR_und = the instruction's address + 4 in ARM state")
+        XCTAssertEqual(cpu.savedProgramStatus(forModeBits: ARMv7CPU.undefinedModeBits).map { $0 & 0x1F }, ARMv7CPU.userModeBits)
+        XCTAssertEqual(reported?.0, 0)
+        XCTAssertEqual(reported?.1, 0xF04F_2116)
+    }
+
+    /// The same word in a privileged mode still halts: the kernel hitting
+    /// it means a gap in this CPU, which must stay loud.
+    func testPrivilegedUnexecutableInstructionStillHalts() {
+        let cpu = makeCPU(program: [0xF04F_2116])
+        cpu.cpsr.rawValue = (cpu.cpsr.rawValue & ~0x1F) | ARMv7CPU.svcModeBits
+        cpu.step()
+        XCTAssertEqual(cpu.lastError, .unsupportedInstruction(rawWord: 0xF04F_2116, address: 0))
+        XCTAssertEqual(cpu.cpsr.rawValue & 0x1F, ARMv7CPU.svcModeBits)
+    }
+
+    /// Thumb state too: LR_und = the address + 2, and SPSR keeps T set so
+    /// the guest kernel sees a Thumb fault.
+    func testUserModeUndefinedThumbInstructionTakesUndefinedException() {
+        let hw: UInt16 = 0xDE00 // udf #0
+        switch ThumbDecoder.decode(hw, 0) {
+        case .undefined, .unsupported: break
+        default: return XCTFail("expected 0xDE00 to be undefined/unsupported in Thumb")
+        }
+        let cpu = makeCPU(program: [UInt32(hw)])
+        cpu.cpsr.rawValue = (cpu.cpsr.rawValue & ~0x1F) | ARMv7CPU.userModeBits
+        cpu.cpsr.thumbState = true
+        cpu.step()
+        XCTAssertNil(cpu.lastError)
+        XCTAssertEqual(cpu.cpsr.rawValue & 0x1F, ARMv7CPU.undefinedModeBits)
+        XCTAssertFalse(cpu.cpsr.thumbState, "exception entry is in ARM state")
+        XCTAssertEqual(cpu.registers.lr, 2)
+        XCTAssertEqual(cpu.savedProgramStatus(forModeBits: ARMv7CPU.undefinedModeBits).map { $0 & 0x20 }, 0x20)
+    }
 }

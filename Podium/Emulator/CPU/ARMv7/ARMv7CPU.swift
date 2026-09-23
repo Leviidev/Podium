@@ -690,11 +690,36 @@ final class ARMv7CPU: CPU {
             executeReturnFromException(instr)
 
         case .unsupported:
-            lastError = .unsupportedInstruction(rawWord: rawWord, address: instructionAddress)
+            if !trapInUserMode(rawWord: rawWord, address: instructionAddress) {
+                lastError = .unsupportedInstruction(rawWord: rawWord, address: instructionAddress)
+            }
 
         case .undefined:
-            lastError = .undefinedInstruction(rawWord: rawWord, address: instructionAddress)
+            if !trapInUserMode(rawWord: rawWord, address: instructionAddress) {
+                lastError = .undefinedInstruction(rawWord: rawWord, address: instructionAddress)
+            }
         }
+    }
+
+    /// Reports each user-mode instruction this CPU couldn't execute before
+    /// it becomes an Undefined Instruction exception (see
+    /// `trapInUserMode`), so a decoder gap in user code stays visible
+    /// instead of silently becoming a process crash.
+    var userUndefinedInstructionHandler: ((_ address: UInt32, _ rawWord: UInt32) -> Void)?
+
+    /// A user process executing an instruction this CPU can't run gets the
+    /// Undefined Instruction exception, as on real hardware — the guest
+    /// kernel then kills just that process (SIGILL) and boot carries on.
+    /// Found on a real boot: a daemon jumped through a corrupted function
+    /// pointer into the middle of Thumb code, ran it as ARM and hit an
+    /// architecturally UNDEFINED word, and halting the whole emulator there
+    /// turned one crashing process into a dead boot. Privileged code still
+    /// halts: the kernel hitting one means a gap in this CPU, not the guest.
+    func trapInUserMode(rawWord: UInt32, address: UInt32) -> Bool {
+        guard cpsr.rawValue & Self.modeBitsMask == Self.userModeBits else { return false }
+        userUndefinedInstructionHandler?(address, rawWord)
+        raiseUndefinedInstruction()
+        return true
     }
 
     private func executeMovWide(_ instr: MovWideInstruction) {
@@ -1278,18 +1303,25 @@ final class ARMv7CPU: CPU {
         let base = operandValue(for: instr.rn)
         var address = base
         do {
+            // Through readData/writeData, which split a word that straddles
+            // a page into per-byte translations: VLD1/VST1 of 8-bit elements
+            // may sit at any alignment, and translating just a word's first
+            // byte let its tail spill into whatever *physical* page came
+            // next. Found as real cross-process corruption: a NEON memset's
+            // `vst1.8 {d0-d3}, [ip]` two bytes before a page boundary zeroed
+            // the first halfword of another process's private page — its
+            // libsystem_kernel errno hook — which later sent that process
+            // jumping into the middle of Thumb code as ARM.
             for offset in 0..<instr.registerCount {
-                let lowPhysicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
-                let highPhysicalAddress = try translatedAddress(address &+ 4, access: instr.isLoad ? .read : .write)
                 let register = instr.firstRegister + offset
                 if instr.isLoad {
-                    let low = try memory.readWord32(at: lowPhysicalAddress)
-                    let high = try memory.readWord32(at: highPhysicalAddress)
+                    let low = try readData(address, width: 4)
+                    let high = try readData(address &+ 4, width: 4)
                     neon[register] = UInt64(low) | (UInt64(high) << 32)
                 } else {
                     let value = neon[register]
-                    try memory.writeWord32(UInt32(truncatingIfNeeded: value), at: lowPhysicalAddress)
-                    try memory.writeWord32(UInt32(truncatingIfNeeded: value >> 32), at: highPhysicalAddress)
+                    try writeData(UInt32(truncatingIfNeeded: value), address, width: 4)
+                    try writeData(UInt32(truncatingIfNeeded: value >> 32), address &+ 4, width: 4)
                 }
                 address = address &+ 8
             }

@@ -216,9 +216,15 @@ extension ARMv7CPU {
         case .conditionalBranch, .it, .compareBranch, .branchWide:
             preconditionFailure("handled in stepThumb before reaching executeThumb")
         case .unsupported(let raw, let second):
-            lastError = .unsupportedInstruction(rawWord: Self.combinedRawWord(raw, second), address: instructionAddress)
+            let word = Self.combinedRawWord(raw, second)
+            if !trapInUserMode(rawWord: word, address: instructionAddress) {
+                lastError = .unsupportedInstruction(rawWord: word, address: instructionAddress)
+            }
         case .undefined(let raw, let second):
-            lastError = .undefinedInstruction(rawWord: Self.combinedRawWord(raw, second), address: instructionAddress)
+            let word = Self.combinedRawWord(raw, second)
+            if !trapInUserMode(rawWord: word, address: instructionAddress) {
+                lastError = .undefinedInstruction(rawWord: word, address: instructionAddress)
+            }
         }
     }
 
