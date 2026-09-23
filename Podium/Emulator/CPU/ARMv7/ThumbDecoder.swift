@@ -728,15 +728,11 @@ enum ThumbDecoder {
         if !hw1.bit16(11), hw1.bitField16(11, 6) == 0 {
             // Register-offset form (`Rm LSL imm2`), the signed-load
             // sibling of `decode32LoadStoreSingle`'s own register-offset
-            // branch — verified against a real `ldrsb.w r8, [r1, r0]`
-            // word, traced back from a real early-boot kernel halt.
-            // `LDRSH` (register-offset, `isHalfword`) isn't decoded, no
-            // real word has confirmed it yet.
-            guard !isHalfword else {
-                return .unsupported(rawHalfword: hw0, secondHalfword: hw1)
-            }
+            // branch — verified against real `ldrsb.w r8, [r1, r0]` (an
+            // early-boot kernel halt) and `ldrsh.w r0, [r0, r1, lsl #1]`
+            // (ICU in backboardd) words.
             return .loadStoreRegister(ThumbLoadStoreRegisterInstruction(
-                isLoad: true, isByte: true, isHalfword: false, isSigned: true, rn: rn, rt: rt,
+                isLoad: true, isByte: !isHalfword, isHalfword: isHalfword, isSigned: true, rn: rn, rt: rt,
                 rm: Int(hw1.bitField16(3, 0)), shiftAmount: Int(hw1.bitField16(5, 4))
             ))
         }

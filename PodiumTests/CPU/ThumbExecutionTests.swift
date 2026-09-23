@@ -1301,4 +1301,14 @@ final class ThumbExecutionTests: XCTestCase {
             return XCTFail("Expected wfi.w")
         }
     }
+
+    /// ldrsh.w r0, [r0, r1, lsl #1] — from ICU in backboardd.
+    func testLdrshWRegisterOffset() {
+        let cpu = runThumb([0xF930, 0x0011]) { cpu in
+            cpu.registers[0] = 0x300
+            cpu.registers[1] = 2
+            try! cpu.memory.writeWord16(0x8001, at: 0x304)
+        }
+        XCTAssertEqual(cpu.registers[0], 0xFFFF_8001)
+    }
 }
