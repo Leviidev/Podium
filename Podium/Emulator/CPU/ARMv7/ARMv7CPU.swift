@@ -784,8 +784,16 @@ final class ARMv7CPU: CPU {
         case .write: kind = 2
         case .execute: kind = 4
         }
-        let slot = (kind + (user ? 1 : 0)) &* Self.tlbEntries &+ Int((virtualAddress >> 12) & UInt32(Self.tlbEntries - 1))
-        let tag = (virtualAddress & 0xFFFF_F000) | 1
+        // CONTEXTIDR's low 8 bits are the ASID XNU tags each address
+        // space with — folded into both the slot index (so two processes'
+        // entries for "the same" virtual page don't fight over one
+        // direct-mapped slot) and the tag itself (so a collision is only
+        // ever a cache miss, never a wrong answer).
+        let asid = cp15.contextID & 0xFF
+        let asidMix = asid &* 0x9E37_79B1 // Knuth multiplicative hash constant
+        let pageIndex = ((virtualAddress >> 12) ^ (asidMix >> 20)) & UInt32(Self.tlbEntries - 1)
+        let slot = (kind + (user ? 1 : 0)) &* Self.tlbEntries &+ Int(pageIndex)
+        let tag = (virtualAddress & 0xFFFF_F000) | (asid << 1) | 1
         if tlbTags[slot] == tag {
             return tlbPages[slot] | (virtualAddress & 0xFFF)
         }
@@ -801,12 +809,27 @@ final class ARMv7CPU: CPU {
     // MARK: - TLB
 
     /// A software TLB in front of `ARMv7MMU.translate`: successful walks
-    /// cached per 4 KB virtual page, per access kind (read/write/execute)
-    /// and privilege; faults are never cached. It follows real hardware's
-    /// contract — the guest must invalidate (CP15 c8) after changing a
-    /// valid mapping — and is also emptied whenever SCTLR, TTBR0/1, TTBCR,
-    /// DACR or CONTEXTIDR change, which covers every context switch.
-    private static let tlbEntries = 1024
+    /// cached per 4 KB virtual page, per access kind (read/write/execute),
+    /// privilege and ASID; faults are never cached. It follows real
+    /// hardware's contract — the guest must invalidate (CP15 c8) after
+    /// changing a valid mapping — and is emptied whenever SCTLR, TTBR1,
+    /// TTBCR or DACR change.
+    ///
+    /// TTBR0 and CONTEXTIDR are deliberately *not* on that list, even
+    /// though they change on every context switch (a new address space
+    /// means a new page table base and a new ASID) — unlike the others,
+    /// entries are tagged with the ASID they were created under (see
+    /// `translatedAddress`), so switching back to a process whose
+    /// mappings are still cached is a hit, not a guaranteed re-walk. Real
+    /// ARM MMUs work the same way for the same reason: without ASID
+    /// tagging, ordinary multitasking would thrash a TLB flushed on every
+    /// switch — measured as real cost here too, on a real kernel/user-
+    /// space trace with many processes starting and being scheduled.
+    /// This relies on the same contract real hardware does: software must
+    /// never reuse an ASID for a genuinely different address space
+    /// without an explicit invalidate, which XNU already has to get right
+    /// to work on real silicon.
+    private static let tlbEntries = 8192
     private let tlbTags = UnsafeMutablePointer<UInt32>.allocate(capacity: 6 * tlbEntries)
     private let tlbPages = UnsafeMutablePointer<UInt32>.allocate(capacity: 6 * tlbEntries)
 
@@ -814,11 +837,12 @@ final class ARMv7CPU: CPU {
         tlbTags.initialize(repeating: 0, count: 6 * Self.tlbEntries)
     }
 
-    /// CP15 writes that change translation: SCTLR (c1), TTBR0/TTBR1/TTBCR
-    /// (c2), DACR (c3), the TLB maintenance operations (c8), CONTEXTIDR
-    /// (c13, opc2 1).
+    /// CP15 writes that change translation and need a full flush: SCTLR
+    /// (c1), TTBR1/TTBCR (c2, opc2 1/2 — not opc2 0, TTBR0, which the ASID
+    /// tag already handles), DACR (c3), the TLB maintenance operations
+    /// (c8). CONTEXTIDR (c13, opc2 1) isn't here for the same reason.
     private static func cp15WriteAffectsTranslation(crn: Int, opc2: Int) -> Bool {
-        crn == 1 || crn == 2 || crn == 3 || crn == 8 || (crn == 13 && opc2 == 1)
+        crn == 1 || crn == 3 || crn == 8 || (crn == 2 && opc2 != 0)
     }
 
     // MARK: - Guest RAM fast path

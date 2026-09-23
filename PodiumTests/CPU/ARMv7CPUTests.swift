@@ -1257,4 +1257,51 @@ final class ARMv7CPUTests: XCTestCase {
         XCTAssertNil(cpu.lastError)
         XCTAssertEqual(cpu.registers[4], 0x2222_2222, "the invalidated TLB re-walked the table")
     }
+
+
+    /// The TLB tags entries with the ASID (CONTEXTIDR) active when they
+    /// were cached, and doesn't need a flush on an ordinary TTBR0/
+    /// CONTEXTIDR context switch (see `ARMv7CPU.translatedAddress`'s doc
+    /// comment) — this proves that's actually safe: two address spaces
+    /// mapping the *same* virtual page to *different* physical pages,
+    /// switched between repeatedly with no explicit TLB invalidate, never
+    /// cross-contaminate. A version that folded ASID into neither the tag
+    /// nor the slot index would return the wrong process's data here.
+    func testTLBDistinguishesAddressSpacesByASIDWithoutExplicitInvalidate() throws {
+        // Everything here is set up directly via `cpu.cp15`/`cpu.memory`,
+        // not by executing guest instructions, so the program is empty.
+        let cpu = makeCPU(program: [], memorySize: 0x40_0000)
+        // Two independent 16 KB first-level tables, built by hand.
+        let tableA: UInt32 = 0x1_0000, tableB: UInt32 = 0x2_0000
+        // Both tables identity-map section 0 (VA 0x0-0xFFFFF); table A's
+        // section 1 (VA 0x100000) points at physical 0x200000, table B's
+        // same slot points at physical 0x300000 — same VA, deliberately
+        // different destinations.
+        try cpu.memory.writeWord32(0x0000_0C02, at: tableA) // section 0 identity
+        try cpu.memory.writeWord32(0x0020_0C02, at: tableA + 4) // section 1 -> 0x200000
+        try cpu.memory.writeWord32(0x0000_0C02, at: tableB)
+        try cpu.memory.writeWord32(0x0030_0C02, at: tableB + 4) // section 1 -> 0x300000
+        try cpu.memory.writeWord32(0xAAAA_AAAA, at: 0x20_0000)
+        try cpu.memory.writeWord32(0xBBBB_BBBB, at: 0x30_0000)
+
+        func setUpAddressSpace(_ table: UInt32, asid: UInt32) {
+            cpu.cp15.write(coprocessor: 15, opc1: 0, crn: 2, crm: 0, opc2: 0, value: table) // TTBR0
+            cpu.cp15.write(coprocessor: 15, opc1: 0, crn: 13, crm: 0, opc2: 1, value: asid) // CONTEXTIDR
+        }
+        cpu.cp15.write(coprocessor: 15, opc1: 0, crn: 3, crm: 0, opc2: 0, value: 1) // DACR: domain 0 client
+        cpu.cp15.write(coprocessor: 15, opc1: 0, crn: 1, crm: 0, opc2: 0, value: 1) // SCTLR.M = 1
+
+        setUpAddressSpace(tableA, asid: 1)
+        XCTAssertEqual(try cpu.translatedAddress(0x10_0000, access: .read), 0x20_0000)
+        XCTAssertEqual(try cpu.memory.readWord32(at: try cpu.translatedAddress(0x10_0000, access: .read)), 0xAAAA_AAAA)
+
+        setUpAddressSpace(tableB, asid: 2)
+        XCTAssertEqual(try cpu.translatedAddress(0x10_0000, access: .read), 0x30_0000, "different ASID, different mapping for the same VA")
+        XCTAssertEqual(try cpu.memory.readWord32(at: try cpu.translatedAddress(0x10_0000, access: .read)), 0xBBBB_BBBB)
+
+        // Switch back to A with no TLBI in between — must still see A's
+        // mapping, not a stale/cross-contaminated hit from B.
+        setUpAddressSpace(tableA, asid: 1)
+        XCTAssertEqual(try cpu.translatedAddress(0x10_0000, access: .read), 0x20_0000, "back on A: A's mapping, not B's")
+    }
 }

@@ -22,6 +22,11 @@ struct CP15State {
     private(set) var ttbr1: UInt32 = 0
     private(set) var ttbcr: UInt32 = 0
     private(set) var dacr: UInt32 = 0
+    /// CONTEXTIDR (c13, opc2 1): its low 8 bits are the ASID XNU tags each
+    /// address space with. Kept as a dedicated field, like the others
+    /// above, because `ARMv7CPU`'s TLB now reads it on every translated
+    /// access, not just on a context switch.
+    private(set) var contextID: UInt32 = 0
 
     private var storage: [Key: UInt32] = [:]
 
@@ -35,6 +40,10 @@ struct CP15State {
             case (3, 0): dacr = value; return
             default: break
             }
+        }
+        if coprocessor == 15, opc1 == 0, crn == 13, crm == 0, opc2 == 1 {
+            contextID = value
+            return
         }
         storage[Key(coprocessor: coprocessor, opc1: opc1, crn: crn, crm: crm, opc2: opc2)] = value
     }
@@ -53,6 +62,9 @@ struct CP15State {
             case (3, 0): return dacr
             default: break
             }
+        }
+        if coprocessor == 15, opc1 == 0, crn == 13, crm == 0, opc2 == 1 {
+            return contextID
         }
         return storage[Key(coprocessor: coprocessor, opc1: opc1, crn: crn, crm: crm, opc2: opc2)] ?? 0
     }
