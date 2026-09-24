@@ -92,6 +92,8 @@ enum KernelBootstrap {
         if let ramDiskAddress, let ramDiskSize, deviceTree != nil {
             DeviceTreePatcher.addRAMDisk(&deviceTree!, physicalAddress: ramDiskAddress, size: UInt32(ramDiskSize))
             DeviceTreePatcher.disableSecureRootCheck(&deviceTree!)
+            DeviceTreePatcher.enableDebugging(&deviceTree!)
+            DeviceTreePatcher.markNoEffaceableStorage(&deviceTree!)
         }
         let deviceTreeLength = UInt32(deviceTree?.count ?? 0)
         let pramAddress = align(deviceTreeAddress + deviceTreeLength, 0x1000)

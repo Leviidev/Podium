@@ -222,4 +222,60 @@ final class DeviceTreePatcherTests: XCTestCase {
         XCTAssertNotNil(tree.range(of: Data("after".utf8)), "the node after is intact")
         XCTAssertGreaterThan(tree.range(of: Data("after".utf8))!.lowerBound, tree.startIndex + offset)
     }
+
+    /// AMFI only honors its boot-args when `PE_i_can_has_debugger()` —
+    /// `/chosen/debug-enabled` — is nonzero; the patch sets it in place.
+    func testEnableDebuggingSetsChosenDebugEnabledInPlace() {
+        func property(_ name: String, value: Data) -> Data {
+            var data = Data(count: 32)
+            data.replaceSubrange(0..<name.utf8.count, with: Array(name.utf8))
+            var length = Data(count: 4)
+            length.writeUInt32LE(UInt32(value.count), at: 0)
+            return data + length + value + Data(count: (4 - value.count % 4) % 4)
+        }
+        func node(_ properties: [Data], children: [Data]) -> Data {
+            var header = Data(count: 8)
+            header.writeUInt32LE(UInt32(properties.count), at: 0)
+            header.writeUInt32LE(UInt32(children.count), at: 4)
+            return header + properties.reduce(Data(), +) + children.reduce(Data(), +)
+        }
+        let chosen = node([property("name", value: Data("chosen\u{0}".utf8)), property("debug-enabled", value: Data(count: 4))], children: [])
+        var tree = node([], children: [chosen])
+        let originalCount = tree.count
+
+        DeviceTreePatcher.enableDebugging(&tree)
+
+        XCTAssertEqual(tree.count, originalCount)
+        guard let offset = valueOffset(of: "debug-enabled", in: tree) else { return XCTFail("no debug-enabled property") }
+        XCTAssertEqual(tree.readUInt32LE(at: offset), 1)
+    }
+
+    /// keybagd and AppleKeyStore look for `no-effaceable-storage` under
+    /// `/defaults`; the patch appends it as an empty flag property.
+    func testMarkNoEffaceableStorageAddsFlagToDefaults() {
+        func property(_ name: String, value: Data) -> Data {
+            var data = Data(count: 32)
+            data.replaceSubrange(0..<name.utf8.count, with: Array(name.utf8))
+            var length = Data(count: 4)
+            length.writeUInt32LE(UInt32(value.count), at: 0)
+            return data + length + value + Data(count: (4 - value.count % 4) % 4)
+        }
+        func node(_ properties: [Data], children: [Data]) -> Data {
+            var header = Data(count: 8)
+            header.writeUInt32LE(UInt32(properties.count), at: 0)
+            header.writeUInt32LE(UInt32(children.count), at: 4)
+            return header + properties.reduce(Data(), +) + children.reduce(Data(), +)
+        }
+        let defaults = node([property("name", value: Data("defaults\u{0}".utf8)), property("content-protect", value: Data())], children: [])
+        var tree = node([], children: [defaults])
+        let originalCount = tree.count
+
+        DeviceTreePatcher.markNoEffaceableStorage(&tree)
+
+        XCTAssertEqual(tree.count, originalCount + 32 + 4)
+        guard let offset = valueOffset(of: "no-effaceable-storage", in: tree) else { return XCTFail("no flag property") }
+        XCTAssertEqual(tree.readUInt32LE(at: offset - 4), 0, "empty flag")
+        let defaultsOffset = tree.range(of: Data("defaults".utf8))!.lowerBound - tree.startIndex - 36 - 8
+        XCTAssertEqual(tree.readUInt32LE(at: defaultsOffset), 3)
+    }
 }

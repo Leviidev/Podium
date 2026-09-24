@@ -196,6 +196,34 @@ enum DeviceTreePatcher {
         renameProperty(&deviceTree, path: [], from: "secure-root-prefix", to: "podium-unused-secure-root")
     }
 
+    /// Sets `/chosen/debug-enabled`, which iBoot fills in from the chip's
+    /// fuses (1 on development-fused devices). The kernel's
+    /// `PE_i_can_has_debugger()` returns it, and AppleMobileFileIntegrity
+    /// only reads its boot-args (`amfi_allow_any_signature`,
+    /// `amfi_get_out_of_my_way`, `cs_enforcement_disable`) when that is
+    /// nonzero — with the shipped 0, `ramDiskBootArguments` were silently
+    /// ignored and AMFI killed any binary whose code directory it didn't
+    /// already trust ("hook..execve() killing pid N: no code signature").
+    /// In place (the property is already 4 bytes), so nothing moves.
+    static func enableDebugging(_ deviceTree: inout Data) {
+        guard let location = findProperties(in: deviceTree, path: ["chosen"], propertyNames: ["debug-enabled"]).first,
+              location.currentLength == 4 else { return }
+        deviceTree.writeUInt32LE(1, at: location.valueOffset)
+    }
+
+    /// Adds the `/defaults/no-effaceable-storage` flag. Data protection
+    /// normally keeps the system keybag's wrapping key ("BAG1") and wipe
+    /// ID in effaceable storage — lockers in NAND/NOR that AppleEffaceable-
+    /// Storage serves — and Podium has neither flash. With the flag,
+    /// AppleKeyStore uses its fixed stand-in key ("disabling use of
+    /// effaceable storage, using fake key") and MobileKeyBag and keybagd
+    /// skip the lockers; without it, creating the system keybag fails to
+    /// save and keybagd, unable to load it ("Can't find EffaceableStorage
+    /// kext!"), reboots into recovery.
+    static func markNoEffaceableStorage(_ deviceTree: inout Data) {
+        addProperty(&deviceTree, path: ["defaults"], name: "no-effaceable-storage", value: Data())
+    }
+
     /// Renames a property of the node at `path` without changing its size.
     static func renameProperty(_ deviceTree: inout Data, path: [String], from oldName: String, to newName: String) {
         guard let location = findProperties(in: deviceTree, path: path, propertyNames: [oldName]).first else { return }
