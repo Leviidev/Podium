@@ -8,8 +8,9 @@ protocol DeviceEventHandler: AnyObject {
 /// The A4 (S5L8930X) SoC hardware that has real behavior, as opposed to
 /// the plain storage `DeviceTreeMemoryMap` backs every other peripheral
 /// with: the system timer, the power manager, the interrupt controller, and
-/// the IOP's and single-wire interface's handshakes, wired to the CPU's
-/// IRQ/FIQ pins and to its virtual clock.
+/// the IOP's and single-wire interface's handshakes, and the CDMA engine's
+/// memory-to-memory AES, wired to the CPU's IRQ/FIQ pins and to its
+/// virtual clock.
 ///
 /// Time is virtual: the timebase counter advances one tick per
 /// `instructionsPerTimebaseTick` retired instructions (plus whatever WFI
@@ -36,6 +37,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
     let powerManager = S5L8930XPowerManager()
     let iop = S5L8930XIOP()
     let swi = S5L8930XSWI()
+    private(set) var cdma: S5L8930XCDMA!
 
     init(cpu: ARMv7CPU) {
         self.cpu = cpu
@@ -48,6 +50,12 @@ final class S5L8930XPlatform: DeviceEventHandler {
             deadlineChanged: { [unowned self] in self.rescheduleNextEvent() },
             setInterruptLine: { [unowned self] asserted in
                 self.interruptController.setLine(S5L8930XTimer.interruptLine, asserted: asserted)
+            }
+        )
+        cdma = S5L8930XCDMA(
+            memory: { [unowned cpu] in cpu.memory },
+            setInterruptLine: { [unowned self] line, asserted in
+                self.interruptController.setLine(line, asserted: asserted)
             }
         )
         cpu.deviceEventHandler = self
@@ -65,6 +73,8 @@ final class S5L8930XPlatform: DeviceEventHandler {
             (interruptController, Self.vicBase, PL192InterruptController.windowLength),
             (iop, Self.iopBase, S5L8930XIOP.windowLength),
             (swi, Self.swiBase, S5L8930XSWI.windowLength),
+            (cdma, S5L8930XCDMA.channelsBase, S5L8930XCDMA.channelsLength),
+            (cdma.aes, S5L8930XCDMA.aesBase, S5L8930XCDMA.aesLength),
         ]
         return windows.flatMap { device, base, length in
             [base, base | Self.aliasBit].map { MMIORegion(device: device, baseAddress: $0, length: length) }

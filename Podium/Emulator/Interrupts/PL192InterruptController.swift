@@ -10,9 +10,13 @@ import Foundation
 /// priorities until it's written back (end of interrupt).
 ///
 /// Outputs are OR-ed across the four VICs into the CPU's IRQ and FIQ
-/// pins rather than modeling the daisy chain between them — the daisy
-/// chain only matters for `VICADDRESS` hand-off across VICs, which this
-/// reports per VIC.
+/// pins, but `VICADDRESS` follows the daisy chain (VIC0 first): the
+/// kernel's AppleARMPL192VIC reads only VIC0's `VICADDRESS` to find the
+/// line, then — for a line in VIC k ≥ 2 — VIC1…VIC(k-1)'s, and ends the
+/// interrupt by writing VIC k…VIC0's. A read on VIC n hands out its own
+/// best line, or, when VIC n+1 has something that outranks it (at
+/// `VICPRIORITYDAISY`), VIC n+1's hand-out, marking the daisy slot in
+/// service on VIC n.
 final class PL192InterruptController: MMIODevice {
     static let vicCount = 4
     static let vicStride: UInt32 = 0x1_0000
@@ -88,7 +92,7 @@ final class PL192InterruptController: MMIODevice {
         case 0x028: return vic.priorityDaisy
         case 0x100..<0x180: return vic.vectorAddress[Int((register - 0x100) / 4)]
         case 0x200..<0x280: return vic.vectorPriority[Int((register - 0x200) / 4)]
-        case 0xF00: return handOutHighestPriorityIRQ(from: vic)
+        case 0xF00: return handOutHighestPriorityIRQ(from: Int(offset / Self.vicStride))
         case 0xFE0: return 0x92
         case 0xFE4: return 0x11
         case 0xFE8: return 0x04
@@ -121,11 +125,32 @@ final class PL192InterruptController: MMIODevice {
         updateOutputs()
     }
 
-    /// `VICADDRESS` read: the vector address of the highest-priority
-    /// deliverable IRQ (lowest priority number, then lowest line), which
-    /// then counts as in service. With nothing deliverable, the last
-    /// address handed out is returned unchanged.
-    private func handOutHighestPriorityIRQ(from vic: VIC) -> UInt32 {
+    /// `VICADDRESS` read on VIC `index`: the vector address of the
+    /// highest-priority deliverable IRQ (lowest priority number, then
+    /// lowest line) among its own lines and whatever the rest of the
+    /// daisy chain offers, which then counts as in service. With nothing
+    /// deliverable, the last address handed out is returned unchanged.
+    private func handOutHighestPriorityIRQ(from index: Int) -> UInt32 {
+        let vic = vics[index]
+        let own = bestDeliverable(in: vic)
+        let daisyPriority = vic.priorityDaisy & 0xF
+        let ceiling = vic.inService.last ?? 16
+        let chainOffers = index + 1 < vics.count && chainHasDeliverable(from: index + 1)
+            && daisyPriority < ceiling && vic.softwarePriorityMask & (1 << daisyPriority) != 0
+        if let own, !chainOffers || own.priority <= daisyPriority {
+            vic.inService.append(own.priority)
+            vic.lastHandedOutAddress = vic.vectorAddress[own.line]
+        } else if chainOffers {
+            vic.inService.append(daisyPriority)
+            vic.lastHandedOutAddress = handOutHighestPriorityIRQ(from: index + 1)
+        } else {
+            return vic.lastHandedOutAddress
+        }
+        updateOutputs()
+        return vic.lastHandedOutAddress
+    }
+
+    private func bestDeliverable(in vic: VIC) -> (line: Int, priority: UInt32)? {
         var best: (line: Int, priority: UInt32)?
         var pending = vic.deliverableIRQs
         while pending != 0 {
@@ -134,11 +159,11 @@ final class PL192InterruptController: MMIODevice {
             let priority = vic.vectorPriority[line] & 0xF
             if best == nil || priority < best!.priority { best = (line, priority) }
         }
-        guard let best else { return vic.lastHandedOutAddress }
-        vic.inService.append(best.priority)
-        vic.lastHandedOutAddress = vic.vectorAddress[best.line]
-        updateOutputs()
-        return vic.lastHandedOutAddress
+        return best
+    }
+
+    private func chainHasDeliverable(from index: Int) -> Bool {
+        vics[index...].contains { $0.deliverableIRQs != 0 }
     }
 
     private func updateOutputs() {
