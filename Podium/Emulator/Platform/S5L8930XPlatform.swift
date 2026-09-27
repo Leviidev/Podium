@@ -38,6 +38,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
     static let dart2Base: UInt32 = 0x09D0_0000
     static let displayPipeBase: UInt32 = 0x0900_0000
     static let clcdBase: UInt32 = 0x0920_0000
+    static let dsimBase: UInt32 = 0x0950_0000
     static let displayPipeInterruptLine = 0x2A
     static let clcdInterruptLine = 0x29
     /// Timebase ticks per frame: 24 MHz / 60 Hz.
@@ -60,6 +61,8 @@ final class S5L8930XPlatform: DeviceEventHandler {
     let dart2 = S5L8930XDART()
     private(set) var displayPipe: S5L8930XDisplayPipe!
     private(set) var clcd: S5L8930XCLCD!
+    /// The MIPI DSI link to the panel.
+    let dsim = S5L8930XDSIM()
     private var nextFrameTick: UInt64 = frameTicks
 
     init(cpu: ARMv7CPU) {
@@ -118,6 +121,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
             (dart2, Self.dart2Base, S5L8930XDART.windowLength),
             (displayPipe, Self.displayPipeBase, S5L8930XDisplayPipe.windowLength),
             (clcd, Self.clcdBase, S5L8930XCLCD.windowLength),
+            (dsim, Self.dsimBase, S5L8930XDSIM.windowLength),
         ]
         return windows.flatMap { device, base, length in
             [base, base | Self.aliasBit].map { MMIORegion(device: device, baseAddress: $0, length: length) }
