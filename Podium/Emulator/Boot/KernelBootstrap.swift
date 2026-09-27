@@ -160,12 +160,30 @@ enum KernelBootstrap {
     /// enable bit, `+0x50` bit 0, and a nonzero panel size at `+0x60` —
     /// width in bits [10:0], height in bits [26:16]. This leaves exactly
     /// that state behind, for the panel's real 640x960.
+    ///
+    /// It also leaves the display pipe showing the boot logo in layer 1,
+    /// which is where AppleDisplayPipe learns the panel's size: for
+    /// whichever layer `+0x1038` says is on (bit 8 layer 0, bit 9 layer
+    /// 1), width and height are the layer's window end (`+0x5060`, x in
+    /// bits [26:16], y in [10:0]) minus its start (`+0x5050`). Without it,
+    /// every framebuffer reported a 0x0 display, and CoreAnimation,
+    /// clipping every frame to that, never drew anything.
     static let clcdSecondaryWindow: UInt32 = 0x8920_0000
+    static let displayPipe: UInt32 = 0x8900_0000
 
     private static func leaveDisplayControllerRunning(on bus: SegmentedMemoryBus) throws {
-        let size = UInt32(GuestMemoryLayout.framebufferHeight) << 16 | UInt32(GuestMemoryLayout.framebufferWidth)
-        try bus.writeWord32(size, at: clcdSecondaryWindow + 0x60)
+        let width = UInt32(GuestMemoryLayout.framebufferWidth)
+        let height = UInt32(GuestMemoryLayout.framebufferHeight)
+        try bus.writeWord32(height << 16 | width, at: clcdSecondaryWindow + 0x60)
         try bus.writeWord32(1, at: clcdSecondaryWindow + 0x50)
+        // Layer 1, as openiBoot's A4 clcd.c programs a window: enabled,
+        // 32-bit pixels, the boot framebuffer, its stride, and the window.
+        try bus.writeWord32(1, at: displayPipe + 0x5040)
+        try bus.writeWord32(GuestMemoryLayout.framebufferPhysicalAddress, at: displayPipe + 0x5044)
+        try bus.writeWord32((GuestMemoryLayout.framebufferRowBytes & ~0x3F) | 2, at: displayPipe + 0x5048)
+        try bus.writeWord32(0, at: displayPipe + 0x5050)
+        try bus.writeWord32(width << 16 | height, at: displayPipe + 0x5060)
+        try bus.writeWord32(1 << 9, at: displayPipe + 0x1038)
     }
 
     private static func align(_ value: UInt32, _ alignment: UInt32) -> UInt32 {

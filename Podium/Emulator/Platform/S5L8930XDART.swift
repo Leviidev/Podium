@@ -38,6 +38,13 @@ final class S5L8930XDART: MMIODevice {
         }
     }
 
+    /// Whether the kernel has set up any segment for `stream` yet. Until
+    /// it does (iBoot's boot logo, say), the stream's device addresses are
+    /// physical ones.
+    func hasSegments(stream: Int) -> Bool {
+        segmentTable[stream * Self.segmentCount..<(stream + 1) * Self.segmentCount].contains { $0 & 1 != 0 }
+    }
+
     /// The physical address `deviceAddress` maps to for `stream`, or nil
     /// when the segment or page isn't valid.
     func translate(_ deviceAddress: UInt32, stream: Int, memory: MemoryBus) -> UInt32? {

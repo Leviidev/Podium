@@ -4,9 +4,9 @@ import Foundation
 /// AppleCLCD/AppleDisplayPipe programmed, read through the display DART
 /// the way the hardware fetches them, composited into one BGRA8 frame.
 ///
-/// Until a layer is enabled (before AppleCLCD's first swap) this falls
-/// back to `bootFramebuffer`, the static framebuffer `boot_args.Video`
-/// points at.
+/// Until a layer is enabled this falls back to `bootFramebuffer`, the
+/// static framebuffer `boot_args.Video` points at; until the kernel sets
+/// up the DART, layer addresses (iBoot's boot logo layer) are physical.
 ///
 /// Layer registers, from openiBoot's A4 `clcd.c` (which programs the same
 /// pipe) and the kernel's own writes: layer `n` at pipe `+0x4040 + n *
@@ -72,6 +72,7 @@ final class DisplayScanout: FramebufferSource {
         let height = min(layer.height, pixelHeight)
         let stride = layer.stride > 0 ? layer.stride : layer.width * layer.bytesPerPixel
         let rowBytes = width * layer.bytesPerPixel
+        let translated = dart.hasSegments(stream: Self.clcdStream)
         var row = Data(count: rowBytes)
         for y in 0..<height {
             let rowAddress = layer.address &+ UInt32(y * stride)
@@ -79,7 +80,7 @@ final class DisplayScanout: FramebufferSource {
             while filled < rowBytes {
                 let deviceAddress = rowAddress &+ UInt32(filled)
                 let run = min(rowBytes - filled, 0x1000 - Int(deviceAddress & 0xFFF))
-                if let physical = dart.translate(deviceAddress, stream: Self.clcdStream, memory: memory),
+                if let physical = translated ? dart.translate(deviceAddress, stream: Self.clcdStream, memory: memory) : deviceAddress,
                    let bytes = try? memory.readBytes(run, at: physical) {
                     row.replaceSubrange(filled..<(filled + run), with: bytes)
                 } else {

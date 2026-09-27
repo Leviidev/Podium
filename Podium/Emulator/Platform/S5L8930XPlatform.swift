@@ -10,8 +10,9 @@ protocol DeviceEventHandler: AnyObject {
 /// with: the system timer, the power manager, the interrupt controller, and
 /// the IOP's and single-wire interface's handshakes, the CDMA engine's
 /// memory-to-memory AES, the I²C buses with the PMU on them, the I²S
-/// controller's channel status, and the display DART's segment table,
-/// wired to the CPU's IRQ/FIQ pins and to its virtual clock.
+/// controller's channel status, the display DART's segment table, and the
+/// LCD's display pipe and CLCD interrupts at 60 frames a second, wired to
+/// the CPU's IRQ/FIQ pins and to its virtual clock.
 ///
 /// Time is virtual: the timebase counter advances one tick per
 /// `instructionsPerTimebaseTick` retired instructions (plus whatever WFI
@@ -35,6 +36,12 @@ final class S5L8930XPlatform: DeviceEventHandler {
     static let i2c0InterruptLine = 0x13
     static let i2s0Base: UInt32 = 0x0450_0400
     static let dart2Base: UInt32 = 0x09D0_0000
+    static let displayPipeBase: UInt32 = 0x0900_0000
+    static let clcdBase: UInt32 = 0x0920_0000
+    static let displayPipeInterruptLine = 0x2A
+    static let clcdInterruptLine = 0x29
+    /// Timebase ticks per frame: 24 MHz / 60 Hz.
+    static let frameTicks: UInt64 = 400_000
     static let i2c2InterruptLine = 0x15
     private static let aliasBit: UInt32 = 0x8000_0000
 
@@ -51,6 +58,9 @@ final class S5L8930XPlatform: DeviceEventHandler {
     let i2s0 = S5L8930XI2S()
     /// The display IOMMU (`dart2`), which scanout translates through.
     let dart2 = S5L8930XDART()
+    private(set) var displayPipe: S5L8930XDisplayPipe!
+    private(set) var clcd: S5L8930XCLCD!
+    private var nextFrameTick: UInt64 = frameTicks
 
     init(cpu: ARMv7CPU) {
         self.cpu = cpu
@@ -78,7 +88,14 @@ final class S5L8930XPlatform: DeviceEventHandler {
             self.interruptController.setLine(Self.i2c2InterruptLine, asserted: asserted)
         }
         i2c0.attach(pmu, at: D1815PMU.address)
+        displayPipe = S5L8930XDisplayPipe { [unowned self] asserted in
+            self.interruptController.setLine(Self.displayPipeInterruptLine, asserted: asserted)
+        }
+        clcd = S5L8930XCLCD { [unowned self] asserted in
+            self.interruptController.setLine(Self.clcdInterruptLine, asserted: asserted)
+        }
         cpu.deviceEventHandler = self
+        rescheduleNextEvent()
     }
 
     /// The MMIO regions to put on the bus — ahead of the generic
@@ -99,6 +116,8 @@ final class S5L8930XPlatform: DeviceEventHandler {
             (i2c2, Self.i2c2Base, S5L8930XI2C.windowLength),
             (i2s0, Self.i2s0Base, S5L8930XI2S.windowLength),
             (dart2, Self.dart2Base, S5L8930XDART.windowLength),
+            (displayPipe, Self.displayPipeBase, S5L8930XDisplayPipe.windowLength),
+            (clcd, Self.clcdBase, S5L8930XCLCD.windowLength),
         ]
         return windows.flatMap { device, base, length in
             [base, base | Self.aliasBit].map { MMIORegion(device: device, baseAddress: $0, length: length) }
@@ -106,11 +125,17 @@ final class S5L8930XPlatform: DeviceEventHandler {
     }
 
     func deviceEventDue(at virtualTime: UInt64) {
-        timer.advance(toTick: virtualTime / Self.instructionsPerTimebaseTick)
+        let tick = virtualTime / Self.instructionsPerTimebaseTick
+        timer.advance(toTick: tick)
+        if tick >= nextFrameTick {
+            displayPipe.frameEnded()
+            clcd.frameEnded()
+            nextFrameTick = (tick / Self.frameTicks + 1) * Self.frameTicks
+        }
         rescheduleNextEvent()
     }
 
     private func rescheduleNextEvent() {
-        cpu.nextDeviceEventAt = timer.eventDeadlineTick.map { $0 &* Self.instructionsPerTimebaseTick } ?? .max
+        cpu.nextDeviceEventAt = min(timer.eventDeadlineTick ?? .max, nextFrameTick) &* Self.instructionsPerTimebaseTick
     }
 }
