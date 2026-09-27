@@ -45,4 +45,11 @@ enum ReferenceFirmwareKeys {
         key: Data(hex: "fd12079909ae24b2f8140720854608d12c066def4dc07b66f142259d2970426c"),
         iv: Data(hex: "830c518baddc2e82ad27de186a56e451")
     )
+
+    /// The root filesystem disk image's `encrcdsa` key (16-byte AES key
+    /// followed by the 20-byte HMAC-SHA1 key), from the same TheAppleWiki
+    /// page's "Root Filesystem" entry. Verified the same way: decrypting
+    /// `058-2543-001.dmg` with it yields a UDIF image whose `koly` trailer
+    /// and HFSX partition table parse, and whose volume mounts.
+    static let rootFilesystem = Data(hex: "7fc7156c452e9c6d05983c5286c2ffd51a305c4bd61a7a5161a567b3b5ef88e1ff786ee9")
 }

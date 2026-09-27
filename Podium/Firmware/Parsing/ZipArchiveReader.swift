@@ -81,6 +81,75 @@ final class ZipArchiveReader {
         }
     }
 
+    /// Streams an entry's decompressed bytes to `body` a piece at a time,
+    /// for entries too large to hold in memory (an IPSW's root filesystem
+    /// image is most of a gigabyte). `progress` gets the fraction of the
+    /// entry's compressed bytes read so far.
+    func stream(_ entry: ZipEntry, progress: (Double) -> Void = { _ in }, _ body: (UnsafeRawBufferPointer) throws -> Void) throws {
+        try fileHandle.seek(toOffset: entry.localHeaderOffset)
+        guard let header = try fileHandle.read(upToCount: 30), header.count == 30,
+              header.readUInt32LE(at: 0) == Self.localFileHeaderSignature else {
+            throw FirmwareParsingError.notAZipArchive
+        }
+        let nameLength = UInt64(header.readUInt16LE(at: 26))
+        let extraLength = UInt64(header.readUInt16LE(at: 28))
+        try fileHandle.seek(toOffset: entry.localHeaderOffset + 30 + nameLength + extraLength)
+        let readSize = 1 << 20
+        var remaining = entry.compressedSize
+
+        if entry.compressionMethod == 0 {
+            while remaining > 0 {
+                let piece = try readExact(count: Int(min(UInt64(readSize), remaining)))
+                remaining -= UInt64(piece.count)
+                try piece.withUnsafeBytes(body)
+                progress(1 - Double(remaining) / Double(max(entry.compressedSize, 1)))
+            }
+            return
+        }
+        guard entry.compressionMethod == 8 else {
+            throw FirmwareParsingError.unsupportedZipFeature("Compression method \(entry.compressionMethod) is not supported.")
+        }
+
+        let streamPointer = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
+        defer { streamPointer.deallocate() }
+        guard compression_stream_init(streamPointer, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else {
+            throw FirmwareParsingError.unsupportedZipFeature("Couldn't start a deflate stream.")
+        }
+        defer { compression_stream_destroy(streamPointer) }
+        let outputSize = 4 << 20
+        let output = UnsafeMutablePointer<UInt8>.allocate(capacity: outputSize)
+        defer { output.deallocate() }
+        var finished = false
+        while !finished {
+            let piece = remaining > 0 ? try readExact(count: Int(min(UInt64(readSize), remaining))) : Data()
+            remaining -= UInt64(piece.count)
+            let flags = remaining == 0 ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
+            var producedAny = false
+            try piece.withUnsafeBytes { input in
+                streamPointer.pointee.src_ptr = input.bindMemory(to: UInt8.self).baseAddress ?? UnsafePointer(output)
+                streamPointer.pointee.src_size = input.count
+                repeat {
+                    streamPointer.pointee.dst_ptr = output
+                    streamPointer.pointee.dst_size = outputSize
+                    let status = compression_stream_process(streamPointer, flags)
+                    guard status != COMPRESSION_STATUS_ERROR else {
+                        throw FirmwareParsingError.unsupportedZipFeature("Corrupt deflate data in \(entry.name).")
+                    }
+                    let produced = outputSize - streamPointer.pointee.dst_size
+                    if produced > 0 {
+                        producedAny = true
+                        try body(UnsafeRawBufferPointer(start: output, count: produced))
+                    }
+                    if status == COMPRESSION_STATUS_END { finished = true; break }
+                } while streamPointer.pointee.src_size > 0 || streamPointer.pointee.dst_size == 0
+            }
+            progress(1 - Double(remaining) / Double(max(entry.compressedSize, 1)))
+            if !finished, piece.isEmpty, !producedAny {
+                throw FirmwareParsingError.unsupportedZipFeature("\(entry.name) ended before its deflate stream did.")
+            }
+        }
+    }
+
     private func readExact(count: Int) throws -> Data {
         guard let data = try fileHandle.read(upToCount: count), data.count == count else {
             throw FirmwareParsingError.unreadableFile(underlying: CocoaError(.fileReadCorruptFile))

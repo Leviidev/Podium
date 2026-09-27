@@ -59,6 +59,11 @@ struct BuildManifestPlist: Decodable {
         buildIdentities.first?.manifest["KernelCache"]?.info.path
     }
 
+    /// The path of the root filesystem disk image (the "OS" component).
+    var rootFilesystemPath: String? {
+        buildIdentities.first?.manifest["OS"]?.info.path
+    }
+
     /// The path (inside the IPSW) of the device tree this manifest
     /// describes — same "first `BuildIdentity`" simplification as
     /// `kernelCachePath`.
