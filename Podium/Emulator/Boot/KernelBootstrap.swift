@@ -65,6 +65,8 @@ enum KernelBootstrap {
             DeviceTreePatcher.patchClockPlaceholders(&deviceTree!)
             DeviceTreePatcher.patchNVRAMProxyData(&deviceTree!)
             DeviceTreePatcher.patchClockFrequencies(&deviceTree!)
+            DeviceTreePatcher.setLCDPanelID(&deviceTree!)
+            DeviceTreePatcher.setVRAM(&deviceTree!, physicalAddress: GuestMemoryLayout.framebufferPhysicalAddress, size: GuestMemoryLayout.framebufferSize)
             for region in DeviceTreeMemoryMap.peripheralRegions(in: deviceTree!, excluding: GuestMemoryLayout.ramPhysicalRange) {
                 bus.addRegion(peripheralBacking(FlatPhysicalMemory(length: Int(region.size), baseAddress: region.address)))
             }

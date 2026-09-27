@@ -278,4 +278,64 @@ final class DeviceTreePatcherTests: XCTestCase {
         let defaultsOffset = tree.range(of: Data("defaults".utf8))!.lowerBound - tree.startIndex - 36 - 8
         XCTAssertEqual(tree.readUInt32LE(at: defaultsOffset), 3)
     }
+
+    /// ApplePinotLCD refuses to start with the shipped `lcd-panel-id` of 0;
+    /// the patch fills in the stand-in ID in place, on the `lcd` node under
+    /// `arm-io/mipi-dsim` only.
+    func testSetLCDPanelIDFillsInTheMIPIPanelNodeInPlace() {
+        func property(_ name: String, value: Data) -> Data {
+            var data = Data(count: 32)
+            data.replaceSubrange(0..<name.utf8.count, with: Array(name.utf8))
+            var length = Data(count: 4)
+            length.writeUInt32LE(UInt32(value.count), at: 0)
+            return data + length + value + Data(count: (4 - value.count % 4) % 4)
+        }
+        func node(_ name: String, _ properties: [Data], children: [Data] = []) -> Data {
+            let all = [property("name", value: Data((name + "\u{0}").utf8))] + properties
+            var header = Data(count: 8)
+            header.writeUInt32LE(UInt32(all.count), at: 0)
+            header.writeUInt32LE(UInt32(children.count), at: 4)
+            return header + all.reduce(Data(), +) + children.reduce(Data(), +)
+        }
+        let lcd = node("lcd", [property("lcd-panel-id", value: Data(count: 4))])
+        let armIO = node("arm-io", [], children: [node("mipi-dsim", [], children: [lcd])])
+        var tree = node("device-tree", [], children: [armIO])
+        let originalCount = tree.count
+
+        DeviceTreePatcher.setLCDPanelID(&tree)
+
+        XCTAssertEqual(tree.count, originalCount)
+        guard let offset = valueOffset(of: "lcd-panel-id", in: tree) else { return XCTFail("no lcd-panel-id property") }
+        XCTAssertEqual(tree.readUInt32LE(at: offset), DeviceTreePatcher.standInLCDPanelID)
+        XCTAssertEqual(DeviceTreePatcher.standInLCDPanelID & 0x38, 0, "class 1 panel")
+    }
+
+    /// IOSurfaceRoot waits on `/vram` as a memory region; the patch points
+    /// it at the boot framebuffer, in place.
+    func testSetVRAMPointsTheVRAMNodeAtTheBootFramebuffer() {
+        func property(_ name: String, value: Data) -> Data {
+            var data = Data(count: 32)
+            data.replaceSubrange(0..<name.utf8.count, with: Array(name.utf8))
+            var length = Data(count: 4)
+            length.writeUInt32LE(UInt32(value.count), at: 0)
+            return data + length + value + Data(count: (4 - value.count % 4) % 4)
+        }
+        func node(_ name: String, _ properties: [Data], children: [Data] = []) -> Data {
+            let all = [property("name", value: Data((name + "\u{0}").utf8))] + properties
+            var header = Data(count: 8)
+            header.writeUInt32LE(UInt32(all.count), at: 0)
+            header.writeUInt32LE(UInt32(children.count), at: 4)
+            return header + all.reduce(Data(), +) + children.reduce(Data(), +)
+        }
+        let vram = node("vram", [property("device_type", value: Data("vram\u{0}".utf8)), property("reg", value: Data(count: 8))])
+        var tree = node("device-tree", [], children: [vram])
+        let originalCount = tree.count
+
+        DeviceTreePatcher.setVRAM(&tree, physicalAddress: 0x7FDA_8000, size: 0x25_8000)
+
+        XCTAssertEqual(tree.count, originalCount)
+        guard let offset = valueOffset(of: "reg", in: tree) else { return XCTFail("no reg property") }
+        XCTAssertEqual(tree.readUInt32LE(at: offset), 0x7FDA_8000)
+        XCTAssertEqual(tree.readUInt32LE(at: offset + 4), 0x25_8000)
+    }
 }

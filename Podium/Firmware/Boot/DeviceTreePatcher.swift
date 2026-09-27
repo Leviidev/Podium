@@ -211,6 +211,40 @@ enum DeviceTreePatcher {
         deviceTree.writeUInt32LE(1, at: location.valueOffset)
     }
 
+    /// Stand-in for the ID iBoot reads back from the panel over MIPI-DSI.
+    /// Bits 5:3 zero make it a "class 1" panel to ApplePinotLCD, the class
+    /// whose power-on sequence has no extra settle delay.
+    static let standInLCDPanelID: UInt32 = 0x00A2_C102
+
+    /// Sets `lcd-panel-id` on the `lcd` node under `mipi-dsim`, which iBoot
+    /// fills in after querying the panel. ApplePinotLCD's `start` gives up
+    /// when it reads 0 (the shipped placeholder), so it never publishes its
+    /// `lcdE` function, and AppleCLCD, which looks that function up through
+    /// its own `function-lcd_enable`, then waits for it forever: the built-in
+    /// display never registers, and backboardd only finds the TV-out
+    /// framebuffer (AppleRGBOUT). In place (the property is already 4
+    /// bytes), so nothing moves.
+    static func setLCDPanelID(_ deviceTree: inout Data, id: UInt32 = standInLCDPanelID) {
+        guard let location = findProperties(in: deviceTree, path: ["arm-io", "mipi-dsim", "lcd"], propertyNames: ["lcd-panel-id"]).first,
+              location.currentLength == 4 else { return }
+        deviceTree.writeUInt32LE(id, at: location.valueOffset)
+    }
+
+    /// Sets `/vram`'s `reg` to the boot framebuffer, which iBoot fills in
+    /// with the memory it drew the boot logo in. IOSurfaceRoot counts
+    /// `/vram` among the memory regions it waits for before creating any
+    /// surface; AppleCLCD's first surface is that same framebuffer,
+    /// adopted from iBoot, and with the shipped zero-length placeholder
+    /// the creation waited forever, so AppleCLCD never registered as a
+    /// display. In place (the property is already 8 bytes), so nothing
+    /// moves.
+    static func setVRAM(_ deviceTree: inout Data, physicalAddress: UInt32, size: UInt32) {
+        guard let location = findProperties(in: deviceTree, path: ["vram"], propertyNames: ["reg"]).first,
+              location.currentLength == 8 else { return }
+        deviceTree.writeUInt32LE(physicalAddress, at: location.valueOffset)
+        deviceTree.writeUInt32LE(size, at: location.valueOffset + 4)
+    }
+
     /// Adds the `/defaults/no-effaceable-storage` flag. Data protection
     /// normally keeps the system keybag's wrapping key ("BAG1") and wipe
     /// ID in effaceable storage — lockers in NAND/NOR that AppleEffaceable-

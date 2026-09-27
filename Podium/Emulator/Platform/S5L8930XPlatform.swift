@@ -8,9 +8,10 @@ protocol DeviceEventHandler: AnyObject {
 /// The A4 (S5L8930X) SoC hardware that has real behavior, as opposed to
 /// the plain storage `DeviceTreeMemoryMap` backs every other peripheral
 /// with: the system timer, the power manager, the interrupt controller, and
-/// the IOP's and single-wire interface's handshakes, and the CDMA engine's
-/// memory-to-memory AES, wired to the CPU's IRQ/FIQ pins and to its
-/// virtual clock.
+/// the IOP's and single-wire interface's handshakes, the CDMA engine's
+/// memory-to-memory AES, the I²C buses with the PMU on them, the I²S
+/// controller's channel status, and the display DART's segment table,
+/// wired to the CPU's IRQ/FIQ pins and to its virtual clock.
 ///
 /// Time is virtual: the timebase counter advances one tick per
 /// `instructionsPerTimebaseTick` retired instructions (plus whatever WFI
@@ -29,6 +30,12 @@ final class S5L8930XPlatform: DeviceEventHandler {
     static let vicBase: UInt32 = 0x3F20_0000
     static let iopBase: UInt32 = 0x0630_0000
     static let swiBase: UInt32 = 0x3F60_0000
+    static let i2c0Base: UInt32 = 0x0320_0000
+    static let i2c2Base: UInt32 = 0x0340_0000
+    static let i2c0InterruptLine = 0x13
+    static let i2s0Base: UInt32 = 0x0450_0400
+    static let dart2Base: UInt32 = 0x09D0_0000
+    static let i2c2InterruptLine = 0x15
     private static let aliasBit: UInt32 = 0x8000_0000
 
     private unowned let cpu: ARMv7CPU
@@ -38,6 +45,12 @@ final class S5L8930XPlatform: DeviceEventHandler {
     let iop = S5L8930XIOP()
     let swi = S5L8930XSWI()
     private(set) var cdma: S5L8930XCDMA!
+    private(set) var i2c0: S5L8930XI2C!
+    private(set) var i2c2: S5L8930XI2C!
+    let pmu = D1815PMU()
+    let i2s0 = S5L8930XI2S()
+    /// The display IOMMU (`dart2`), which scanout translates through.
+    let dart2 = S5L8930XDART()
 
     init(cpu: ARMv7CPU) {
         self.cpu = cpu
@@ -58,6 +71,13 @@ final class S5L8930XPlatform: DeviceEventHandler {
                 self.interruptController.setLine(line, asserted: asserted)
             }
         )
+        i2c0 = S5L8930XI2C { [unowned self] asserted in
+            self.interruptController.setLine(Self.i2c0InterruptLine, asserted: asserted)
+        }
+        i2c2 = S5L8930XI2C { [unowned self] asserted in
+            self.interruptController.setLine(Self.i2c2InterruptLine, asserted: asserted)
+        }
+        i2c0.attach(pmu, at: D1815PMU.address)
         cpu.deviceEventHandler = self
     }
 
@@ -75,6 +95,10 @@ final class S5L8930XPlatform: DeviceEventHandler {
             (swi, Self.swiBase, S5L8930XSWI.windowLength),
             (cdma, S5L8930XCDMA.channelsBase, S5L8930XCDMA.channelsLength),
             (cdma.aes, S5L8930XCDMA.aesBase, S5L8930XCDMA.aesLength),
+            (i2c0, Self.i2c0Base, S5L8930XI2C.windowLength),
+            (i2c2, Self.i2c2Base, S5L8930XI2C.windowLength),
+            (i2s0, Self.i2s0Base, S5L8930XI2S.windowLength),
+            (dart2, Self.dart2Base, S5L8930XDART.windowLength),
         ]
         return windows.flatMap { device, base, length in
             [base, base | Self.aliasBit].map { MMIORegion(device: device, baseAddress: $0, length: length) }

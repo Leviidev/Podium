@@ -171,6 +171,11 @@ final class EmulatorCore {
             segmentedBus.addRegion(region)
         }
         self.platform = platform
+        // The screen shows what the display pipe scans out once AppleCLCD
+        // programs a layer, and the boot framebuffer until then.
+        if let bootFramebuffer = framebufferSource as? GuestFramebuffer {
+            framebufferSource = DisplayScanout(memory: segmentedBus, dart: platform.dart2, bootFramebuffer: bootFramebuffer)
+        }
 
         let prepared: KernelBootstrap.Prepared
         do {
