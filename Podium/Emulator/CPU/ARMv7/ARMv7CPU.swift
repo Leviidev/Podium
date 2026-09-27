@@ -1003,12 +1003,29 @@ final class ARMv7CPU: CPU {
     /// Exception return: CPSR (mode, flags, masks, T, ITSTATE) from
     /// `savedCPSR`, banking in the restored mode's registers, then a
     /// jump to `address` aligned for the restored instruction set.
-    private func returnFromException(to address: UInt32, restoring savedCPSR: UInt32) {
+    func returnFromException(to address: UInt32, restoring savedCPSR: UInt32) {
         let oldModeBits = cpsr.rawValue & Self.modeBitsMask
         cpsr.rawValue = savedCPSR & ~Self.itBitsMask
         itState = Self.itState(fromCPSR: savedCPSR)
         switchProcessorMode(from: oldModeBits, to: cpsr.rawValue & Self.modeBitsMask)
         registers.pc = address & (cpsr.thumbState ? ~UInt32(1) : ~UInt32(3))
+    }
+
+    /// Emulates a fast return from a Supervisor Call taken at the SVC vector,
+    /// setting r0 to `result` and updating the Carry flag (bit 29) in the
+    /// restored user CPSR (cleared on success, set on error) per Darwin's
+    /// ARM syscall ABI.
+    func returnFromSupervisorCall(result: UInt32, success: Bool = true) {
+        let spsr = savedProgramStatus(forModeBits: Self.svcModeBits) ?? cpsr.rawValue
+        let returnAddress = registers.lr
+        var userCPSR = spsr
+        if success {
+            userCPSR &= ~(1 << 29)
+        } else {
+            userCPSR |= (1 << 29)
+        }
+        registers[0] = result
+        returnFromException(to: returnAddress, restoring: userCPSR)
     }
 
     /// The User/System-mode copy of a register while executing in another

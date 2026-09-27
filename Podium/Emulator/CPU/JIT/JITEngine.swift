@@ -45,6 +45,7 @@ final class JITEngine {
     // was added.
     private var cache: [UInt32: CompiledBlock?] = [:]
     private let maxBlockLength: Int
+    public var fallbackCounts: [UInt32: Int] = [:]
 
     // Tracks, per cache key, how many *consecutive* times in a row a
     // memory-accessing block has bailed on its very first instruction
