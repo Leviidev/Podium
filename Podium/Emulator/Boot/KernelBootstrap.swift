@@ -42,7 +42,11 @@ enum KernelBootstrap {
     /// still left AMFI killing every exec with "missing or invalid
     /// entitlement hash", which put several daemons into a launchd
     /// respawn loop; `amfi_allow_any_signature` covers that check too).
-    static let ramDiskBootArguments = "rd=md0 amfi_get_out_of_my_way=1 amfi_allow_any_signature=1 cs_enforcement_disable=1 -v"
+    /// `fips_mode=0` skips corecrypto's FIPS power-on self-test in user
+    /// space (`/usr/libexec/cc_fips_test`: "Bypassing FIPS mode for user
+    /// space!"), whose RSA key generation alone was about 1.5 billion
+    /// guest instructions of every boot.
+    static let ramDiskBootArguments = "rd=md0 amfi_get_out_of_my_way=1 amfi_allow_any_signature=1 cs_enforcement_disable=1 fips_mode=0 -v"
 
     /// - Parameter peripheralBacking: wraps each plain-storage peripheral
     ///   region before it's added (a tracing wrapper, for instance).
