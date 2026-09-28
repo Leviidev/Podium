@@ -79,22 +79,34 @@ final class ARMv7CPU: CPU {
     /// reliably catch (a tight loop after the address of interest is very
     /// unlikely to land back exactly on it at a sampled boundary).
     var breakpoints: Set<UInt32> = [] {
-        didSet {
-            breakpointFilter = [UInt64](repeating: 0, count: Self.breakpointFilterWords)
-            for address in breakpoints {
-                let bit = Self.breakpointFilterBit(address)
-                breakpointFilter[bit >> 6] |= 1 << UInt64(bit & 63)
-            }
-        }
+        didSet { rebuildBreakpointFilter() }
     }
-    /// A bitmap over (pc >> 1) that every breakpoint sets a bit in, checked
-    /// before the set itself: `run(maxUnits:)` asks once per unit, and
-    /// hashing the pc into the set each time was a fifth of host time.
+    /// Guest functions done natively instead of interpreted. At one of
+    /// these addresses, before its first instruction runs, the handler gets
+    /// the CPU with the arguments as the caller left them. It returns true
+    /// once it has done the function's work, and the CPU returns to the
+    /// caller as the function's own `bx lr` would; or false, to have the
+    /// guest's code run after all. Breakpoints take precedence.
+    var nativeFunctions: [UInt32: (ARMv7CPU) -> Bool] = [:] {
+        didSet { rebuildBreakpointFilter() }
+    }
+    /// A bitmap over (pc >> 1) that every breakpoint and native function
+    /// sets a bit in, checked before the sets themselves: `run(maxUnits:)`
+    /// asks once per unit, and hashing the pc into the set each time was a
+    /// fifth of host time.
     private var breakpointFilter = [UInt64](repeating: 0, count: breakpointFilterWords)
     private static let breakpointFilterWords = 64
     @inline(__always)
     private static func breakpointFilterBit(_ address: UInt32) -> Int { Int((address >> 1) & UInt32(breakpointFilterWords * 64 - 1)) }
     private(set) var hitBreakpoint: UInt32?
+
+    private func rebuildBreakpointFilter() {
+        breakpointFilter = [UInt64](repeating: 0, count: Self.breakpointFilterWords)
+        for address in breakpoints.union(nativeFunctions.keys) {
+            let bit = Self.breakpointFilterBit(address)
+            breakpointFilter[bit >> 6] |= 1 << UInt64(bit & 63)
+        }
+    }
     /// Real guest instructions retired so far. Differs from `run(maxUnits:)`'s
     /// unit count once the JIT is involved, since one compiled block is one
     /// unit but many instructions — this is the honest progress/speed figure.
@@ -409,9 +421,19 @@ final class ARMv7CPU: CPU {
         while isRunning && lastError == nil && unitsRun < maxUnits {
             serviceDevicesAndInterrupts()
             let bit = Self.breakpointFilterBit(registers.pc)
-            if breakpointFilter[bit >> 6] & (1 << UInt64(bit & 63)) != 0, breakpoints.contains(registers.pc) {
-                hitBreakpoint = registers.pc
-                break
+            if breakpointFilter[bit >> 6] & (1 << UInt64(bit & 63)) != 0 {
+                if breakpoints.contains(registers.pc) {
+                    hitBreakpoint = registers.pc
+                    break
+                }
+                if let function = nativeFunctions[registers.pc], function(self) {
+                    let returnAddress = registers.lr
+                    cpsr.thumbState = returnAddress & 1 != 0
+                    registers.pc = returnAddress & ~1
+                    retiredInstructionCount &+= 1
+                    unitsRun += 1
+                    continue
+                }
             }
             runOneUnit()
             unitsRun += 1
@@ -839,6 +861,16 @@ final class ARMv7CPU: CPU {
     /// the MMU on or off, exactly like real hardware.
     var mmuEnabled: Bool {
         cp15.sctlr & Self.sctlrMMUEnableBit != 0
+    }
+
+    /// Where guest virtual `address` is in host memory, if it's RAM mapped
+    /// for `access` in the current address space right now; nil where the
+    /// guest would fault, or it isn't RAM. For native functions, which
+    /// reach guest memory directly.
+    func hostAddress(ofVirtual address: UInt32, for access: ARMv7MMU.Access) -> UnsafeMutableRawPointer? {
+        guard let physical = try? translatedAddress(address, access: access),
+              let region = memory.fastPathRegion(for: physical) else { return nil }
+        return region.pointer + Int(physical &- region.regionBaseAddress)
     }
 
     func translatedAddress(_ virtualAddress: UInt32, access: ARMv7MMU.Access) throws -> UInt32 {
