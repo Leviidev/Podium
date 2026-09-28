@@ -13,8 +13,13 @@ import Foundation
 /// 0x1000` — control `+0x0` (bit 0 enable, bits 11:8 format: 0 32-bit
 /// BGRA, 4 RGB565), buffer device address `+0x4`, stride `+0x8` (bytes,
 /// low bits flags), size `+0x20` (`width << 16 | height`).
+///
+/// While the CLCD itself is disabled (`+0x50` bit 0 clear — AppleCLCD
+/// powers the panel down that way when the device sleeps) the screen is
+/// dark, whatever the layers still hold.
 final class DisplayScanout: FramebufferSource {
     static let pipeBase: UInt32 = 0x8900_0000
+    static let clcdControl: UInt32 = 0x8920_0050
     static let layerOffsets: [UInt32] = [0x4040, 0x5040]
     /// `mapper-clcd` is DART stream 0.
     static let clcdStream = 0
@@ -52,12 +57,19 @@ final class DisplayScanout: FramebufferSource {
 
     var activeLayers: [Layer] { Self.layerOffsets.indices.map(layer).filter(\.enabled) }
 
+    /// The panel is on: the CLCD is enabled.
+    var isLit: Bool { ((try? memory.readWord32(at: Self.clcdControl)) ?? 1) & 1 != 0 }
+
     func copyCurrentFrame(into buffer: UnsafeMutableRawBufferPointer) {
-        let layers = activeLayers
-        guard !layers.isEmpty else { return bootFramebuffer.copyCurrentFrame(into: buffer) }
         let byteCount = pixelWidth * pixelHeight * 4
         guard buffer.count >= byteCount else { return }
         let output = buffer.bindMemory(to: UInt32.self)
+        guard isLit else {
+            for index in 0..<(pixelWidth * pixelHeight) { output[index] = 0xFF00_0000 }
+            return
+        }
+        let layers = activeLayers
+        guard !layers.isEmpty else { return bootFramebuffer.copyCurrentFrame(into: buffer) }
         for index in 0..<(pixelWidth * pixelHeight) { output[index] = 0xFF00_0000 }
         for (index, layer) in layers.enumerated() {
             draw(layer, into: output, blend: index > 0)
