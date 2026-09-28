@@ -32,7 +32,8 @@ protocol DMAEndpoint: AnyObject {
 /// - Channel `n` at `n << 12`: CSR `+0x0`, DCR `+0x4`, DAR `+0x8`, DBR
 ///   (bytes remaining) `+0xC`, MAR `+0x10`, CAR (command chain, physical)
 ///   `+0x14`, ERR `+0x18`. CSR bit 0 starts the channel, writing bit 1
-///   aborts it; bits 17:16 read the state (1 = running); bit 18 (error)
+///   aborts it and bit 2 pauses it (bit 21 reads back paused); bits 17:16
+///   read the state (1 = running); bit 18 (error)
 ///   and bit 19 (done) are write-one-to-clear interrupt status, bit 3
 ///   enables the channel's interrupt (VIC line `0x30 + n`), bit 7 marks a
 ///   memory-to-memory channel, and bits 15:8 name the AES context
@@ -63,6 +64,8 @@ final class S5L8930XCDMA: MMIODevice {
 
     private static let csrStart: UInt32 = 1 << 0
     private static let csrAbort: UInt32 = 1 << 1
+    private static let csrPause: UInt32 = 1 << 2
+    private static let csrPaused: UInt32 = 1 << 21
     private static let csrInterruptEnable: UInt32 = 1 << 3
     private static let csrMemoryToMemory: UInt32 = 1 << 7
     private static let csrStateMask: UInt32 = 3 << 16
@@ -152,12 +155,17 @@ final class S5L8930XCDMA: MMIODevice {
         let old = registers[Int(offset / 4)]
         var csr = (value & ~(Self.csrWriteOneToClear | Self.csrStateMask)) | (old & (Self.csrWriteOneToClear | Self.csrStateMask))
         csr &= ~(value & Self.csrWriteOneToClear)
+        // Pausing (bit 2) halts the channel where it is, and says so in bit
+        // 21 — at once here; the kernel pauses a channel before it stops
+        // it (when the screen sleeps, say) and waits for that bit. It stays
+        // paused until it's aborted or started again.
+        if value & Self.csrPause != 0 || old & Self.csrPaused != 0 { csr |= Self.csrPaused }
         if value & Self.csrAbort != 0 {
-            csr &= ~(Self.csrStateMask | Self.csrStart | Self.csrAbort)
+            csr &= ~(Self.csrStateMask | Self.csrStart | Self.csrAbort | Self.csrPause | Self.csrPaused)
             peripheralTransfers[channel] = nil
         }
         if value & Self.csrStart != 0, old & Self.csrStateMask == 0 {
-            csr = (csr & ~Self.csrStateMask) | Self.csrStateRunning
+            csr = (csr & ~(Self.csrStateMask | Self.csrPause | Self.csrPaused)) | Self.csrStateRunning
         }
         registers[Int(offset / 4)] = csr
         if csr & (Self.csrError | Self.csrDone) == 0 { setInterruptLine(Self.firstInterruptLine + channel, false) }
@@ -203,7 +211,7 @@ final class S5L8930XCDMA: MMIODevice {
         var progress = true
         while progress {
             progress = false
-            for channel in peripheralTransfers.keys.sorted() {
+            for channel in peripheralTransfers.keys.sorted() where register(channel, 0) & Self.csrPaused == 0 {
                 guard var transfer = peripheralTransfers[channel] else { continue }
                 while transfer.segment < transfer.segments.count {
                     let segment = transfer.segments[transfer.segment]
