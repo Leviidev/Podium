@@ -78,41 +78,49 @@ final class DisplayScanout: FramebufferSource {
 
     /// Fetches one layer row by row through the DART. Rows can straddle
     /// device pages that map to scattered physical pages, so each page's
-    /// run is translated on its own.
+    /// run is translated on its own, and read straight from host memory.
     private func draw(_ layer: Layer, into output: UnsafeMutableBufferPointer<UInt32>, blend: Bool) {
         let width = min(layer.width, pixelWidth)
         let height = min(layer.height, pixelHeight)
-        let stride = layer.stride > 0 ? layer.stride : layer.width * layer.bytesPerPixel
-        let rowBytes = width * layer.bytesPerPixel
+        let bytesPerPixel = layer.bytesPerPixel
+        let stride = layer.stride > 0 ? layer.stride : layer.width * bytesPerPixel
+        let rowBytes = width * bytesPerPixel
         let translated = dart.hasSegments(stream: Self.clcdStream)
-        var row = Data(count: rowBytes)
+        guard let base = output.baseAddress else { return }
         for y in 0..<height {
             let rowAddress = layer.address &+ UInt32(y * stride)
+            let rowOutput = base + y * pixelWidth
             var filled = 0
             while filled < rowBytes {
                 let deviceAddress = rowAddress &+ UInt32(filled)
                 let run = min(rowBytes - filled, 0x1000 - Int(deviceAddress & 0xFFF))
-                if let physical = translated ? dart.translate(deviceAddress, stream: Self.clcdStream, memory: memory) : deviceAddress,
-                   let bytes = try? memory.readBytes(run, at: physical) {
-                    row.replaceSubrange(filled..<(filled + run), with: bytes)
-                } else {
-                    row.resetBytes(in: filled..<(filled + run))
+                let pixels = run / bytesPerPixel
+                let target = rowOutput + filled / bytesPerPixel
+                if let source = hostAddress(ofDevice: deviceAddress, translated: translated) {
+                    if bytesPerPixel == 2 {
+                        let from = source.assumingMemoryBound(to: UInt16.self)
+                        for x in 0..<pixels { target[x] = Self.bgra(fromRGB565: from[x]) }
+                    } else if blend {
+                        let from = source.assumingMemoryBound(to: UInt32.self)
+                        for x in 0..<pixels { target[x] = Self.over(from[x], target[x]) }
+                    } else {
+                        let from = source.assumingMemoryBound(to: UInt32.self)
+                        for x in 0..<pixels { target[x] = from[x] | 0xFF00_0000 }
+                    }
+                } else if !blend {
+                    for x in 0..<pixels { target[x] = 0xFF00_0000 }
                 }
                 filled += run
             }
-            row.withUnsafeBytes { raw in
-                let base = y * pixelWidth
-                if layer.bytesPerPixel == 2 {
-                    let pixels = raw.bindMemory(to: UInt16.self)
-                    for x in 0..<width { output[base + x] = Self.bgra(fromRGB565: pixels[x]) }
-                } else {
-                    let pixels = raw.bindMemory(to: UInt32.self)
-                    for x in 0..<width {
-                        output[base + x] = blend ? Self.over(pixels[x], output[base + x]) : pixels[x] | 0xFF00_0000
-                    }
-                }
-            }
         }
+    }
+
+    /// Where the display fetches device address `address` from, in host
+    /// memory: through the DART once the kernel has set it up.
+    private func hostAddress(ofDevice address: UInt32, translated: Bool) -> UnsafeRawPointer? {
+        guard let physical = translated ? dart.translate(address, stream: Self.clcdStream, memory: memory) : address,
+              let region = memory.fastPathRegion(for: physical) else { return nil }
+        return UnsafeRawPointer(region.pointer + Int(physical &- region.regionBaseAddress))
     }
 
     private static func bgra(fromRGB565 pixel: UInt16) -> UInt32 {
