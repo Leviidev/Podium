@@ -52,6 +52,9 @@ final class EmulatorCore {
     private static let logCapacity = 200
 
     private var pollTask: Task<Void, Never>?
+    /// What the running machine was powered on with, so a restart iOS
+    /// asks for can power it straight back on.
+    private var poweredOnWith: (firmware: ImportedFirmware, fileURL: URL)?
     private var rateSamples: [(time: Date, retired: UInt64)] = []
 
     init(
@@ -77,6 +80,12 @@ final class EmulatorCore {
     func powerOn(firmware: ImportedFirmware, storedAt fileURL: URL) async {
         guard session == nil, bootStage == nil else { return }
         Self.resetLogFile()
+        await boot(firmware: firmware, storedAt: fileURL)
+    }
+
+    private func boot(firmware: ImportedFirmware, storedAt fileURL: URL) async {
+        guard session == nil, bootStage == nil else { return }
+        poweredOnWith = (firmware, fileURL)
         status = .booting
         bootStage = .loadingKernel
         appendLog("Powering on \(firmware.displayName) (iOS \(firmware.metadata.productVersion)).")
@@ -215,6 +224,13 @@ final class EmulatorCore {
             status = .stopped
             framebufferSource = nil
             appendLog("iOS shut down.")
+        case .restarting:
+            status = .stopped
+            framebufferSource = nil
+            appendLog("iOS is restarting.")
+            if let (firmware, fileURL) = poweredOnWith {
+                Task { await boot(firmware: firmware, storedAt: fileURL) }
+            }
         case .stopped, .running:
             status = .stopped
         }

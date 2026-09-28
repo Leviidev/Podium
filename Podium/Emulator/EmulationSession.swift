@@ -13,8 +13,10 @@ final class EmulationSession {
     enum State: Equatable {
         case running
         case stopped
-        /// iOS shut itself down (or restarted): the watchdog reset it.
+        /// iOS shut itself down.
         case shutDown
+        /// iOS asked to restart.
+        case restarting
         case panicked(String)
         case halted(String)
     }
@@ -30,6 +32,17 @@ final class EmulationSession {
     /// handlers, jumping into `_panic`'s tail) in the 10B500 kernelcache,
     /// with the register holding each one's format string.
     private static let panicEntries: [UInt32: Int] = [0x8001_7C10: 0, 0x8001_7F28: 2]
+    /// `boot(paniced, howto, command)` in the same kernelcache, where every
+    /// shutdown and restart begins once launchd asks for one; `howto` bit 3
+    /// (`RB_HALT`) tells a shutdown from a restart. The run ends there:
+    /// everything the kernel does after it — syncing and unmounting a root
+    /// filesystem whose changes are discarded at power-off anyway, telling
+    /// every driver — only takes time. A lot of it: by then the root
+    /// filesystem's cached pages are going, and a launchd thread that
+    /// wakes up faults on its own code, takes the signal, faults again in
+    /// the handler, and crowds out the halt for a minute or more.
+    private static let shutdownEntry: UInt32 = 0x801D_F6E8
+    private static let haltFlag: UInt32 = 1 << 3
 
     let cpu: ARMv7CPU
     let platform: S5L8930XPlatform
@@ -93,9 +106,10 @@ final class EmulationSession {
         }
         cpu.reset()
         cpu.loadInitialRegisters(prepared.initialRegisters)
-        cpu.breakpoints = Set(Self.panicEntries.keys)
-        // The CPU spins until the reset lands; the run loop sees it at the
-        // end of the chunk.
+        cpu.breakpoints = Set(Self.panicEntries.keys).union([Self.shutdownEntry])
+        // A reset by any other route (the kernel ends a halt with the
+        // watchdog, and spins until it lands) ends the run too; the run
+        // loop sees it at the end of the chunk.
         platform.watchdog.onReset = { [unowned self] in guestReset = true }
     }
 
@@ -202,6 +216,10 @@ final class EmulationSession {
             let ran = cpu.run(maxUnits: 1_000_000)
             if guestReset {
                 finalState = .shutDown
+                break
+            }
+            if cpu.hitBreakpoint == Self.shutdownEntry {
+                finalState = cpu.registers[1] & Self.haltFlag != 0 ? .shutDown : .restarting
                 break
             }
             if let hit = cpu.hitBreakpoint, let register = Self.panicEntries[hit] {
