@@ -56,7 +56,7 @@ struct DeveloperSettingsScreen: View {
 
             Section("Memory") {
                 LabeledContent("Target RAM", value: Int64(EmulatorCore.physicalMemorySize).formattedByteCount)
-                LabeledContent("Status", value: emulatorCore.memory != nil ? "Mapped at 0x00000000" : "Not active")
+                LabeledContent("Status", value: emulatorCore.isPoweredOn ? "Mapped at 0x\(GuestMemoryLayout.ramPhysicalBase.hexString8)" : "Not active")
             }
 
             Section("Boot Arguments") {

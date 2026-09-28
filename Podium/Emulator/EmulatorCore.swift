@@ -1,60 +1,58 @@
 import Foundation
 import Observation
 
-/// Coordinates the emulator subsystems for the UI layer.
+/// Coordinates the emulator for the UI: powering the virtual iPod on
+/// (preparing its root filesystem the first time), tracking boot progress
+/// toward the lock screen, forwarding input, and powering it off.
 ///
-/// `EmulatorCore` depends on every subsystem through a protocol (`CPU?`,
-/// `MemoryBus?`, `AudioOutput`, `NetworkInterface`), never a concrete
-/// type, so the frontend is never coupled to a specific implementation.
-///
-/// `cpu`/`memory` start `nil` and are brought up lazily by
-/// `activateCoreIfNeeded()` — there's no reason to hold 256 MB of guest
-/// RAM before the user has actually opened the emulator screen. Once
-/// activated, `status` becomes `.ready`: a real ARMv7 interpreter exists
-/// and is reset and waiting, which is honestly what "ready" means here.
-/// It does not advance to `.booting`/`.running` just because a firmware
-/// was selected — there is still no kernelcache extraction or boot
-/// pipeline to actually load and run guest code, so nothing is executing
-/// and status must not claim otherwise.
+/// The machine itself is an `EmulationSession`, created fresh for every
+/// power-on and run on its own thread; this class only polls it.
 @MainActor
 @Observable
 final class EmulatorCore {
-    private(set) var status: EmulatorStatus = .notImplemented
+    /// Where a power-on is up to, for the boot screen.
+    enum BootStage: Equatable {
+        /// First launch only: building the root filesystem from the IPSW.
+        case preparingFilesystem(RootFilesystemPreparer.Phase, fraction: Double)
+        case loadingKernel
+        /// iOS is starting; `fraction` of the way to the lock screen, and
+        /// roughly how long is left at the current speed.
+        case booting(fraction: Double, secondsRemaining: Double?)
+        /// The lock screen (or anything later) is up.
+        case running
+    }
+
+    private(set) var status: EmulatorStatus = .stopped
+    private(set) var bootStage: BootStage?
     private(set) var log: [EmulatorLogEntry] = []
-    private(set) var cpu: CPU?
-    private(set) var memory: MemoryBus?
     private(set) var framebufferSource: FramebufferSource?
-    private var segmentedBus: SegmentedMemoryBus?
-    /// The A4's modeled hardware (timer, interrupt controller). The CPU
-    /// only holds it weakly, so this is what keeps it alive.
-    private var platform: S5L8930XPlatform?
+    private(set) var session: EmulationSession?
+    /// Guest instructions per second over the last few seconds.
+    private(set) var instructionsPerSecond: Double = 0
+    private(set) var jitAvailable = false
+
+    var cpu: CPU? { session?.cpu }
+    var isPoweredOn: Bool { session != nil }
 
     let audioOutput: AudioOutput
     let networkInterface: NetworkInterface
     let inputController: InputController
 
-    /// See `GuestMemoryLayout` for the real S5L8930X address map these
-    /// come from.
     static let physicalMemorySize = GuestMemoryLayout.ramSize
-    static let physicalMemoryBaseAddress = GuestMemoryLayout.ramPhysicalBase
     static let framebufferWidth = GuestMemoryLayout.framebufferWidth
     static let framebufferHeight = GuestMemoryLayout.framebufferHeight
-    static let framebufferPhysicalAddress = GuestMemoryLayout.framebufferPhysicalAddress
 
-    /// Caps a single boot attempt so unsupported guest code halts the
-    /// attempt instead of running forever with no way to observe where it
-    /// got to. Set far past what's been reached so far — a standalone
-    /// macOS trace of this same kernel (see `.standalone_trace/` at the
-    /// repo root, not part of the app target) has run clean past 2
-    /// billion instructions without hitting an unsupported/undefined
-    /// instruction — so a real device (whose JIT-compiled path should run
-    /// this meaningfully faster than that trace's interpreter) gets real
-    /// room to find out how much further boot actually goes before this
-    /// budget, rather than reporting a misleading "step budget reached"
-    /// long before the interesting part of boot.
-    private static let maxBootUnits = 50_000_000_000
-
+    /// Guest instructions from power-on to the lock screen, measured with
+    /// the app's own session code on the Mac; replaced by what this device
+    /// actually took once it has booted once, so later estimates match.
+    private static let defaultBootInstructions: Double = 5_500_000_000
+    /// Per root filesystem recipe: a new recipe can change how much work
+    /// boot does.
+    private static let measuredBootInstructionsKey = "EmulatorCore.measuredBootInstructions.\(RootFilesystemRecipe.version)"
     private static let logCapacity = 200
+
+    private var pollTask: Task<Void, Never>?
+    private var rateSamples: [(time: Date, retired: UInt64)] = []
 
     init(
         audioOutput: AudioOutput = NullAudioOutput(),
@@ -64,252 +62,178 @@ final class EmulatorCore {
         self.audioOutput = audioOutput
         self.networkInterface = networkInterface
         self.inputController = inputController
-        appendLog("Emulator core not implemented. Firmware parsing and the module architecture are in place; no CPU is active yet.")
     }
 
-    /// Brings up the CPU/memory subsystems if they aren't already. Safe
-    /// to call repeatedly (e.g. every time the emulator screen appears).
-    func activateCoreIfNeeded() {
-        guard cpu == nil else { return }
-
-        let ram = FlatPhysicalMemory(length: Self.physicalMemorySize, baseAddress: Self.physicalMemoryBaseAddress)
-        // A small on-chip SRAM at low physical addresses, entirely
-        // separate from the external DRAM window at
-        // `physicalMemoryBaseAddress` — a standard feature on SoCs of
-        // this era (and this one specifically: a real page-table walk
-        // this session hit a coarse second-level table the kernel's
-        // own pmap had allocated at physical `0x3000`, well below
-        // DRAM, while mapping the `arm-io` peripheral bus — real
-        // hardware plausibly keeps early/critical page tables in this
-        // always-present on-chip SRAM rather than general DRAM). Not
-        // firmware-specific like the peripheral map below, so backed
-        // unconditionally here rather than waiting on a device tree.
-        let lowSRAM = FlatPhysicalMemory(length: 0x0010_0000, baseAddress: 0)
-        // Real SoC peripheral registers live at physical addresses
-        // nowhere near DRAM — see `SegmentedMemoryBus`'s doc comment.
-        // Only RAM/SRAM are known at this point; `attemptBoot` enriches
-        // this same bus with the real peripheral map once a specific
-        // firmware's device tree has actually been read (see
-        // `DeviceTreeMemoryMap`).
-        let bus = SegmentedMemoryBus(regions: [ram, lowSRAM])
-        let armCPU = ARMv7CPU(memory: bus, jit: JITEngine())
-        armCPU.linearMap = (GuestMemoryLayout.kernelVirtualBase, GuestMemoryLayout.ramPhysicalBase, UInt32(GuestMemoryLayout.ramSize))
-        armCPU.reset()
-
-        memory = ram
-        segmentedBus = bus
-        cpu = armCPU
-        framebufferSource = GuestFramebuffer(
-            memory: ram,
-            baseAddress: Self.framebufferPhysicalAddress,
-            pixelWidth: Self.framebufferWidth,
-            pixelHeight: Self.framebufferHeight
-        )
-        status = .ready
-        let baseHex = "0x" + Self.physicalMemoryBaseAddress.hexString8
-        appendLog("ARMv7 interpreter core online (with JIT compilation for eligible instruction sequences). \(Int64(Self.physicalMemorySize).formattedByteCount) physical memory mapped at \(baseHex).")
-        appendLog("No guest firmware is loaded yet.")
+    private var expectedBootInstructions: Double {
+        let measured = UserDefaults.standard.double(forKey: Self.measuredBootInstructionsKey)
+        return measured > 1_000_000_000 ? measured : Self.defaultBootInstructions
     }
 
-    /// Extracts the kernel (and, best-effort, the device tree) from
-    /// `firmware`'s stored IPSW, loads them into guest memory, points
-    /// the CPU at its real entry point, and runs a bounded number of
-    /// instructions. This is Milestone 4's own stated goal — "get the
-    /// guest kernel executing" — not a claim that it boots to
-    /// anything further: real XNU boot code still exercises
-    /// instruction families and kernel subsystems this emulator
-    /// doesn't fully model yet, so halting on `.unsupportedInstruction`
-    /// or a memory fault partway through real execution remains the
-    /// expected, honest outcome, not a bug in the loader.
-    func attemptBoot(firmware: ImportedFirmware, storedAt fileURL: URL) async {
-        activateCoreIfNeeded()
-        guard let armCPU = cpu as? ARMv7CPU else { return }
+    // MARK: Power
 
+    /// Boots `firmware` to its lock screen. Returns once the machine is
+    /// running (or failed to start); boot progress continues in
+    /// `bootStage`.
+    func powerOn(firmware: ImportedFirmware, storedAt fileURL: URL) async {
+        guard session == nil, bootStage == nil else { return }
         Self.resetLogFile()
         status = .booting
-        appendLog("Extracting kernel from \(firmware.metadata.originalFileName)…")
+        bootStage = .loadingKernel
+        appendLog("Powering on \(firmware.displayName) (iOS \(firmware.metadata.productVersion)).")
 
-        let machO: Data
         do {
-            machO = try await Task.detached(priority: .userInitiated) {
-                try KernelcacheExtractor.extractKernelMachO(from: firmware, storedAt: fileURL)
-            }.value
-        } catch let error as FriendlyError {
-            status = .error(error.userMessage)
-            appendLog("Kernel extraction failed: \(error.developerDetail)")
-            return
-        } catch {
-            status = .error("Podium couldn't extract the kernel from this firmware.")
-            appendLog("Kernel extraction failed: \(error.localizedDescription)")
-            return
-        }
-        appendLog("Kernel extracted and decompressed: \(Int64(machO.count).formattedByteCount).")
-
-        var deviceTree: Data?
-        do {
-            let extracted = try await Task.detached(priority: .userInitiated) {
-                try DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: fileURL)
-            }.value
-            deviceTree = extracted
-            appendLog("Device tree extracted: \(Int64(extracted.count).formattedByteCount).")
-        } catch let error as FriendlyError {
-            // Not fatal — some firmware may not declare/have a usable
-            // device tree, and XNU's very early entry code doesn't
-            // touch it. boot_args.deviceTreeP is left honestly zero
-            // rather than this failure blocking the boot attempt.
-            appendLog("Device tree extraction skipped: \(error.developerDetail)")
-        } catch {
-            appendLog("Device tree extraction skipped: \(error.localizedDescription)")
-        }
-
-        // Devices with real behavior go on the bus first, so they take
-        // precedence over the plain-storage backing KernelBootstrap adds for
-        // the same peripheral windows.
-        guard let segmentedBus else { return }
-        let platform = S5L8930XPlatform(cpu: armCPU)
-        for region in platform.regions {
-            segmentedBus.addRegion(region)
-        }
-        self.platform = platform
-        // The screen shows what the display pipe scans out once AppleCLCD
-        // programs a layer, and the boot framebuffer until then.
-        if let bootFramebuffer = framebufferSource as? GuestFramebuffer {
-            framebufferSource = DisplayScanout(memory: segmentedBus, dart: platform.dart2, bootFramebuffer: bootFramebuffer)
-        }
-
-        let prepared: KernelBootstrap.Prepared
-        do {
-            prepared = try KernelBootstrap.prepare(kernel: machO, deviceTree: deviceTree, on: segmentedBus)
-        } catch let error as FriendlyError {
-            status = .error(error.userMessage)
-            appendLog("Kernel load failed: \(error.developerDetail)")
-            return
-        } catch {
-            status = .error("Podium couldn't load this kernel binary.")
-            appendLog("Kernel load failed: \(error.localizedDescription)")
-            return
-        }
-        if let deviceTreeAddress = prepared.deviceTreeAddress {
-            appendLog("Device tree written at 0x\(deviceTreeAddress.hexString8) (\(Int64(prepared.deviceTreeLength).formattedByteCount)).")
-        }
-
-        armCPU.reset()
-        armCPU.loadInitialRegisters(prepared.initialRegisters)
-        appendLog("boot_args written at 0x\(prepared.bootArgsAddress.hexString8) (physBase=0x\(GuestMemoryLayout.ramPhysicalBase.hexString8), virtBase=0x\(GuestMemoryLayout.kernelVirtualBase.hexString8), memSize=\(Int64(prepared.memorySizeGivenToKernel).formattedByteCount)); r0 points there.")
-        appendLog("Kernel loaded. Entry point: 0x\(prepared.entryPoint.hexString8) (physical). Starting execution…")
-
-        // Breakpoints on the kernel's two panic entries (addresses from
-        // `nm` on the decrypted kernelcache): `_panic(fmt, ...)` and the
-        // unexported `panic_context(reason, ctx, fmt, ...)` exception
-        // handlers use, which jumps into `_panic`'s tail and so never
-        // passes its entry. Real runs reach a panic long before any
-        // unsupported instruction trips `lastError`; without these,
-        // Podium would only report a generic "still running".
-        let panicEntries: [UInt32: Int] = [0x8001_7c10: 0, 0x8001_7f28: 2] // entry -> register holding the format string
-        armCPU.breakpoints = Set(panicEntries.keys)
-        let chunkSize = 200_000
-        let stepBudget = Self.maxBootUnits
-        // With `maxBootUnits` in the billions, a single boot attempt can run
-        // a long time; this periodic line lets progress be checked (e.g. by
-        // pulling the persisted log file off the device mid-run).
-        let progressLogInterval = 50_000_000
-        var unitsSinceProgressLog = 0
-        var unitsRun = 0
-        var panicFormatRegister: Int?
-        while unitsRun < stepBudget {
-            let ran = await Task.detached(priority: .userInitiated) {
-                armCPU.run(maxUnits: min(chunkSize, stepBudget - unitsRun))
-            }.value
-            unitsRun += ran
-            unitsSinceProgressLog += ran
-            if unitsSinceProgressLog >= progressLogInterval {
-                unitsSinceProgressLog = 0
-                appendLog("Still running: \(armCPU.retiredInstructionCount) instructions so far, PC now 0x\(armCPU.registers.pc.hexString8).")
+            if !RootFilesystemPreparer.isPrepared(forFirmwareAt: fileURL) {
+                appendLog("Preparing the root filesystem from the IPSW (first launch only)…")
+                bootStage = .preparingFilesystem(.extracting, fraction: 0)
+                let keybagBootstrap = try Self.bundledKeybagBootstrap()
+                let firstBootState = Bundle.main.url(forResource: "first_boot_state", withExtension: "plist").flatMap { try? Data(contentsOf: $0) }
+                let bootReadFiles = Bundle.main.url(forResource: "boot_read_files", withExtension: "txt")
+                    .flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map(RootFilesystemRecipe.fileList) ?? []
+                let started = Date()
+                try await Task.detached(priority: .userInitiated) {
+                    try RootFilesystemPreparer.prepare(firmwareAt: fileURL, keybagBootstrap: keybagBootstrap, firstBootState: firstBootState,
+                                                       bootReadFiles: bootReadFiles) { progress in
+                        Task { @MainActor [weak self] in
+                            guard let self, case .preparingFilesystem = self.bootStage else { return }
+                            self.bootStage = .preparingFilesystem(progress.phase, fraction: progress.fraction)
+                        }
+                    }
+                }.value
+                appendLog(String(format: "Root filesystem ready in %.1f s.", Date().timeIntervalSince(started)))
             }
-            if let hit = armCPU.hitBreakpoint {
-                panicFormatRegister = panicEntries[hit]
-                break
+            bootStage = .loadingKernel
+            let rootFilesystem = RootFilesystemPreparer.imageURL(forFirmwareAt: fileURL)
+            let session = try await Task.detached(priority: .userInitiated) {
+                let kernel = try KernelcacheExtractor.extractKernelMachO(from: firmware, storedAt: fileURL)
+                let deviceTree = try DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: fileURL)
+                return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem)
+            }.value
+            session.onFinish = { [weak self] state in
+                Task { @MainActor in self?.sessionFinished(state) }
             }
-            if ran == 0 || armCPU.lastError != nil {
-                break
-            }
-        }
-
-        let instructions = armCPU.retiredInstructionCount
-        if let register = panicFormatRegister {
-            let format = armCPU.registers[register]
-            let message = Self.readCString(from: segmentedBus, at: GuestMemoryLayout.physical(fromKernelVirtual: format), maxLength: 512)
-            status = .error("Kernel panic after \(instructions) instructions: \(message)")
-            appendLog("Kernel panicked (entry 0x\(armCPU.registers.pc.hexString8)). Format string at 0x\(format.hexString8): \(message)")
-        } else if let error = armCPU.lastError {
-            status = .error("Halted after \(instructions) instructions: \(Self.describe(error)).")
-            appendLog("Execution halted: \(error)")
-        } else {
-            status = .running
-            appendLog("Ran \(instructions) instructions without hitting an unimplemented instruction (step budget reached). PC now 0x\(armCPU.registers.pc.hexString8).")
-        }
-
-        // The `pram` region is where the kernel's panic path writes its
-        // fully-rendered log (varargs substituted, unlike the raw format
-        // string above), so a device run's crash log survives either way.
-        if let pramText = Self.readPrintableText(from: segmentedBus, at: prepared.pramAddress, length: Int(prepared.pramSize)), !pramText.isEmpty {
-            appendLog("pram (panic log) region contents: \(pramText)")
+            self.session = session
+            framebufferSource = session.display
+            rateSamples = [(Date(), 0)]
+            bootStage = .booting(fraction: 0, secondsRemaining: nil)
+            session.start()
+            appendLog("Kernel loaded; iOS is starting.")
+            startPolling()
+        } catch let error as FriendlyError {
+            fail(error.userMessage, detail: error.developerDetail)
+        } catch {
+            fail("Podium couldn't start this firmware.", detail: "\(error)")
         }
     }
 
-    /// Reads a NUL-terminated C string starting at `address`, best-effort
-    /// (stops early on any read failure rather than throwing, since this
-    /// only ever runs after something has already gone wrong).
-    private static func readCString(from memory: MemoryBus, at address: UInt32, maxLength: Int) -> String {
-        var bytes: [UInt8] = []
-        var cursor = address
-        for _ in 0..<maxLength {
-            guard let byte = try? memory.readByte(at: cursor), byte != 0 else { break }
-            bytes.append(byte)
-            cursor &+= 1
-        }
-        return String(decoding: bytes, as: UTF8.self)
-    }
-
-    /// Reads `length` bytes starting at `address` and returns the
-    /// printable-ASCII subset (kernel panic logs are plain text with
-    /// occasional NULs/padding, not arbitrary binary), or nil if the
-    /// region couldn't be read at all.
-    private static func readPrintableText(from memory: MemoryBus, at address: UInt32, length: Int) -> String? {
-        guard let data = try? memory.readBytes(length, at: address) else { return nil }
-        let printable = data.filter { $0 == 0x0A || (0x20...0x7E).contains($0) }
-        return String(decoding: printable, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func describe(_ error: CPUError) -> String {
-        switch error {
-        case .unsupportedInstruction(let word, let address):
-            return "unsupported instruction 0x\(word.hexString8) at 0x\(address.hexString8)"
-        case .undefinedInstruction(let word, let address):
-            return "undefined instruction 0x\(word.hexString8) at 0x\(address.hexString8)"
-        case .memoryFault(let fault, let address):
-            return "memory fault at 0x\(address.hexString8) (\(fault))"
-        case .unimplementedHardwareFeature(let description, let address):
-            return "\(description), at 0x\(address.hexString8)"
-        }
+    /// Cuts the power: the machine stops at once and its memory is freed.
+    func powerOff() {
+        guard let session else { return }
+        session.onFinish = nil
+        session.stop()
+        pollTask?.cancel()
+        pollTask = nil
+        self.session = nil
+        framebufferSource = nil
+        bootStage = nil
+        status = .stopped
+        appendLog("Powered off.")
     }
 
     func sendInput(_ event: InputEvent) {
         inputController.send(event)
-        appendLog("Input: \(describe(event))")
+        session?.send(event)
     }
 
-    private func describe(_ event: InputEvent) -> String {
-        switch event {
-        case .touchBegan(let point): return "touch began at (\(Int(point.x)), \(Int(point.y)))"
-        case .touchMoved(let point): return "touch moved to (\(Int(point.x)), \(Int(point.y)))"
-        case .touchEnded: return "touch ended"
-        case .homeButton(let pressed): return "Home button \(pressed ? "pressed" : "released")"
-        case .powerButton(let pressed): return "Power button \(pressed ? "pressed" : "released")"
-        case .volumeUp(let pressed): return "Volume up \(pressed ? "pressed" : "released")"
-        case .volumeDown(let pressed): return "Volume down \(pressed ? "pressed" : "released")"
+    // MARK: Progress
+
+    private func startPolling() {
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                self?.poll()
+            }
         }
     }
+
+    private func poll() {
+        guard let session else { return }
+        let snapshot = session.snapshot()
+        jitAvailable = snapshot.jitAvailable
+        let now = Date()
+        rateSamples.append((now, snapshot.retiredInstructions))
+        rateSamples.removeAll { now.timeIntervalSince($0.time) > 6 }
+        if let first = rateSamples.first, let last = rateSamples.last, last.time > first.time {
+            instructionsPerSecond = Double(last.retired - first.retired) / last.time.timeIntervalSince(first.time)
+        }
+        guard case .booting = bootStage else { return }
+        if Self.lockScreenIsUp(session.display) {
+            bootStage = .running
+            status = .running
+            UserDefaults.standard.set(Double(snapshot.retiredInstructions), forKey: Self.measuredBootInstructionsKey)
+            appendLog("Lock screen up after \(snapshot.retiredInstructions) instructions.")
+            return
+        }
+        let expected = expectedBootInstructions
+        let done = Double(snapshot.retiredInstructions)
+        let fraction = min(done / expected, 0.99)
+        let remaining = instructionsPerSecond > 0 ? max(expected - done, 0) / instructionsPerSecond : nil
+        bootStage = .booting(fraction: fraction, secondsRemaining: remaining)
+    }
+
+    /// The boot screens (Apple logo, SpringBoard's logo flare) are almost
+    /// all black or a dark glow; the lock screen is a bright, full-screen
+    /// wallpaper.
+    static func lockScreenIsUp(_ display: DisplayScanout) -> Bool {
+        guard !display.activeLayers.isEmpty else { return false }
+        let width = display.pixelWidth, height = display.pixelHeight
+        var pixels = [UInt32](repeating: 0, count: width * height)
+        pixels.withUnsafeMutableBytes { display.copyCurrentFrame(into: $0) }
+        var bright = 0, sampled = 0
+        for index in stride(from: 0, to: pixels.count, by: 37) {
+            let pixel = pixels[index]
+            let sum = (pixel & 0xFF) + (pixel >> 8 & 0xFF) + (pixel >> 16 & 0xFF)
+            sampled += 1
+            if sum > 3 * 48 { bright += 1 }
+        }
+        return Double(bright) / Double(sampled) > 0.4
+    }
+
+    private func sessionFinished(_ state: EmulationSession.State) {
+        pollTask?.cancel()
+        pollTask = nil
+        session = nil
+        bootStage = nil
+        switch state {
+        case .panicked(let message):
+            status = .error("iOS panicked: \(message)")
+            appendLog("Kernel panic: \(message)")
+        case .halted(let reason):
+            status = .error("Emulation stopped: \(reason)")
+            appendLog("Halted: \(reason)")
+        case .shutDown:
+            status = .stopped
+            framebufferSource = nil
+            appendLog("iOS shut down.")
+        case .stopped, .running:
+            status = .stopped
+        }
+    }
+
+    private func fail(_ message: String, detail: String) {
+        status = .error(message)
+        bootStage = nil
+        appendLog("Power-on failed: \(detail)")
+    }
+
+    private static func bundledKeybagBootstrap() throws -> [UInt8] {
+        guard let url = Bundle.main.url(forResource: "keybag_bootstrap", withExtension: "bin") else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "keybag_bootstrap.bin is missing from the app bundle"])
+        }
+        return [UInt8](try Data(contentsOf: url))
+    }
+
+    // MARK: Log
 
     private func appendLog(_ message: String) {
         let entry = EmulatorLogEntry(date: Date(), message: message)
@@ -320,18 +244,15 @@ final class EmulatorCore {
         Self.persistLogLine("\(entry.formattedTime) \(message)")
     }
 
-    /// Every log entry, additionally mirrored to a real file in the app's
-    /// Documents directory — unlike the in-memory `log` above (capped at
-    /// `logCapacity`, lost on relaunch), this survives the app quitting
-    /// or crashing and can be pulled straight off the device (e.g. via
-    /// `xcrun devicectl device copy from`) without needing the UI at all.
+    /// Every log entry, additionally mirrored to a file in the app's
+    /// Documents directory, so a device run's log survives the app quitting
+    /// and can be pulled off the device (`xcrun devicectl device copy
+    /// from`) without the UI.
     private static let logFileURL: URL? = {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
             .appendingPathComponent("podium.log")
     }()
 
-    /// Starts a fresh log file for this boot attempt so it isn't a
-    /// confusing mix of unrelated runs.
     private static func resetLogFile() {
         guard let url = logFileURL else { return }
         try? "".write(to: url, atomically: true, encoding: .utf8)
