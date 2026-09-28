@@ -44,7 +44,13 @@ final class EmulationSession {
     private var messagesRead = 0
 
     private let lock = NSLock()
-    private var pendingInput: [InputEvent] = []
+    private var pendingInput: [(event: InputEvent, sent: Date)] = []
+    /// Buttons down: when the press was sent, and the guest time it
+    /// landed at (emulation thread only).
+    private var buttonsDown: [Button: (sent: Date, landed: UInt64)] = [:]
+    /// Buttons released on the host whose release the guest hasn't seen
+    /// yet, and the guest time it lands at (emulation thread only).
+    private var releasesDue: [Button: UInt64] = [:]
     private var stopRequested = false
     private var state: State = .running
     private var retired: UInt64 = 0
@@ -111,7 +117,7 @@ final class EmulationSession {
 
     func send(_ event: InputEvent) {
         lock.lock()
-        pendingInput.append(event)
+        pendingInput.append((event, Date()))
         lock.unlock()
     }
 
@@ -120,6 +126,67 @@ final class EmulationSession {
         defer { lock.unlock() }
         return Snapshot(state: state, retiredInstructions: retired, virtualTime: virtualTime, jitAvailable: cpu.jit?.isAvailable ?? false)
     }
+
+    // MARK: Buttons
+
+    enum Button { case home, power, volumeUp, volumeDown }
+
+    private static func button(_ event: InputEvent) -> (button: Button, pressed: Bool)? {
+        switch event {
+        case .homeButton(let pressed): (.home, pressed)
+        case .powerButton(let pressed): (.power, pressed)
+        case .volumeUp(let pressed): (.volumeUp, pressed)
+        case .volumeDown(let pressed): (.volumeDown, pressed)
+        case .touchBegan, .touchMoved, .touchEnded: nil
+        }
+    }
+
+    private static func release(_ button: Button) -> InputEvent {
+        switch button {
+        case .home: .homeButton(pressed: false)
+        case .power: .powerButton(pressed: false)
+        case .volumeUp: .volumeUp(pressed: false)
+        case .volumeDown: .volumeDown(pressed: false)
+        }
+    }
+
+    /// Guest time, in `virtualTime` units, per second: the 24 MHz timebase.
+    private static let virtualTimePerSecond = 24_000_000 * Double(S5L8930XPlatform.instructionsPerTimebaseTick)
+    /// The longest hold a release waits for: longer than any press iOS
+    /// tells from a hold (about two seconds, for "slide to power off").
+    private static let longestHold: TimeInterval = 3
+
+    /// Applies input, all at once except button releases. The guest's
+    /// clock runs several times slower than the host's while it's busy,
+    /// and iOS tells a press from a hold by how long it lasts in its own
+    /// time — so a button is released only once the guest has seen it
+    /// held as long as it really was (up to `longestHold`). Otherwise a
+    /// hold long enough to bring up "slide to power off" could land as a
+    /// tap, which sleeps the device. Touches never wait.
+    private func apply(_ input: [(event: InputEvent, sent: Date)]) {
+        for (event, sent) in input {
+            guard let (button, pressed) = Self.button(event) else {
+                platform.handle(event)
+                continue
+            }
+            if pressed {
+                if releasesDue.removeValue(forKey: button) != nil { platform.handle(Self.release(button)) }
+                platform.handle(event)
+                buttonsDown[button] = (sent, cpu.virtualTime)
+            } else if let down = buttonsDown.removeValue(forKey: button) {
+                let held = min(max(sent.timeIntervalSince(down.sent), 0), Self.longestHold)
+                releasesDue[button] = down.landed &+ UInt64(held * Self.virtualTimePerSecond)
+            } else {
+                platform.handle(event)
+            }
+        }
+        for (button, due) in releasesDue where cpu.virtualTime >= due {
+            releasesDue[button] = nil
+            platform.handle(Self.release(button))
+        }
+    }
+
+    // MARK: Running
 
     private func runLoop() {
         var finalState = State.stopped
@@ -130,7 +197,7 @@ final class EmulationSession {
             pendingInput.removeAll()
             lock.unlock()
             if stopping { break }
-            for event in input { platform.handle(event) }
+            apply(input)
 
             let ran = cpu.run(maxUnits: 1_000_000)
             if guestReset {
