@@ -13,7 +13,12 @@ import Foundation
 /// unexercised complexity. This is documented here so it isn't mistaken
 /// for an oversight when exception support is added later.
 struct Registers {
-    private var storage: [UInt32] = Array(repeating: 0, count: 16)
+    /// Inline, not an `Array`: every register write through an array
+    /// checks its buffer is uniquely referenced first, and at one or more
+    /// writes per guest instruction that check alone was measured at ~7%
+    /// of the emulator's time.
+    private var storage: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32,
+                          UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
     static let pcIndex = 15
     static let lrIndex = 14
@@ -22,27 +27,27 @@ struct Registers {
     subscript(index: Int) -> UInt32 {
         get {
             precondition((0..<16).contains(index), "Register index out of range: \(index)")
-            return storage[index]
+            return withUnsafeBytes(of: storage) { $0.load(fromByteOffset: index &* 4, as: UInt32.self) }
         }
         set {
             precondition((0..<16).contains(index), "Register index out of range: \(index)")
-            storage[index] = newValue
+            withUnsafeMutableBytes(of: &storage) { $0.storeBytes(of: newValue, toByteOffset: index &* 4, as: UInt32.self) }
         }
     }
 
     var pc: UInt32 {
-        get { storage[Self.pcIndex] }
-        set { storage[Self.pcIndex] = newValue }
+        get { storage.15 }
+        set { storage.15 = newValue }
     }
 
     var lr: UInt32 {
-        get { storage[Self.lrIndex] }
-        set { storage[Self.lrIndex] = newValue }
+        get { storage.14 }
+        set { storage.14 = newValue }
     }
 
     var sp: UInt32 {
-        get { storage[Self.spIndex] }
-        set { storage[Self.spIndex] = newValue }
+        get { storage.13 }
+        set { storage.13 = newValue }
     }
 
     /// The value an instruction sees when it reads r15 as an operand:
@@ -55,7 +60,7 @@ struct Registers {
     }
 
     mutating func reset() {
-        storage = Array(repeating: 0, count: 16)
+        storage = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     }
 
     /// Exposes the register file as a raw pointer for exactly the
@@ -64,8 +69,6 @@ struct Registers {
     /// (see `JITTranslator`), without copying 16 words in and back out
     /// for every native call.
     mutating func withUnsafeMutableStorage<T>(_ body: (UnsafeMutablePointer<UInt32>) -> T) -> T {
-        storage.withUnsafeMutableBufferPointer { buffer in
-            body(buffer.baseAddress!)
-        }
+        withUnsafeMutableBytes(of: &storage) { body($0.baseAddress!.assumingMemoryBound(to: UInt32.self)) }
     }
 }

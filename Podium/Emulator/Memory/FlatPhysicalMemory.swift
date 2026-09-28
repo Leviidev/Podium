@@ -11,6 +11,7 @@ import Foundation
 /// count against the host app's memory footprint until the guest writes
 /// them).
 final class FlatPhysicalMemory: MemoryBus {
+    var window: (first: UInt32, count: UInt64)? { (baseAddress, UInt64(length)) }
     let baseAddress: UInt32
     let length: Int
     private let pointer: UnsafeMutableRawPointer

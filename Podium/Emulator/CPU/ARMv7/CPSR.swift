@@ -86,6 +86,7 @@ struct CPSR {
     /// Whether an instruction carrying this condition should execute,
     /// per the current flags. `.never` (0b1111) is the reserved encoding
     /// and never executes.
+    @inline(__always)
     func isSatisfied(_ condition: ARMCondition) -> Bool {
         switch condition {
         case .equal: return zero

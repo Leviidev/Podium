@@ -66,8 +66,18 @@ final class JITEngine {
     // in a row and gets its cache entry permanently replaced with a
     // confirmed-ineligible marker, so the interpreter takes over there for
     // the rest of the run with no further JIT overhead at all.
-    private var consecutiveBailCounts: [UInt32: Int] = [:]
     private static let maxConsecutiveBailsBeforeEviction = 4
+
+    /// A direct-mapped cache in front of `cache`, since the CPU asks once
+    /// per unit and hashing every lookup into a dictionary was a real
+    /// share of host time. Slots hold `key &+ 1` (0 is empty) and the
+    /// same double-optional meaning as `cache`.
+    private static let frontSlots = 1 << 16
+    private var frontKeys = [UInt32](repeating: 0, count: frontSlots)
+    private var frontBlocks = [CompiledBlock?](repeating: nil, count: frontSlots)
+
+    @inline(__always)
+    private static func frontSlot(_ key: UInt32) -> Int { Int((key >> 1) & UInt32(frontSlots - 1)) }
 
     init(maxBlockLength: Int = 32) {
         self.maxBlockLength = maxBlockLength
@@ -90,7 +100,18 @@ final class JITEngine {
         guard isAvailable else { return nil }
 
         let key = Self.cacheKey(address: address, thumbState: thumbState)
+        let slot = Self.frontSlot(key)
+        if frontKeys[slot] == key &+ 1 {
+            if let block = frontBlocks[slot] {
+                stats.cacheHitCount += 1
+                return block
+            }
+            stats.interpreterFallbackCount += 1
+            return nil
+        }
         if let cached = cache[key] {
+            frontKeys[slot] = key &+ 1
+            frontBlocks[slot] = cached
             if let block = cached {
                 stats.cacheHitCount += 1
                 return block
@@ -105,6 +126,8 @@ final class JITEngine {
             : compileARM(startingAt: address, memory: memory)
 
         cache[key] = compiled
+        frontKeys[slot] = key &+ 1
+        frontBlocks[slot] = compiled
 
         guard let compiled else {
             stats.interpreterFallbackCount += 1
@@ -120,21 +143,17 @@ final class JITEngine {
     /// at all. See this type's doc comment on `consecutiveBailCounts` for
     /// why a block that never makes progress needs to be evicted rather
     /// than compiled once and trusted forever.
-    func reportMemoryBlockOutcome(at address: UInt32, thumbState: Bool, madeProgress: Bool) {
-        let key = Self.cacheKey(address: address, thumbState: thumbState)
+    func reportMemoryBlockOutcome(_ block: CompiledBlock, at address: UInt32, thumbState: Bool, madeProgress: Bool) {
         if madeProgress {
-            if consecutiveBailCounts[key] != nil {
-                consecutiveBailCounts.removeValue(forKey: key)
-            }
+            block.consecutiveBails = 0
             return
         }
-
-        let count = (consecutiveBailCounts[key] ?? 0) + 1
-        if count >= Self.maxConsecutiveBailsBeforeEviction {
+        block.consecutiveBails += 1
+        if block.consecutiveBails >= Self.maxConsecutiveBailsBeforeEviction {
+            let key = Self.cacheKey(address: address, thumbState: thumbState)
             cache[key] = .some(nil)
-            consecutiveBailCounts.removeValue(forKey: key)
-        } else {
-            consecutiveBailCounts[key] = count
+            let slot = Self.frontSlot(key)
+            if frontKeys[slot] == key &+ 1 { frontBlocks[slot] = nil }
         }
     }
 

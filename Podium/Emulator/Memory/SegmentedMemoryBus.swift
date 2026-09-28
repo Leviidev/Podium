@@ -31,11 +31,65 @@ import Foundation
 /// an address the real device genuinely has, without pretending to
 /// emulate what's actually attached there.
 final class SegmentedMemoryBus: MemoryBus {
-    private var regions: [MemoryBus]
+    private var regions: [MemoryBus] {
+        didSet { rebuildSegments() }
+    }
+
+    /// Every address range some region declares, flattened into
+    /// non-overlapping segments each owned by the highest-priority
+    /// (earliest added) region covering it, sorted for binary search.
+    private var segmentStarts: [UInt64] = []
+    private var segmentEnds: [UInt64] = []
+    private var segmentRegions: [Int] = []
+    private var hasUndeclaredRegions = false
+
+    private func rebuildSegments() {
+        hasUndeclaredRegions = regions.contains { $0.window == nil }
+        var boundaries = Set<UInt64>()
+        for region in regions {
+            guard let window = region.window else { continue }
+            boundaries.insert(UInt64(window.first))
+            boundaries.insert(UInt64(window.first) + window.count)
+        }
+        let sorted = boundaries.sorted()
+        var starts: [UInt64] = [], ends: [UInt64] = [], owners: [Int] = []
+        for (low, high) in zip(sorted, sorted.dropFirst()) {
+            guard let owner = regions.firstIndex(where: { region in
+                guard let window = region.window else { return false }
+                return UInt64(window.first) <= low && high <= UInt64(window.first) + window.count
+            }) else { continue }
+            if let last = owners.last, last == owner, ends.last == low {
+                ends[ends.count - 1] = high
+            } else {
+                starts.append(low); ends.append(high); owners.append(owner)
+            }
+        }
+        segmentStarts = starts
+        segmentEnds = ends
+        segmentRegions = owners
+    }
+
+    /// Stateless on purpose: the display is read from the UI thread while
+    /// the CPU runs, and a shared "last segment used" shortcut raced —
+    /// one thread could swap it between another's bounds check and its
+    /// use, handing a CPU access to the wrong device.
+    @inline(__always)
+    private func region(containing address: UInt32) -> MemoryBus? {
+        let a = UInt64(address)
+        var low = 0, high = segmentStarts.count - 1
+        while low <= high {
+            let mid = (low + high) / 2
+            if a < segmentStarts[mid] { high = mid - 1 }
+            else if a >= segmentEnds[mid] { low = mid + 1 }
+            else { return regions[segmentRegions[mid]] }
+        }
+        return nil
+    }
 
     init(regions: [MemoryBus]) {
         precondition(!regions.isEmpty, "SegmentedMemoryBus needs at least one region")
         self.regions = regions
+        rebuildSegments()
     }
 
     /// Appends a region discovered after construction — e.g. the real
@@ -89,14 +143,18 @@ final class SegmentedMemoryBus: MemoryBus {
         return nil
     }
 
-    /// Tries each region in order, since a region only knows its own
-    /// bounds (there's no separate range table to keep in sync) —
-    /// whichever one doesn't throw `unmappedAddress` for this address
-    /// handles it. Any other error (out-of-bounds, misaligned) is
-    /// real and propagates immediately rather than falling through.
+    /// Hands the access to the region that owns the address (see
+    /// `rebuildSegments` — the order regions were added is the priority,
+    /// so a device modeled on top of generic peripheral backing wins).
+    /// Regions that don't declare a window are asked in turn after that
+    /// and may refuse with `unmappedAddress`.
     private func dispatch<T>(_ address: UInt32, _ operation: (MemoryBus) throws -> T) throws -> T {
+        if let region = region(containing: address) {
+            return try operation(region)
+        }
+        guard hasUndeclaredRegions else { throw MemoryAccessError.unmappedAddress(address) }
         var lastError: Error?
-        for region in regions {
+        for region in regions where region.window == nil {
             do {
                 return try operation(region)
             } catch MemoryAccessError.unmappedAddress {

@@ -22,9 +22,9 @@ extension ARMv7CPU {
 
     /// Reads `registers` consecutive `D` registers from `first` as
     /// `esize`-bit elements, lowest first.
-    private func elements(_ first: Int, registers: Int, esize: Int) -> [UInt64] {
+    private func elements(_ first: Int, registers: Int, esize: Int) -> NEONLanes {
         let perRegister = 64 / esize
-        var out = [UInt64](repeating: 0, count: registers * perRegister)
+        var out = NEONLanes(repeating: 0, count: registers * perRegister)
         let m = Self.mask(esize)
         for r in 0..<registers {
             let value = neon[(first + r) & 31]
@@ -35,7 +35,7 @@ extension ARMv7CPU {
         return out
     }
 
-    private func setElements(_ first: Int, _ values: [UInt64], esize: Int) {
+    private func setElements<Values: RandomAccessCollection>(_ first: Int, _ values: Values, esize: Int) where Values.Element == UInt64, Values.Index == Int {
         let perRegister = 64 / esize
         let m = Self.mask(esize)
         for r in 0..<(values.count / perRegister) {
@@ -231,7 +231,7 @@ extension ARMv7CPU {
         case .duplicateScalar(let index):
             let scalar = elements(instr.m, registers: 1, esize: instr.esize)[index]
             let registers = instr.isQuad ? 2 : 1
-            setElements(instr.d, [UInt64](repeating: scalar, count: registers * 64 / instr.esize), esize: instr.esize)
+            setElements(instr.d, NEONLanes(repeating: scalar, count: registers * 64 / instr.esize), esize: instr.esize)
         }
     }
 
@@ -246,7 +246,7 @@ extension ARMv7CPU {
         let ones = m
         func ext(_ v: UInt64) -> Int64 { unsigned ? Int64(bitPattern: v) : Self.signed(v, esize) }
         func less(_ x: UInt64, _ y: UInt64) -> Bool { unsigned ? x < y : Self.signed(x, esize) < Self.signed(y, esize) }
-        var out = [UInt64](repeating: 0, count: a.count)
+        var out = NEONLanes(repeating: 0, count: a.count)
 
         func pairwise(_ f: (UInt64, UInt64) -> UInt64) {
             let half = a.count / 2
@@ -401,7 +401,7 @@ extension ARMv7CPU {
         let m = Self.mask(wide)
         let unsigned = instr.unsigned
         func ext(_ v: UInt64) -> Int64 { unsigned ? Int64(v) : Self.signed(v, esize) }
-        var out = [UInt64](repeating: 0, count: a.count)
+        var out = NEONLanes(repeating: 0, count: a.count)
         for i in 0..<a.count {
             let x = ext(a[i]), y = ext(b[i])
             switch op {
@@ -438,7 +438,7 @@ extension ARMv7CPU {
         let a = elements(instr.n, registers: 2, esize: wide)
         let b = elements(instr.m, registers: 1, esize: esize)
         let m = Self.mask(wide)
-        var out = [UInt64](repeating: 0, count: a.count)
+        var out = NEONLanes(repeating: 0, count: a.count)
         for i in 0..<a.count {
             let y = UInt64(bitPattern: instr.unsigned ? Int64(b[i]) : Self.signed(b[i], esize))
             out[i] = (op == .add ? a[i] &+ y : a[i] &- y) & m
@@ -451,7 +451,7 @@ extension ARMv7CPU {
         let a = elements(instr.n, registers: 2, esize: wide)
         let b = elements(instr.m, registers: 2, esize: wide)
         let round: UInt64 = op == .roundingAdd || op == .roundingSubtract ? 1 << UInt64(esize - 1) : 0
-        var out = [UInt64](repeating: 0, count: a.count)
+        var out = NEONLanes(repeating: 0, count: a.count)
         for i in 0..<a.count {
             let result = op == .add || op == .roundingAdd ? a[i] &+ b[i] : a[i] &- b[i]
             out[i] = ((result &+ round) & Self.mask(wide)) >> UInt64(esize)
@@ -470,7 +470,7 @@ extension ARMv7CPU {
             let registers = instr.isQuad ? 2 : 1
             let a = elements(instr.n, registers: registers, esize: esize)
             let old = elements(instr.d, registers: registers, esize: esize)
-            var out = [UInt64](repeating: 0, count: a.count)
+            var out = NEONLanes(repeating: 0, count: a.count)
             let s = Self.neonFloat(scalar)
             for i in 0..<a.count {
                 switch op {
@@ -495,7 +495,7 @@ extension ARMv7CPU {
             func ext(_ v: UInt64) -> Int64 { unsigned ? Int64(v) : Self.signed(v, esize) }
             let y = ext(scalar)
             let wm = Self.mask(wide)
-            var out = [UInt64](repeating: 0, count: a.count)
+            var out = NEONLanes(repeating: 0, count: a.count)
             for i in 0..<a.count {
                 let product = ext(a[i]) &* y
                 switch op {
@@ -524,7 +524,7 @@ extension ARMv7CPU {
             let rounding = op == .roundingShiftRightNarrow || op == .saturatingRoundingShiftRightNarrow || op == .saturatingRoundingShiftRightUnsignedNarrow
             // The unsigned-result forms take signed input; VQSHRN.U takes unsigned.
             let signedInput = op == .saturatingShiftRightUnsignedNarrow || op == .saturatingRoundingShiftRightUnsignedNarrow || !unsigned
-            var out = [UInt64](repeating: 0, count: source.count)
+            var out = NEONLanes(repeating: 0, count: source.count)
             for i in 0..<source.count {
                 let value: Int64
                 if signedInput {
@@ -562,7 +562,7 @@ extension ARMv7CPU {
         let source = elements(instr.m, registers: registers, esize: esize)
         let old = elements(instr.d, registers: registers, esize: esize)
         let m = Self.mask(esize)
-        var out = [UInt64](repeating: 0, count: source.count)
+        var out = NEONLanes(repeating: 0, count: source.count)
         for i in 0..<source.count {
             let x = source[i]
             switch op {
@@ -625,18 +625,19 @@ extension ARMv7CPU {
             let x = elements(instr.d, registers: registers, esize: esize)
             let y = elements(instr.m, registers: registers, esize: esize)
             let count = x.count
-            var newX = [UInt64](repeating: 0, count: count), newY = newX
+            var newX = NEONLanes(repeating: 0, count: count), newY = newX
+            // The two registers' elements as one sequence, x's first.
+            func joined(_ index: Int) -> UInt64 { index < count ? x[index] : y[index - count] }
             if op == .unzip {
-                let joined = x + y
                 for e in 0..<count {
-                    newX[e] = joined[2 * e]
-                    newY[e] = joined[2 * e + 1]
+                    newX[e] = joined(2 * e)
+                    newY[e] = joined(2 * e + 1)
                 }
             } else {
-                var interleaved: [UInt64] = []
-                for e in 0..<count { interleaved.append(x[e]); interleaved.append(y[e]) }
-                newX = Array(interleaved[0..<count])
-                newY = Array(interleaved[count..<2 * count])
+                for e in 0..<count {
+                    let pair = e * 2
+                    if pair < count { newX[pair] = x[e]; newX[pair + 1] = y[e] } else { newY[pair - count] = x[e]; newY[pair - count + 1] = y[e] }
+                }
             }
             setElements(instr.d, newX, esize: esize)
             setElements(instr.m, newY, esize: esize)
@@ -678,7 +679,7 @@ extension ARMv7CPU {
         }
 
         let source = elements(instr.m, registers: registers, esize: esize)
-        var out = [UInt64](repeating: 0, count: source.count)
+        var out = NEONLanes(repeating: 0, count: source.count)
         for i in 0..<source.count {
             let x = source[i]
             let s = Self.signed(x, esize)
@@ -752,7 +753,7 @@ extension ARMv7CPU {
         let table = elements(instr.n, registers: length, esize: 8)
         let indices = elements(instr.m, registers: 1, esize: 8)
         let old = elements(instr.d, registers: 1, esize: 8)
-        var out = [UInt64](repeating: 0, count: 8)
+        var out = NEONLanes(repeating: 0, count: 8)
         for i in 0..<8 {
             let index = Int(indices[i])
             out[i] = index < table.count ? table[index] : (extends ? old[i] : 0)
@@ -771,13 +772,13 @@ extension ARMv7CPU {
         func loadElement(_ at: UInt32) throws -> UInt64 {
             var value: UInt64 = 0
             for byte in 0..<ebytes {
-                value |= UInt64(try memory.readByte(at: try translatedAddress(at &+ UInt32(byte), access: .read))) << UInt64(byte * 8)
+                value |= UInt64(try readPhysical8(try translatedAddress(at &+ UInt32(byte), access: .read))) << UInt64(byte * 8)
             }
             return value
         }
         func storeElement(_ value: UInt64, at: UInt32) throws {
             for byte in 0..<ebytes {
-                try memory.writeByte(UInt8(truncatingIfNeeded: value >> UInt64(byte * 8)), at: try translatedAddress(at &+ UInt32(byte), access: .write))
+                try writePhysical8(UInt8(truncatingIfNeeded: value >> UInt64(byte * 8)), try translatedAddress(at &+ UInt32(byte), access: .write))
             }
         }
         func setLane(_ register: Int, _ lane: Int, _ value: UInt64) {

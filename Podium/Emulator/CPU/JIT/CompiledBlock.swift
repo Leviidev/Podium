@@ -46,6 +46,9 @@ final class CompiledBlock {
     /// regardless of whether the block could ever use it — see
     /// `ARMv7CPU.runOneUnit()`'s doc comment on this property).
     let containsMemoryAccess: Bool
+    /// Consecutive runs that bailed on the very first instruction — see
+    /// `JITEngine.reportMemoryBlockOutcome`.
+    var consecutiveBails = 0
 
     init(memory: UnsafeMutableRawPointer, byteCount: Int, instructionCount: Int, cumulativeByteLengths: [Int], containsMemoryAccess: Bool) {
         precondition(cumulativeByteLengths.count == instructionCount + 1 && cumulativeByteLengths.first == 0,

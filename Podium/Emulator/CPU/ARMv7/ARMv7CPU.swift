@@ -78,7 +78,22 @@ final class ARMv7CPU: CPU {
     /// as it's called, which sampling the PC only every N units can't
     /// reliably catch (a tight loop after the address of interest is very
     /// unlikely to land back exactly on it at a sampled boundary).
-    var breakpoints: Set<UInt32> = []
+    var breakpoints: Set<UInt32> = [] {
+        didSet {
+            breakpointFilter = [UInt64](repeating: 0, count: Self.breakpointFilterWords)
+            for address in breakpoints {
+                let bit = Self.breakpointFilterBit(address)
+                breakpointFilter[bit >> 6] |= 1 << UInt64(bit & 63)
+            }
+        }
+    }
+    /// A bitmap over (pc >> 1) that every breakpoint sets a bit in, checked
+    /// before the set itself: `run(maxUnits:)` asks once per unit, and
+    /// hashing the pc into the set each time was a fifth of host time.
+    private var breakpointFilter = [UInt64](repeating: 0, count: breakpointFilterWords)
+    private static let breakpointFilterWords = 64
+    @inline(__always)
+    private static func breakpointFilterBit(_ address: UInt32) -> Int { Int((address >> 1) & UInt32(breakpointFilterWords * 64 - 1)) }
     private(set) var hitBreakpoint: UInt32?
     /// Real guest instructions retired so far. Differs from `run(maxUnits:)`'s
     /// unit count once the JIT is involved, since one compiled block is one
@@ -345,9 +360,15 @@ final class ARMv7CPU: CPU {
         currentInstructionAddress = instructionAddress
         currentInstructionITState = 0
         let word: UInt32
+        let physicalAddress: UInt32
         do {
-            let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
-            word = try readPhysical32(physicalAddress)
+            let location = try fetchLocation(instructionAddress)
+            physicalAddress = location.physical
+            if let host = location.host {
+                word = UInt32(littleEndian: host.loadUnaligned(as: UInt32.self))
+            } else {
+                word = try readPhysical32(physicalAddress)
+            }
         } catch let memoryError as MemoryAccessError {
             if !raisePrefetchAbort(memoryError) { lastError = .memoryFault(memoryError, address: instructionAddress) }
             return
@@ -362,7 +383,7 @@ final class ARMv7CPU: CPU {
         registers.pc = instructionAddress &+ 4
         currentInstructionITState = 0
 
-        execute(ARMDecoder.decode(word), rawWord: word, instructionAddress: instructionAddress)
+        execute(instructionCache.armInstruction(at: physicalAddress, word: word), rawWord: word, instructionAddress: instructionAddress)
     }
 
     func run() {
@@ -387,7 +408,8 @@ final class ARMv7CPU: CPU {
         var unitsRun = 0
         while isRunning && lastError == nil && unitsRun < maxUnits {
             serviceDevicesAndInterrupts()
-            if !breakpoints.isEmpty, breakpoints.contains(registers.pc) {
+            let bit = Self.breakpointFilterBit(registers.pc)
+            if breakpointFilter[bit >> 6] & (1 << UInt64(bit & 63)) != 0, breakpoints.contains(registers.pc) {
                 hitBreakpoint = registers.pc
                 break
             }
@@ -490,7 +512,7 @@ final class ARMv7CPU: CPU {
                 // the fast-path region (`completed == 0` every time) costs
                 // more than it saves, so this reports the outcome back for
                 // eviction bookkeeping.
-                jit.reportMemoryBlockOutcome(at: codeAddress, thumbState: cpsr.thumbState, madeProgress: completed > 0)
+                jit.reportMemoryBlockOutcome(block, at: codeAddress, thumbState: cpsr.thumbState, madeProgress: completed > 0)
             } else {
                 completed = registers.withUnsafeMutableStorage { regPtr in
                     withUnsafeMutablePointer(to: &cpsr.rawValue) { cpsrPtr in
@@ -701,6 +723,18 @@ final class ARMv7CPU: CPU {
         }
     }
 
+    /// The encodings the architecture reserves as permanently UNDEFINED
+    /// (UDF): Thumb `1101 1110 imm8` and `11110 1111111 imm4 1010 imm12`,
+    /// ARM `cond 0111 1111 imm12 1111 imm4`. Thumb 32-bit words arrive as
+    /// `(hw0 << 16) | hw1`.
+    static func isPermanentlyUndefined(_ word: UInt32, thumb: Bool) -> Bool {
+        if thumb {
+            if word <= 0xFFFF { return word & 0xFF00 == 0xDE00 }
+            return word & 0xFFF0_F000 == 0xF7F0_A000
+        }
+        return word & 0x0FF0_00F0 == 0x07F0_00F0
+    }
+
     /// Reports each user-mode instruction this CPU couldn't execute before
     /// it becomes an Undefined Instruction exception (see
     /// `trapInUserMode`), so a decoder gap in user code stays visible
@@ -716,6 +750,13 @@ final class ARMv7CPU: CPU {
     /// turned one crashing process into a dead boot. Privileged code still
     /// halts: the kernel hitting one means a gap in this CPU, not the guest.
     func trapInUserMode(rawWord: UInt32, address: UInt32) -> Bool {
+        // UDF is undefined on purpose, in every mode: XNU traps into its
+        // debugger context with Thumb's `trap` (0xDEFE) to take a
+        // stackshot, and its handler expects the exception.
+        if Self.isPermanentlyUndefined(rawWord, thumb: cpsr.thumbState) {
+            raiseUndefinedInstruction()
+            return true
+        }
         guard cpsr.rawValue & Self.modeBitsMask == Self.userModeBits else { return false }
         userUndefinedInstructionHandler?(address, rawWord)
         raiseUndefinedInstruction()
@@ -860,6 +901,30 @@ final class ARMv7CPU: CPU {
 
     func flushTLB() {
         tlbTags.initialize(repeating: 0, count: 6 * Self.tlbEntries)
+        instructionCache.forgetPage()
+    }
+
+    /// See `InstructionCache`.
+    let instructionCache = InstructionCache()
+
+    /// What a fetch page's translation depended on besides its address.
+    private var fetchContext: UInt32 {
+        guard mmuEnabled else { return 0 }
+        return 1 | (cpsr.rawValue & Self.modeBitsMask == Self.userModeBits ? 2 : 0) | (cp15.contextID & 0xFF) << 8
+    }
+
+    /// Where the instruction at virtual `address` is: its physical
+    /// address, and its bytes in host RAM when it's in RAM — through the
+    /// fetch page, translating only on a page change.
+    @inline(__always)
+    func fetchLocation(_ address: UInt32) throws -> (physical: UInt32, host: UnsafeMutableRawPointer?) {
+        let context = fetchContext
+        if address & ~0xFFF != instructionCache.pageVirtual || context != instructionCache.pageContext {
+            let physical = try translatedAddress(address, access: .execute) & ~0xFFF
+            instructionCache.setPage(virtual: address & ~0xFFF, context: context, physical: physical, host: ramPointer(physical, width: 0x1000))
+        }
+        let offset = address & 0xFFF
+        return (instructionCache.pagePhysical | offset, instructionCache.pageHost.map { $0 + Int(offset) })
     }
 
     /// CP15 writes that change translation and need a full flush: SCTLR
@@ -988,7 +1053,18 @@ final class ARMv7CPU: CPU {
     /// `LR_svc` = the next instruction (the call has completed — so SPSR
     /// gets the IT state already advanced past it), IRQs masked, ARM state,
     /// vector +0x08.
+    /// Consulted before a supervisor call from user mode is taken: returning
+    /// a value completes the call there and then with that result (r0, and
+    /// success in the carry flag, as XNU returns), without entering the
+    /// kernel. See `GuestAccommodations`.
+    var userSupervisorCallFilter: ((ARMv7CPU) -> UInt32?)?
+
     func takeSupervisorCall() {
+        if cpsr.rawValue & Self.modeBitsMask == Self.userModeBits, let result = userSupervisorCallFilter?(self) {
+            registers[0] = result
+            cpsr.rawValue &= ~(1 << 29) // carry clear: success
+            return
+        }
         let savedCPSR = Self.cpsr(cpsr.rawValue, withITState: cpsr.thumbState ? itState : 0)
         switchProcessorMode(from: savedCPSR & Self.modeBitsMask, to: Self.svcModeBits)
         setSavedProgramStatus(savedCPSR, forModeBits: Self.svcModeBits)
@@ -1083,8 +1159,8 @@ final class ARMv7CPU: CPU {
         let base = stackPointer(forMode: instr.mode)
         let address = Self.returnStateAddress(base: base, increment: instr.increment, before: instr.before)
         do {
-            try memory.writeWord32(registers.lr, at: try translatedAddress(address, access: .write))
-            try memory.writeWord32(spsr, at: try translatedAddress(address &+ 4, access: .write))
+            try writePhysical32(registers.lr, try translatedAddress(address, access: .write))
+            try writePhysical32(spsr, try translatedAddress(address &+ 4, access: .write))
         } catch {
             let memoryError = error as? MemoryAccessError ?? .unmappedAddress(address)
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -1102,8 +1178,8 @@ final class ARMv7CPU: CPU {
         let address = Self.returnStateAddress(base: base, increment: instr.increment, before: instr.before)
         let newPC: UInt32, newCPSR: UInt32
         do {
-            newPC = try memory.readWord32(at: try translatedAddress(address, access: .read))
-            newCPSR = try memory.readWord32(at: try translatedAddress(address &+ 4, access: .read))
+            newPC = try readPhysical32(try translatedAddress(address, access: .read))
+            newCPSR = try readPhysical32(try translatedAddress(address &+ 4, access: .read))
         } catch {
             let memoryError = error as? MemoryAccessError ?? .unmappedAddress(address)
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -1458,33 +1534,23 @@ final class ARMv7CPU: CPU {
     /// the logical concatenation of `Vn` (low) then `Vm` (high) — see
     /// `VEXTInstruction`'s doc comment.
     private func executeVectorExtract(_ instr: VEXTInstruction) {
-        func bytes(of value: UInt64) -> [UInt8] {
-            (0..<8).map { UInt8(truncatingIfNeeded: value >> (8 * $0)) }
-        }
-        func value(from slice: ArraySlice<UInt8>) -> UInt64 {
-            var result: UInt64 = 0
-            for (index, byte) in slice.enumerated() {
-                result |= UInt64(byte) << (8 * index)
-            }
-            return result
-        }
-
         let dCount = instr.isQuad ? 2 : 1
         let dn = instr.isQuad ? instr.vn * 2 : instr.vn
         let dm = instr.isQuad ? instr.vm * 2 : instr.vm
         let dd = instr.isQuad ? instr.vd * 2 : instr.vd
-
-        var nBytes: [UInt8] = []
-        var mBytes: [UInt8] = []
-        for lane in 0..<dCount {
-            nBytes += bytes(of: neon[dn + lane])
-            mBytes += bytes(of: neon[dm + lane])
+        let total = dCount * 8
+        // Byte `index` of Vn's bytes followed by Vm's.
+        func byte(_ index: Int) -> UInt64 {
+            let source = index < total ? neon[dn + index / 8] : neon[dm + (index - total) / 8]
+            return (source >> UInt64((index % 8) * 8)) & 0xFF
         }
-        let concatenated = nBytes + mBytes
-        let resultBytes = Array(concatenated[instr.byteOffset..<(instr.byteOffset + dCount * 8)])
-        for lane in 0..<dCount {
-            neon[dd + lane] = value(from: resultBytes[(lane * 8)..<(lane * 8 + 8)])
+        var result: (UInt64, UInt64) = (0, 0)
+        for position in 0..<8 {
+            result.0 |= byte(instr.byteOffset + position) << UInt64(position * 8)
+            if dCount == 2 { result.1 |= byte(instr.byteOffset + 8 + position) << UInt64(position * 8) }
         }
+        neon[dd] = result.0
+        if dCount == 2 { neon[dd + 1] = result.1 }
     }
 
     /// `VSHL`/`VSHR` (immediate) — see
@@ -1627,9 +1693,9 @@ final class ARMv7CPU: CPU {
         do {
             let physicalAddress = try translatedAddress(address, access: .read)
             switch instr.size {
-            case 1: registers[instr.rt] = UInt32(try memory.readByte(at: physicalAddress))
-            case 2: registers[instr.rt] = UInt32(try memory.readWord16(at: physicalAddress))
-            default: registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+            case 1: registers[instr.rt] = UInt32(try readPhysical8(physicalAddress))
+            case 2: registers[instr.rt] = UInt32(try readPhysical16(physicalAddress))
+            default: registers[instr.rt] = try readPhysical32(physicalAddress)
             }
             exclusiveMonitorAddress = address
         } catch let memoryError as MemoryAccessError {
@@ -1648,8 +1714,8 @@ final class ARMv7CPU: CPU {
         do {
             let lowPhysicalAddress = try translatedAddress(address, access: .read)
             let highPhysicalAddress = try translatedAddress(address &+ 4, access: .read)
-            registers[instr.rt] = try memory.readWord32(at: lowPhysicalAddress)
-            registers[instr.rt2] = try memory.readWord32(at: highPhysicalAddress)
+            registers[instr.rt] = try readPhysical32(lowPhysicalAddress)
+            registers[instr.rt2] = try readPhysical32(highPhysicalAddress)
             exclusiveMonitorAddress = address
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -1670,9 +1736,9 @@ final class ARMv7CPU: CPU {
             let physicalAddress = try translatedAddress(address, access: .write)
             let value = registers[instr.rt]
             switch instr.size {
-            case 1: try memory.writeByte(UInt8(truncatingIfNeeded: value), at: physicalAddress)
-            case 2: try memory.writeWord16(UInt16(truncatingIfNeeded: value), at: physicalAddress)
-            default: try memory.writeWord32(value, at: physicalAddress)
+            case 1: try writePhysical8(UInt8(truncatingIfNeeded: value), physicalAddress)
+            case 2: try writePhysical16(UInt16(truncatingIfNeeded: value), physicalAddress)
+            default: try writePhysical32(value, physicalAddress)
             }
             registers[instr.rd] = 0
         } catch let memoryError as MemoryAccessError {
@@ -1692,8 +1758,8 @@ final class ARMv7CPU: CPU {
         do {
             let lowPhysicalAddress = try translatedAddress(address, access: .write)
             let highPhysicalAddress = try translatedAddress(address &+ 4, access: .write)
-            try memory.writeWord32(registers[instr.rt], at: lowPhysicalAddress)
-            try memory.writeWord32(registers[instr.rt2], at: highPhysicalAddress)
+            try writePhysical32(registers[instr.rt], lowPhysicalAddress)
+            try writePhysical32(registers[instr.rt2], highPhysicalAddress)
             registers[instr.rd] = 0
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
@@ -1880,7 +1946,7 @@ final class ARMv7CPU: CPU {
                 guard (instr.registerList >> index) & 1 == 1 else { continue }
                 let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
                 if instr.isLoad {
-                    let value = try memory.readWord32(at: physicalAddress)
+                    let value = try readPhysical32(physicalAddress)
                     if index == Registers.pcIndex {
                         loadedPC = value
                     } else if usesUserBank {
@@ -1889,7 +1955,7 @@ final class ARMv7CPU: CPU {
                         registers[index] = value
                     }
                 } else {
-                    try memory.writeWord32(usesUserBank ? userBankRegister(index) : operandValue(for: index), at: physicalAddress)
+                    try writePhysical32(usesUserBank ? userBankRegister(index) : operandValue(for: index), physicalAddress)
                 }
                 address = address &+ 4
             }
@@ -2032,11 +2098,11 @@ final class ARMv7CPU: CPU {
             let secondAddress = transferAddress &+ 4
             let secondPhysicalAddress = try translatedAddress(secondAddress, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
-                registers[instr.rt] = try memory.readWord32(at: physicalAddress)
-                registers[rt2] = try memory.readWord32(at: secondPhysicalAddress)
+                registers[instr.rt] = try readPhysical32(physicalAddress)
+                registers[rt2] = try readPhysical32(secondPhysicalAddress)
             } else {
-                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
-                try memory.writeWord32(registers[rt2], at: secondPhysicalAddress)
+                try writePhysical32(registers[instr.rt], physicalAddress)
+                try writePhysical32(registers[rt2], secondPhysicalAddress)
             }
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }
@@ -2081,17 +2147,17 @@ final class ARMv7CPU: CPU {
                 if instr.isDouble {
                     let high = try translatedAddress(address &+ 4, access: access)
                     if instr.isLoad {
-                        neon[index] = UInt64(try memory.readWord32(at: low)) | UInt64(try memory.readWord32(at: high)) << 32
+                        neon[index] = UInt64(try readPhysical32(low)) | UInt64(try readPhysical32(high)) << 32
                     } else {
-                        try memory.writeWord32(UInt32(truncatingIfNeeded: neon[index]), at: low)
-                        try memory.writeWord32(UInt32(truncatingIfNeeded: neon[index] >> 32), at: high)
+                        try writePhysical32(UInt32(truncatingIfNeeded: neon[index]), low)
+                        try writePhysical32(UInt32(truncatingIfNeeded: neon[index] >> 32), high)
                     }
                     address = address &+ 8
                 } else {
                     if instr.isLoad {
-                        neon.setSingle(index, try memory.readWord32(at: low))
+                        neon.setSingle(index, try readPhysical32(low))
                     } else {
-                        try memory.writeWord32(neon.single(index), at: low)
+                        try writePhysical32(neon.single(index), low)
                     }
                     address = address &+ 4
                 }

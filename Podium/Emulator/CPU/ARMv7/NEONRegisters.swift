@@ -10,16 +10,22 @@ import Foundation
 /// guarantee zero either), so this starting at zero is Podium's own
 /// choice, not a traced fact.
 struct NEONRegisters {
-    private var storage: [UInt64] = Array(repeating: 0, count: 32)
+    /// Inline rather than an `Array`, for the same reason as `Registers`:
+    /// no uniqueness check on every write.
+    private var storage: (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64,
+                          UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64,
+                          UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64,
+                          UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64)
+        = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
     subscript(index: Int) -> UInt64 {
         get {
             precondition((0..<32).contains(index), "D register index out of range: \(index)")
-            return storage[index]
+            return withUnsafeBytes(of: storage) { $0.load(fromByteOffset: index &* 8, as: UInt64.self) }
         }
         set {
             precondition((0..<32).contains(index), "D register index out of range: \(index)")
-            storage[index] = newValue
+            withUnsafeMutableBytes(of: &storage) { $0.storeBytes(of: newValue, toByteOffset: index &* 8, as: UInt64.self) }
         }
     }
 
@@ -27,12 +33,12 @@ struct NEONRegisters {
     /// `S(2n)` is the low half of `D(n)`, `S(2n+1)` the high half.
     func single(_ index: Int) -> UInt32 {
         precondition((0..<32).contains(index), "S register index out of range: \(index)")
-        return UInt32(truncatingIfNeeded: storage[index / 2] >> (index % 2 == 0 ? 0 : 32))
+        return UInt32(truncatingIfNeeded: self[index / 2] >> (index % 2 == 0 ? 0 : 32))
     }
 
     mutating func setSingle(_ index: Int, _ value: UInt32) {
         precondition((0..<32).contains(index), "S register index out of range: \(index)")
         let shift: UInt64 = index % 2 == 0 ? 0 : 32
-        storage[index / 2] = (storage[index / 2] & ~(0xFFFF_FFFF << shift)) | (UInt64(value) << shift)
+        self[index / 2] = (self[index / 2] & ~(0xFFFF_FFFF << shift)) | (UInt64(value) << shift)
     }
 }

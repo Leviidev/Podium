@@ -19,6 +19,7 @@ protocol MMIODevice: AnyObject {
 /// kernel code accesses these registers as whole words, so this only
 /// needs to be correct, not side-effect-exact, for narrower access.
 final class MMIORegion: MemoryBus {
+    var window: (first: UInt32, count: UInt64)? { (baseAddress, UInt64(length)) }
     let baseAddress: UInt32
     let length: Int
     private let device: MMIODevice

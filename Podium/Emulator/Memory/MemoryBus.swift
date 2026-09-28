@@ -41,9 +41,17 @@ protocol MemoryBus: AnyObject {
     /// covered by this bus at all, so a caller doesn't need a separate
     /// bounds check before asking.
     func fastPathRegion(for address: UInt32) -> (pointer: UnsafeMutableRawPointer, regionBaseAddress: UInt32, regionLength: Int)?
+
+    /// The physical addresses this bus answers for, when it's one window
+    /// (`first`, `count` bytes) — what lets `SegmentedMemoryBus` pick the
+    /// right region directly instead of trying each in turn. `nil` means
+    /// unknown: the bus is asked and may refuse with `unmappedAddress`.
+    var window: (first: UInt32, count: UInt64)? { get }
 }
 
 extension MemoryBus {
+    var window: (first: UInt32, count: UInt64)? { nil }
+
     func writeBytes(_ bytes: Data, at address: UInt32) throws {
         for (offset, byte) in bytes.enumerated() {
             try writeByte(byte, at: address &+ UInt32(offset))

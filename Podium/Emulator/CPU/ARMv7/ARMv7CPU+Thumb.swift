@@ -48,9 +48,17 @@ extension ARMv7CPU {
         currentInstructionAddress = instructionAddress
         currentInstructionITState = itState
         let hw0: UInt16
+        let physicalAddress: UInt32
+        let host: UnsafeMutableRawPointer?
         do {
-            let physicalAddress = try translatedAddress(instructionAddress, access: .execute)
-            hw0 = try readPhysical16(physicalAddress)
+            let location = try fetchLocation(instructionAddress)
+            physicalAddress = location.physical
+            host = location.host
+            if let host {
+                hw0 = UInt16(littleEndian: host.loadUnaligned(as: UInt16.self))
+            } else {
+                hw0 = try readPhysical16(physicalAddress)
+            }
         } catch let memoryError as MemoryAccessError {
             if !raisePrefetchAbort(memoryError) { lastError = .memoryFault(memoryError, address: instructionAddress) }
             return
@@ -61,7 +69,9 @@ extension ARMv7CPU {
 
         let isWide = ThumbDecoder.isThirtyTwoBitFirstHalfword(hw0)
         var hw1: UInt16 = 0
-        if isWide {
+        if isWide, let host, instructionAddress & 0xFFF <= 0xFFC {
+            hw1 = UInt16(littleEndian: (host + 2).loadUnaligned(as: UInt16.self))
+        } else if isWide {
             do {
                 let physicalAddress2 = try translatedAddress(instructionAddress &+ 2, access: .execute)
                 hw1 = try readPhysical16(physicalAddress2)
@@ -76,7 +86,7 @@ extension ARMv7CPU {
 
         registers.pc = instructionAddress &+ (isWide ? 4 : 2)
 
-        let instruction = ThumbDecoder.decode(hw0, hw1)
+        let instruction = instructionCache.thumbInstruction(at: physicalAddress, hw0: hw0, hw1: hw1)
 
         switch instruction {
         case .conditionalBranch(let instr):
@@ -518,7 +528,7 @@ extension ARMv7CPU {
         let address = ((instructionAddress &+ 4) & ~UInt32(0b11)) &+ instr.offset
         do {
             let physicalAddress = try translatedAddress(address, access: .read)
-            registers[instr.rt] = try memory.readWord32(at: physicalAddress)
+            registers[instr.rt] = try readPhysical32(physicalAddress)
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: address) { lastError = .memoryFault(memoryError, address: address) }
         } catch {
@@ -590,7 +600,7 @@ extension ARMv7CPU {
                 guard (instr.registerList >> index) & 1 == 1 else { continue }
                 let physicalAddress = try translatedAddress(address, access: instr.isLoad ? .read : .write)
                 if instr.isLoad {
-                    let value = try memory.readWord32(at: physicalAddress)
+                    let value = try readPhysical32(physicalAddress)
                     if index == Registers.pcIndex {
                         cpsr.thumbState = value.bit(0)
                         registers.pc = value & ~UInt32(0b1)
@@ -598,7 +608,7 @@ extension ARMv7CPU {
                         registers[index] = value
                     }
                 } else {
-                    try memory.writeWord32(registers[index], at: physicalAddress)
+                    try writePhysical32(registers[index], physicalAddress)
                 }
                 address = address &+ 4
             }
@@ -665,11 +675,11 @@ extension ARMv7CPU {
             let secondAddress = transferAddress &+ 4
             let secondPhysicalAddress = try translatedAddress(secondAddress, access: instr.isLoad ? .read : .write)
             if instr.isLoad {
-                registers[instr.rt] = try memory.readWord32(at: physicalAddress)
-                registers[instr.rt2] = try memory.readWord32(at: secondPhysicalAddress)
+                registers[instr.rt] = try readPhysical32(physicalAddress)
+                registers[instr.rt2] = try readPhysical32(secondPhysicalAddress)
             } else {
-                try memory.writeWord32(registers[instr.rt], at: physicalAddress)
-                try memory.writeWord32(registers[instr.rt2], at: secondPhysicalAddress)
+                try writePhysical32(registers[instr.rt], physicalAddress)
+                try writePhysical32(registers[instr.rt2], secondPhysicalAddress)
             }
         } catch let memoryError as MemoryAccessError {
             if !raiseDataAbort(memoryError, faultAddress: transferAddress) { lastError = .memoryFault(memoryError, address: transferAddress) }
