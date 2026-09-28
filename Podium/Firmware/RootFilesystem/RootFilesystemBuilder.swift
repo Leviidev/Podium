@@ -285,7 +285,7 @@ final class RootFilesystemBuilder {
 /// applies on a Mac.
 enum RootFilesystemRecipe {
     /// Bumped whenever the edits change, so prepared images are rebuilt.
-    static let version = 9
+    static let version = 10
     /// Room left for the guest to write into (logs, caches, preferences).
     static let freeSpace: UInt64 = 64 << 20
 
@@ -376,14 +376,18 @@ enum RootFilesystemRecipe {
         for path in bootReadFiles { try builder.storeUncompressed(path) }
     }
 
-    /// First boot's one-time work, done ahead of time: the files a first
-    /// boot of this very image leaves in /private/var — the system
-    /// keybag, the keychain holding lockdownd's activation identity (a
-    /// 1024-bit RSA key pair whose generation was most of a first boot's
-    /// instructions), lockdownd's own records. They were captured once by
-    /// booting in the emulator (see GuestTools/first_boot_capture); the
-    /// keybag and keychain are sealed with the emulated A4's stand-in UID
-    /// key, which is the same on every run, so they open here too.
+    /// First boot's one-time work, done ahead of time: what a first boot
+    /// of this very image leaves in /private/var — the system keybag, the
+    /// keychain holding lockdownd's activation identity (a 1024-bit RSA
+    /// key pair whose generation was most of a first boot's instructions),
+    /// lockdownd's records, and every cache and database first boot builds
+    /// (LaunchServices', SpringBoard's rendered images and icons, the
+    /// apps' databases). A power-on here starts from the image every time,
+    /// so without this every boot would be a first boot. It was captured
+    /// by booting in the emulator until well past the lock screen (see
+    /// GuestTools/first_boot_capture); the keybag and keychain are sealed
+    /// with the emulated A4's stand-in UID key, which is the same on every
+    /// run, so they open here too.
     ///
     /// A binary property list: an array of `path`, `kind` (folder, file,
     /// symlink), `mode`, `uid`, `gid`, and `data` or `target`, parents
