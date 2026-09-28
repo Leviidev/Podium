@@ -166,9 +166,11 @@ final class EmulationSession {
 
     /// Guest time, in `virtualTime` units, per second: the 24 MHz timebase.
     private static let virtualTimePerSecond = 24_000_000 * Double(S5L8930XPlatform.instructionsPerTimebaseTick)
-    /// The longest hold a release waits for: longer than any press iOS
-    /// tells from a hold (about two seconds, for "slide to power off").
-    private static let longestHold: TimeInterval = 3
+    /// The longest hold a release waits for. iOS takes a hold of about
+    /// two seconds for "slide to power off", but only once SpringBoard's
+    /// timer for it fires, which is late while it's busy (just after an
+    /// unlock, say) — so a few seconds more than that.
+    private static let longestHold: TimeInterval = 5
 
     /// Applies input, all at once except button releases. The guest's
     /// clock runs several times slower than the host's while it's busy,
