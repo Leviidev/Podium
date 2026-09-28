@@ -82,6 +82,8 @@ enum KernelBootstrap {
             try leaveDisplayControllerRunning(on: bus)
         }
 
+        var machO = machO
+        KernelcachePatcher.skipBacklightSearch(&machO)
         let image = try MachOLoader.load(machO, into: bus, physicalAddressForVirtual: GuestMemoryLayout.physical(fromKernelVirtual:))
 
         // Each component on its own page after the kernel, as iBoot does;
