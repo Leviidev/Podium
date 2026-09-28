@@ -62,6 +62,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
     private(set) var i2c0: S5L8930XI2C!
     private(set) var i2c2: S5L8930XI2C!
     let pmu = D1815PMU()
+    let audioCodec = CS42L59Codec()
     let i2s0 = S5L8930XI2S()
     /// The display IOMMU (`dart2`), which scanout translates through.
     let dart2 = S5L8930XDART()
@@ -102,6 +103,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
             self.interruptController.setLine(Self.i2c2InterruptLine, asserted: asserted)
         }
         i2c0.attach(pmu, at: D1815PMU.address)
+        i2c0.attach(audioCodec, at: CS42L59Codec.address)
         displayPipe = S5L8930XDisplayPipe { [unowned self] asserted in
             self.interruptController.setLine(Self.displayPipeInterruptLine, asserted: asserted)
         }

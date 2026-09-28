@@ -127,3 +127,35 @@ class I2CRegisterFile: I2CDevice {
 final class D1815PMU: I2CRegisterFile {
     static let address: UInt8 = 0x74
 }
+
+/// The Cirrus CS42L59 audio codec's control port (device tree
+/// `i2c0/audio0`, address 0x4a): its settings read back as written.
+/// As on Cirrus parts, bit 7 of the register address asks for
+/// auto-increment and isn't part of it.
+///
+/// Register 0x38 is status. AppleCS42L59Audio powers the codec down —
+/// at sleep and at shutdown — by setting both power-down bits of
+/// register 6, then polls 0x38 every 10 ms until bit 3 says it's down;
+/// here it's down at once. (Bits 5 and 6 are accessory detection, and
+/// read as nothing attached.)
+final class CS42L59Codec: I2CRegisterFile {
+    static let address: UInt8 = 0x4A
+    private static let powerControl = 0x06
+    private static let powerDown: UInt8 = 0b11
+    private static let status: UInt8 = 0x38
+    private static let poweredDown: UInt8 = 1 << 3
+
+    override func read(register: UInt8, count: Int) -> [UInt8]? {
+        let first = register & 0x7F
+        return (0..<count).map { index in
+            let address = (first &+ UInt8(truncatingIfNeeded: index)) & 0x7F
+            var value = registers[Int(address)]
+            if address == Self.status, registers[Self.powerControl] & Self.powerDown == Self.powerDown { value |= Self.poweredDown }
+            return value
+        }
+    }
+
+    override func write(register: UInt8, bytes: [UInt8]) -> Bool {
+        super.write(register: register & 0x7F, bytes: bytes)
+    }
+}
