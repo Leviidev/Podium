@@ -105,12 +105,22 @@ final class S5L8930XDisplayPipe: MMIODevice {
 /// `0x89200000`, interrupt `0x29`): AppleCLCD arms its own interrupt while
 /// a swap or a table update waits for the next frame, and its filter
 /// treats status bit 2 at `+0x68` as that frame's vsync, acknowledging it
-/// by writing the bit back. The rest is kept as written — including the
-/// enable and panel-size registers `KernelBootstrap` leaves as iBoot would.
+/// by writing the bit back. `+0x50` bit 0 enables the display ("ENVID");
+/// when the driver clears it to power the panel down it waits for bit 1,
+/// which says the controller has stopped — here as soon as it's disabled.
+/// Powering back up, it soft-resets the block by writing bit 8 of `+0x00`
+/// and waits for the bit to clear, which it does at once.
+/// The rest is kept as written — including the enable and panel-size
+/// registers `KernelBootstrap` leaves as iBoot would.
 final class S5L8930XCLCD: MMIODevice {
     static let windowLength: UInt32 = 0x1000
     static let interruptStatus: UInt32 = 0x68
     static let vsync: UInt32 = 1 << 2
+    static let reset: UInt32 = 0x00
+    static let softReset: UInt32 = 1 << 8
+    static let control: UInt32 = 0x50
+    static let enabled: UInt32 = 1 << 0
+    static let stopped: UInt32 = 1 << 1
 
     private let setInterruptLine: (Bool) -> Void
     private var registers = [UInt32](repeating: 0, count: Int(windowLength / 4))
@@ -120,13 +130,17 @@ final class S5L8930XCLCD: MMIODevice {
     }
 
     func readRegister(at offset: UInt32) -> UInt32 {
-        registers[Int(offset / 4)]
+        let value = registers[Int(offset / 4)]
+        guard offset == Self.control else { return value }
+        return value & Self.enabled != 0 ? value & ~Self.stopped : value | Self.stopped
     }
 
     func writeRegister(_ value: UInt32, at offset: UInt32) {
         if offset == Self.interruptStatus {
             registers[Int(offset / 4)] &= ~value
             updateInterruptLine()
+        } else if offset == Self.reset {
+            registers[Int(offset / 4)] = value & ~Self.softReset
         } else {
             registers[Int(offset / 4)] = value
         }

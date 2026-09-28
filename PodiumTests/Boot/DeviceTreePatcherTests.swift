@@ -310,6 +310,62 @@ final class DeviceTreePatcherTests: XCTestCase {
         XCTAssertEqual(DeviceTreePatcher.standInLCDPanelID & 0x38, 0, "class 1 panel")
     }
 
+    /// The display's `dot-pitch` placeholder is 0; the patch fills in the
+    /// panel's 326 dots per inch in place, on `arm-io/clcd`.
+    func testSetDotPitchFillsInTheDisplayNodeInPlace() {
+        func property(_ name: String, value: Data) -> Data {
+            var data = Data(count: 32)
+            data.replaceSubrange(0..<name.utf8.count, with: Array(name.utf8))
+            var length = Data(count: 4)
+            length.writeUInt32LE(UInt32(value.count), at: 0)
+            return data + length + value + Data(count: (4 - value.count % 4) % 4)
+        }
+        func node(_ name: String, _ properties: [Data], children: [Data] = []) -> Data {
+            let all = [property("name", value: Data((name + "\u{0}").utf8))] + properties
+            var header = Data(count: 8)
+            header.writeUInt32LE(UInt32(all.count), at: 0)
+            header.writeUInt32LE(UInt32(children.count), at: 4)
+            return header + all.reduce(Data(), +) + children.reduce(Data(), +)
+        }
+        let clcd = node("clcd", [property("dot-pitch", value: Data(count: 4))])
+        var tree = node("device-tree", [], children: [node("arm-io", [], children: [clcd])])
+        let originalCount = tree.count
+
+        DeviceTreePatcher.setDotPitch(&tree)
+
+        XCTAssertEqual(tree.count, originalCount)
+        guard let offset = valueOffset(of: "dot-pitch", in: tree) else { return XCTFail("no dot-pitch property") }
+        XCTAssertEqual(tree.readUInt32LE(at: offset), 326)
+    }
+
+    /// `/chosen`'s `display-scale` placeholder is 0; the patch fills in the
+    /// Retina panel's 2 pixels per point, in place.
+    func testSetDisplayScaleFillsInTheChosenNodeInPlace() {
+        func property(_ name: String, value: Data) -> Data {
+            var data = Data(count: 32)
+            data.replaceSubrange(0..<name.utf8.count, with: Array(name.utf8))
+            var length = Data(count: 4)
+            length.writeUInt32LE(UInt32(value.count), at: 0)
+            return data + length + value + Data(count: (4 - value.count % 4) % 4)
+        }
+        func node(_ name: String, _ properties: [Data], children: [Data] = []) -> Data {
+            let all = [property("name", value: Data((name + "\u{0}").utf8))] + properties
+            var header = Data(count: 8)
+            header.writeUInt32LE(UInt32(all.count), at: 0)
+            header.writeUInt32LE(UInt32(children.count), at: 4)
+            return header + all.reduce(Data(), +) + children.reduce(Data(), +)
+        }
+        let chosen = node("chosen", [property("display-scale", value: Data(count: 4))])
+        var tree = node("device-tree", [], children: [chosen])
+        let originalCount = tree.count
+
+        DeviceTreePatcher.setDisplayScale(&tree)
+
+        XCTAssertEqual(tree.count, originalCount)
+        guard let offset = valueOffset(of: "display-scale", in: tree) else { return XCTFail("no display-scale property") }
+        XCTAssertEqual(tree.readUInt32LE(at: offset), 2)
+    }
+
     /// IOSurfaceRoot waits on `/vram` as a memory region; the patch points
     /// it at the boot framebuffer, in place.
     func testSetVRAMPointsTheVRAMNodeAtTheBootFramebuffer() {

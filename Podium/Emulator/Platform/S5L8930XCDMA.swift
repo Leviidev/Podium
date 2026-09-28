@@ -1,6 +1,18 @@
 import CommonCrypto
 import Foundation
 
+/// A peripheral FIFO a DMA channel can feed or drain, byte by byte, with
+/// flow control — how channels pointed at a peripheral's data register
+/// move data.
+protocol DMAEndpoint: AnyObject {
+    /// Bytes the endpoint can take now (for memory-to-peripheral).
+    var dmaSpace: Int { get }
+    func dmaPush(_ byte: UInt8)
+    /// Bytes waiting (for peripheral-to-memory).
+    var dmaAvailable: Int { get }
+    func dmaPop() -> UInt8
+}
+
 /// The S5L8930X "CDMA" DMA engine (device tree `cdma`: channels at
 /// `0x07000000`, `0x26000`; AES filter contexts at `0x07800000`,
 /// `0x9000`) — only its memory-to-memory path, the one `IOAESAccelerator`
@@ -74,6 +86,27 @@ final class S5L8930XCDMA: MMIODevice {
     /// The AES filter contexts' own register window.
     let aes = AESContexts()
 
+    /// Peripheral data registers (physical, without the `0x80000000`
+    /// alias) a channel's DAR can name.
+    private var endpoints: [UInt32: DMAEndpoint] = [:]
+    /// A running peripheral channel: its memory segments and progress.
+    private struct PeripheralTransfer {
+        let toPeripheral: Bool
+        let endpoint: DMAEndpoint
+        let segments: [Segment]
+        /// Where the controller's command pointer (CAR) comes to rest.
+        let end: UInt32
+        var segment = 0
+        var offset = 0
+        var moved = 0
+    }
+    private var peripheralTransfers: [Int: PeripheralTransfer] = [:]
+    private var pumping = false
+
+    func attach(_ endpoint: DMAEndpoint, dataRegister: UInt32) {
+        endpoints[dataRegister & 0x7FFF_FFFF] = endpoint
+    }
+
     final class AESContexts: MMIODevice {
         fileprivate var registers = [UInt32](repeating: 0, count: Int(S5L8930XCDMA.aesLength / 4))
         func readRegister(at offset: UInt32) -> UInt32 { registers[Int(offset / 4)] }
@@ -121,6 +154,7 @@ final class S5L8930XCDMA: MMIODevice {
         csr &= ~(value & Self.csrWriteOneToClear)
         if value & Self.csrAbort != 0 {
             csr &= ~(Self.csrStateMask | Self.csrStart | Self.csrAbort)
+            peripheralTransfers[channel] = nil
         }
         if value & Self.csrStart != 0, old & Self.csrStateMask == 0 {
             csr = (csr & ~Self.csrStateMask) | Self.csrStateRunning
@@ -135,7 +169,19 @@ final class S5L8930XCDMA: MMIODevice {
     private func startIfReady(_ channel: Int) {
         let csr = register(channel, 0)
         guard csr & Self.csrMemoryToMemory != 0 else {
-            log?(String(format: "cdma| channel %d started without memory-to-memory mode (csr %08x) — not modeled", channel, csr))
+            let dataRegister = register(channel, 0x8) & 0x7FFF_FFFF
+            guard let endpoint = endpoints[dataRegister] else {
+                log?(String(format: "cdma| channel %d: peripheral register %08x not modeled (csr %08x)", channel, dataRegister, csr))
+                return
+            }
+            // DCR bit 1: memory to peripheral (openiBoot's "out").
+            let chain = walkChain(at: register(channel, 0x14))
+            peripheralTransfers[channel] = PeripheralTransfer(toPeripheral: register(channel, 0x4) & 2 != 0, endpoint: endpoint,
+                                                              segments: chain.segments, end: chain.end)
+            log?(String(format: "cdma| channel %d chain at %08x: %@ -> %08x", channel, register(channel, 0x14), chain.commands, chain.end))
+            log?(String(format: "cdma| channel %d started: %@ %08x, dcr %08x, %d bytes", channel, register(channel, 0x4) & 2 != 0 ? "to" : "from",
+                        dataRegister, register(channel, 0x4), peripheralTransfers[channel]!.segments.reduce(0) { $0 + $1.length }))
+            pumpPeripherals()
             return
         }
         let source = channel & 1 == 1 ? channel : channel - 1
@@ -146,22 +192,80 @@ final class S5L8930XCDMA: MMIODevice {
         transfer(from: source, to: sink)
     }
 
+    /// Moves bytes between running peripheral channels and their
+    /// endpoints until nothing can move. Peripherals call this when their
+    /// FIFOs change.
+    func pumpPeripherals() {
+        guard !pumping, !peripheralTransfers.isEmpty else { return }
+        pumping = true
+        defer { pumping = false }
+        let bus = memory()
+        var progress = true
+        while progress {
+            progress = false
+            for channel in peripheralTransfers.keys.sorted() {
+                guard var transfer = peripheralTransfers[channel] else { continue }
+                while transfer.segment < transfer.segments.count {
+                    let segment = transfer.segments[transfer.segment]
+                    if transfer.offset >= segment.length { transfer.segment += 1; transfer.offset = 0; continue }
+                    let address = segment.address &+ UInt32(transfer.offset)
+                    if transfer.toPeripheral {
+                        guard transfer.endpoint.dmaSpace > 0 else { break }
+                        transfer.endpoint.dmaPush((try? bus.readByte(at: address)) ?? 0)
+                    } else {
+                        guard transfer.endpoint.dmaAvailable > 0 else { break }
+                        try? bus.writeByte(transfer.endpoint.dmaPop(), at: address)
+                    }
+                    transfer.offset += 1
+                    transfer.moved += 1
+                    progress = true
+                }
+                if transfer.segment >= transfer.segments.count {
+                    peripheralTransfers[channel] = nil
+                    setRegister(channel, 0x14, transfer.end)
+                    finish(channel)
+                    log?(String(format: "cdma| channel %d: %d bytes %@ peripheral", channel, transfer.moved, transfer.toPeripheral ? "to" : "from"))
+                } else {
+                    peripheralTransfers[channel] = transfer
+                }
+            }
+        }
+    }
+
+    private func finish(_ channel: Int) {
+        let csr = register(channel, 0)
+        setRegister(channel, 0, (csr & ~(Self.csrStateMask | Self.csrStart)) | Self.csrDone)
+        setRegister(channel, 0xC, 0)
+        if csr & Self.csrInterruptEnable != 0 { setInterruptLine(Self.firstInterruptLine + channel, true) }
+    }
+
     private struct Segment { let address: UInt32; let length: Int }
 
     private func segments(ofChainAt start: UInt32) -> [Segment] {
+        walkChain(at: start).segments
+    }
+
+    /// Follows a command chain from `start`, collecting its data segments.
+    /// The controller consumes descriptors in order, advancing CAR to each
+    /// one's `next`, and stops on a zero command — so the kernel, which
+    /// keeps its descriptors in a ring, counts everything before where
+    /// CAR rests as done.
+    private func walkChain(at start: UInt32) -> (segments: [Segment], end: UInt32, commands: String) {
         let bus = memory()
         var result: [Segment] = []
+        var commands: [String] = []
         var descriptor = start
         for _ in 0..<4096 {
             guard let command = try? bus.readWord32(at: descriptor &+ 4), command != 0 else { break }
+            commands.append(String(format: "%x", command))
             if command & 3 == 3, let address = try? bus.readWord32(at: descriptor &+ 8), let length = try? bus.readWord32(at: descriptor &+ 12) {
                 result.append(Segment(address: address, length: Int(length)))
             }
-            if command & 0x100 != 0 { break }
             guard let next = try? bus.readWord32(at: descriptor) else { break }
+            if command & 0x100 != 0 { descriptor = next; break }
             descriptor = next
         }
-        return result
+        return (result, descriptor, commands.joined(separator: ","))
     }
 
     private func transfer(from source: Int, to sink: Int) {

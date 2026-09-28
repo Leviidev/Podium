@@ -1,7 +1,7 @@
 import Foundation
 
-/// A touch in the virtual device's own coordinate space (960×640 points,
-/// origin top-left) — never a SwiftUI/UIKit coordinate. The UI layer is
+/// A touch in the virtual device's own screen coordinates (640×960 pixels,
+/// portrait, origin top-left) — never a SwiftUI/UIKit coordinate. The UI layer is
 /// responsible for that mapping before an event reaches the emulator core.
 struct TouchPoint: Equatable {
     let x: Double

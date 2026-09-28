@@ -230,6 +230,34 @@ enum DeviceTreePatcher {
         deviceTree.writeUInt32LE(id, at: location.valueOffset)
     }
 
+    /// The iPod touch 4's panel: 326 dots per inch, drawn at 2 pixels per
+    /// point.
+    static let panelDotPitch: UInt32 = 326
+    static let displayScale: UInt32 = 2
+
+    /// Sets the display's `dot-pitch`, which iBoot fills in from the panel
+    /// it found; IOMobileFramebuffer reports it to user space as the
+    /// display's DPI (MobileGestalt's main-screen-pitch). The shipped
+    /// placeholder is 0. In place (the property is already 4 bytes), so
+    /// nothing moves.
+    static func setDotPitch(_ deviceTree: inout Data, dotsPerInch: UInt32 = panelDotPitch) {
+        guard let location = findProperties(in: deviceTree, path: ["arm-io", "clcd"], propertyNames: ["dot-pitch"]).first,
+              location.currentLength == 4 else { return }
+        deviceTree.writeUInt32LE(dotsPerInch, at: location.valueOffset)
+    }
+
+    /// Sets `/chosen`'s `display-scale`, which iBoot fills in: the main
+    /// screen's pixels per point. backboardd tells the touchscreen its
+    /// resolution as 160 dots per inch times this scale; with the shipped
+    /// 0 the multitouch HID plugin's scale was infinite, every touch
+    /// position it produced was 0/0 — NaN — and no touch landed anywhere.
+    /// In place (the property is already 4 bytes), so nothing moves.
+    static func setDisplayScale(_ deviceTree: inout Data, scale: UInt32 = displayScale) {
+        guard let location = findProperties(in: deviceTree, path: ["chosen"], propertyNames: ["display-scale"]).first,
+              location.currentLength == 4 else { return }
+        deviceTree.writeUInt32LE(scale, at: location.valueOffset)
+    }
+
     /// Sets `/vram`'s `reg` to the boot framebuffer, which iBoot fills in
     /// with the memory it drew the boot logo in. IOSurfaceRoot counts
     /// `/vram` among the memory regions it waits for before creating any

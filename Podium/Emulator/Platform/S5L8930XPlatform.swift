@@ -39,6 +39,10 @@ final class S5L8930XPlatform: DeviceEventHandler {
     static let displayPipeBase: UInt32 = 0x0900_0000
     static let clcdBase: UInt32 = 0x0920_0000
     static let dsimBase: UInt32 = 0x0950_0000
+    static let gpioBase: UInt32 = 0x3FA0_0000
+    static let gpioInterruptLine = 0x74
+    static let spi1Base: UInt32 = 0x0210_0000
+    static let spi1InterruptLine = 0x1E
     static let displayPipeInterruptLine = 0x2A
     static let clcdInterruptLine = 0x29
     /// Timebase ticks per frame: 24 MHz / 60 Hz.
@@ -50,6 +54,8 @@ final class S5L8930XPlatform: DeviceEventHandler {
     private(set) var interruptController: PL192InterruptController!
     private(set) var timer: S5L8930XTimer!
     let powerManager = S5L8930XPowerManager()
+    /// Fires when iOS shuts down or restarts.
+    let watchdog = S5L8930XWatchdog()
     let iop = S5L8930XIOP()
     let swi = S5L8930XSWI()
     private(set) var cdma: S5L8930XCDMA!
@@ -63,6 +69,11 @@ final class S5L8930XPlatform: DeviceEventHandler {
     private(set) var clcd: S5L8930XCLCD!
     /// The MIPI DSI link to the panel.
     let dsim = S5L8930XDSIM()
+    /// Buttons and the touch controller's interrupt line.
+    private(set) var gpio: S5L8930XGPIO!
+    /// The bus the touchscreen controller is on.
+    private(set) var spi1: S5L8930XSPI!
+    let touch = MultitouchN1()
     private var nextFrameTick: UInt64 = frameTicks
 
     init(cpu: ARMv7CPU) {
@@ -97,6 +108,25 @@ final class S5L8930XPlatform: DeviceEventHandler {
         clcd = S5L8930XCLCD { [unowned self] asserted in
             self.interruptController.setLine(Self.clcdInterruptLine, asserted: asserted)
         }
+        gpio = S5L8930XGPIO { [unowned self] asserted in
+            self.interruptController.setLine(Self.gpioInterruptLine, asserted: asserted)
+        }
+        spi1 = S5L8930XSPI { [unowned self] asserted in
+            self.interruptController.setLine(Self.spi1InterruptLine, asserted: asserted)
+        }
+        spi1.slave = touch
+        cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.transmitData)
+        cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.receiveData)
+        spi1.dmaRequest = { [unowned self] in self.cdma.pumpPeripherals() }
+        touch.setAttention = { [unowned self] asserted in
+            self.gpio.setInputLevel(!asserted, pin: S5L8930XGPIO.Pin.touchInterrupt)
+        }
+        gpio.onOutputChanged = { [unowned self] pin, level in
+            // The touch controller's chip select is active low; its reset
+            // line puts it back in its bootloader.
+            if pin == MultitouchN1.chipSelectPin { self.touch.chipSelectChanged(!level) }
+            if pin == MultitouchN1.resetPin { self.touch.reset() }
+        }
         cpu.deviceEventHandler = self
         rescheduleNextEvent()
     }
@@ -109,6 +139,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
         // region must come first to claim its own registers.
         let windows: [(MMIODevice, UInt32, UInt32)] = [
             (timer, Self.pmgrBase + S5L8930XTimer.windowOffsetInPMGR, S5L8930XTimer.windowLength),
+            (watchdog, Self.pmgrBase + S5L8930XWatchdog.windowOffsetInPMGR, S5L8930XWatchdog.windowLength),
             (powerManager, Self.pmgrBase, S5L8930XPowerManager.windowLength),
             (interruptController, Self.vicBase, PL192InterruptController.windowLength),
             (iop, Self.iopBase, S5L8930XIOP.windowLength),
@@ -122,10 +153,36 @@ final class S5L8930XPlatform: DeviceEventHandler {
             (displayPipe, Self.displayPipeBase, S5L8930XDisplayPipe.windowLength),
             (clcd, Self.clcdBase, S5L8930XCLCD.windowLength),
             (dsim, Self.dsimBase, S5L8930XDSIM.windowLength),
+            (gpio, Self.gpioBase, S5L8930XGPIO.windowLength),
+            (spi1, Self.spi1Base, S5L8930XSPI.windowLength),
         ]
         return windows.flatMap { device, base, length in
             [base, base | Self.aliasBit].map { MMIORegion(device: device, baseAddress: $0, length: length) }
         }
+    }
+
+    /// Delivers user input to the hardware it belongs to. The buttons are
+    /// active low: pressing one pulls its pin to 0.
+    func handle(_ event: InputEvent) {
+        switch event {
+        case .homeButton(let pressed): gpio.setInputLevel(!pressed, pin: S5L8930XGPIO.Pin.menu)
+        case .powerButton(let pressed): gpio.setInputLevel(!pressed, pin: S5L8930XGPIO.Pin.hold)
+        case .volumeUp(let pressed): gpio.setInputLevel(!pressed, pin: S5L8930XGPIO.Pin.volumeUp)
+        case .volumeDown(let pressed): gpio.setInputLevel(!pressed, pin: S5L8930XGPIO.Pin.volumeDown)
+        case .touchBegan(let point): touch(.began, point)
+        case .touchMoved(let point): touch(.moved, point)
+        case .touchEnded(let point): touch(.ended, point)
+        }
+    }
+
+    /// The guest's clock in milliseconds (the timebase runs at 24 MHz).
+    private var milliseconds: UInt32 {
+        UInt32(truncatingIfNeeded: cpu.virtualTime / Self.instructionsPerTimebaseTick / 24_000)
+    }
+
+    private func touch(_ phase: MultitouchN1.Phase, _ point: TouchPoint) {
+        touch.touch(phase, x: point.x / Double(GuestMemoryLayout.framebufferWidth), y: point.y / Double(GuestMemoryLayout.framebufferHeight),
+                    time: milliseconds)
     }
 
     func deviceEventDue(at virtualTime: UInt64) {
@@ -134,6 +191,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
         if tick >= nextFrameTick {
             displayPipe.frameEnded()
             clcd.frameEnded()
+            touch.scan(time: milliseconds)
             nextFrameTick = (tick / Self.frameTicks + 1) * Self.frameTicks
         }
         rescheduleNextEvent()
