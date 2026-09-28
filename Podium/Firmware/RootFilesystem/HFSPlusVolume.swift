@@ -414,3 +414,26 @@ final class HFSPlusVolume {
         }
     }
 }
+
+/// A volume stored as a plain file (a raw HFS+ image).
+final class FileVolumeSource: VolumeByteSource {
+    private let fileDescriptor: Int32
+
+    init(url: URL) throws {
+        fileDescriptor = open(url.path, O_RDONLY)
+        guard fileDescriptor >= 0 else { throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: url.path]) }
+    }
+
+    deinit { close(fileDescriptor) }
+
+    func readBytes(_ count: Int, at offset: UInt64) throws -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: count)
+        var done = 0
+        while done < count {
+            let n = bytes.withUnsafeMutableBytes { pread(fileDescriptor, $0.baseAddress! + done, count - done, off_t(offset) + off_t(done)) }
+            guard n > 0 else { throw HFSPlusError.corrupt("read past the end of the image at \(offset + UInt64(done))") }
+            done += n
+        }
+        return bytes
+    }
+}

@@ -1,0 +1,10 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ armv7-ios ]
+install-name:    '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation'
+current-version: 793
+exports:
+  - targets:     [ armv7-ios ]
+    symbols:     [ _CFDataCreate, _CFDictionaryCreate, _CFRelease, _CFStringCreateWithCString,
+                   _kCFAllocatorDefault, _kCFTypeDictionaryKeyCallBacks, _kCFTypeDictionaryValueCallBacks ]
+...

@@ -56,7 +56,8 @@ enum RootFilesystemPreparer {
 
     /// Returns the prepared image, building it first if needed.
     @discardableResult
-    static func prepare(firmwareAt ipswURL: URL, keybagBootstrap: [UInt8], progress: (Progress) -> Void = { _ in }) throws -> URL {
+    static func prepare(firmwareAt ipswURL: URL, keybagBootstrap: [UInt8], firstBootState: Data? = nil, bootReadFiles: [String] = [],
+                        progress: (Progress) -> Void = { _ in }) throws -> URL {
         let image = imageURL(forFirmwareAt: ipswURL)
         if isPrepared(forFirmwareAt: ipswURL) { return image }
         let fileManager = FileManager.default
@@ -70,8 +71,17 @@ enum RootFilesystemPreparer {
 
         // 1. Extract and decrypt.
         if keepDecrypted, fileManager.fileExists(atPath: decrypted.path) {
-            return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap, progress: progress)
+            return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap, firstBootState: firstBootState, bootReadFiles: bootReadFiles, progress: progress)
         }
+        try decryptRootFilesystem(fromFirmwareAt: ipswURL, to: decrypted) { progress(Progress(phase: .extracting, fraction: $0)) }
+
+        return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap, firstBootState: firstBootState, bootReadFiles: bootReadFiles, progress: progress)
+    }
+
+    /// Streams the root filesystem DMG out of the IPSW, decrypting it into
+    /// `decrypted` (a UDIF image).
+    static func decryptRootFilesystem(fromFirmwareAt ipswURL: URL, to decrypted: URL, progress: (Double) -> Void = { _ in }) throws {
+        let fileManager = FileManager.default
         let zip = try ZipArchiveReader(fileURL: ipswURL)
         guard let manifestEntry = zip.entry(named: IPSWParser.buildManifestEntryName) else { throw PreparationError.missingRootFilesystem }
         let manifest = try PropertyListDecoder().decode(BuildManifestPlist.self, from: try zip.data(for: manifestEntry))
@@ -80,6 +90,7 @@ enum RootFilesystemPreparer {
 
         fileManager.createFile(atPath: decrypted.path, contents: nil)
         let output = try FileHandle(forWritingTo: decrypted)
+        defer { try? output.close() }
         var buffer = Data()
         buffer.reserveCapacity(8 << 20)
         let decryptor = try EncryptedDiskImageDecryptor(key: [UInt8](ReferenceFirmwareKeys.rootFilesystem)) { plain in
@@ -89,23 +100,21 @@ enum RootFilesystemPreparer {
                 buffer.removeAll(keepingCapacity: true)
             }
         }
-        try zip.stream(entry, progress: { progress(Progress(phase: .extracting, fraction: $0)) }) { piece in
+        try zip.stream(entry, progress: progress) { piece in
             try decryptor.feed(piece)
         }
         try output.write(contentsOf: buffer)
-        try output.close()
         guard decryptor.isComplete else { throw PreparationError.incompleteDecryption }
-
-        return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap, progress: progress)
     }
 
     // 2. Rebuild the volume.
-    private static func build(from decrypted: URL, to image: URL, partial: URL, keybagBootstrap: [UInt8], progress: (Progress) -> Void) throws -> URL {
+    private static func build(from decrypted: URL, to image: URL, partial: URL, keybagBootstrap: [UInt8], firstBootState: Data?, bootReadFiles: [String],
+                              progress: (Progress) -> Void) throws -> URL {
         let fileManager = FileManager.default
         progress(Progress(phase: .building, fraction: 0))
         let volume = try HFSPlusVolume(source: try UDIFDiskImage(url: decrypted))
         let builder = try RootFilesystemBuilder(volume: volume)
-        try RootFilesystemRecipe.apply(to: builder, keybagBootstrap: keybagBootstrap)
+        try RootFilesystemRecipe.apply(to: builder, keybagBootstrap: keybagBootstrap, firstBootState: firstBootState, bootReadFiles: bootReadFiles)
         try builder.write(to: partial, freeSpace: RootFilesystemRecipe.freeSpace) { written in
             progress(Progress(phase: .building, fraction: Double(written.bytesWritten) / Double(max(written.totalBytes, 1))))
         }

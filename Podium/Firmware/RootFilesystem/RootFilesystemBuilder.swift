@@ -93,6 +93,13 @@ final class RootFilesystemBuilder {
     }
 
     /// Replaces a file's contents, stored uncompressed.
+    /// Stores a compressed file's contents plainly. Hard links and files
+    /// that aren't compressed (or aren't there) are left as they are.
+    func storeUncompressed(_ path: String) throws {
+        guard let index = index(of: path), records[index].isFile, records[index].isCompressed, !records[index].isHardLink else { return }
+        try replaceContents(of: path, with: try contents(of: path))
+    }
+
     func replaceContents(of path: String, with bytes: [UInt8]) throws {
         guard let index = index(of: path), records[index].isFile, !records[index].isHardLink else { throw HFSPlusError.missingPath(path) }
         let id = records[index].catalogNodeID
@@ -144,13 +151,72 @@ final class RootFilesystemBuilder {
         if let mode { data.putBE16((data.be16(42) & 0xF000) | (mode & 0x0FFF), at: 42) }
         data.putBE32(0, at: 44) // bsdInfo.special
         for offset in 48..<80 { data[offset] = 0 } // Finder info
-        let record = HFSPlusCatalogRecord(parentID: records[parent].catalogNodeID, name: name, data: data)
+        insert(HFSPlusCatalogRecord(parentID: records[parent].catalogNodeID, name: name, data: data), parent: parent)
+        replacedContent[id] = contents
+    }
+
+    /// Adds a folder (or updates an existing one's ownership and mode),
+    /// its record modeled on its parent's.
+    func addFolder(_ path: String, owner: UInt32, group: UInt32, mode: UInt16) throws {
+        if let existing = index(of: path) {
+            guard records[existing].isFolder else { throw HFSPlusError.unsupported("\(path) exists and isn't a folder") }
+            setOwnership(existing, owner: owner, group: group, mode: mode)
+            return
+        }
+        let (parent, name) = try parentAndName(of: path)
+        let id = nextCatalogID
+        nextCatalogID += 1
+        var data = records[parent].data
+        data.putBE32(0, at: 4) // valence
+        data.putBE32(id, at: 8)
+        data.putBE32(0, at: 84) // folderCount
+        data.putBE16(data.be16(2) & HFSPlusCatalogRecord.hasFolderCountFlag, at: 2)
+        for offset in 48..<80 { data[offset] = 0 } // Finder info
+        insert(HFSPlusCatalogRecord(parentID: records[parent].catalogNodeID, name: name, data: data), parent: parent)
+        setOwnership(records.count - 1, owner: owner, group: group, mode: mode)
+    }
+
+    /// Adds (or replaces) a file with explicit ownership and mode.
+    func addFile(_ path: String, contents: [UInt8], owner: UInt32, group: UInt32, mode: UInt16, template templatePath: String) throws {
+        try addFile(path, contents: contents, template: templatePath)
+        guard let index = index(of: path) else { throw HFSPlusError.missingPath(path) }
+        setOwnership(index, owner: owner, group: group, mode: mode)
+    }
+
+    /// Adds a symbolic link: an HFS+ file of type 'slnk'/'rhap' whose data
+    /// fork is the target path.
+    func addSymbolicLink(_ path: String, target: String, owner: UInt32, group: UInt32, template templatePath: String) throws {
+        try addFile(path, contents: Array(target.utf8), template: templatePath)
+        guard let index = index(of: path) else { throw HFSPlusError.missingPath(path) }
+        records[index].data.putBE32(0x736C_6E6B, at: 48) // 'slnk'
+        records[index].data.putBE32(0x7268_6170, at: 52) // 'rhap'
+        setOwnership(index, owner: owner, group: group, mode: 0o120755)
+    }
+
+    private func setOwnership(_ index: Int, owner: UInt32, group: UInt32, mode: UInt16) {
+        records[index].data.putBE32(owner, at: 32)
+        records[index].data.putBE32(group, at: 36)
+        let type = records[index].isFolder ? 0o040000 : (mode & 0o170000 != 0 ? mode & 0o170000 : 0o100000)
+        records[index].data.putBE16(UInt16(type) | (mode & 0o7777), at: 42)
+    }
+
+    private func parentAndName(of path: String) throws -> (parent: Int, name: [UInt16]) {
+        var parts = Self.components(path)
+        let name = parts.removeLast()
+        let parentPath = "/" + parts.map { String(decoding: $0, as: UTF16.self) }.joined(separator: "/")
+        guard let parent = index(of: parentPath), records[parent].isFolder else { throw HFSPlusError.missingPath(parentPath) }
+        return (parent, name)
+    }
+
+    private func insert(_ record: HFSPlusCatalogRecord, parent: Int) {
         records.append(record)
         let newIndex = records.count - 1
-        indexByID[id] = newIndex
+        indexByID[record.catalogNodeID] = newIndex
         childrenByParent[record.parentID, default: []].append(newIndex)
         records[parent].valence += 1
-        replacedContent[id] = contents
+        if record.isFolder, records[parent].flags & HFSPlusCatalogRecord.hasFolderCountFlag != 0 {
+            records[parent].folderCount += 1
+        }
     }
 
     private func remove(index: Int) throws {
@@ -219,11 +285,11 @@ final class RootFilesystemBuilder {
 /// applies on a Mac.
 enum RootFilesystemRecipe {
     /// Bumped whenever the edits change, so prepared images are rebuilt.
-    static let version = 1
+    static let version = 9
     /// Room left for the guest to write into (logs, caches, preferences).
     static let freeSpace: UInt64 = 64 << 20
 
-    static func apply(to builder: RootFilesystemBuilder, keybagBootstrap: [UInt8]) throws {
+    static func apply(to builder: RootFilesystemBuilder, keybagBootstrap: [UInt8], firstBootState: Data? = nil, bootReadFiles: [String] = []) throws {
         // The volume is rebuilt unjournaled; its old journal is just space.
         try builder.remove("/.journal")
         try builder.remove("/.journal_info_block")
@@ -252,7 +318,8 @@ enum RootFilesystemRecipe {
         try builder.remove("/System/Library/Frameworks/GameKit.framework/GameKit@2x~iphone.artwork")
         try builder.removeChildren(of: "/System/Library/PrivateFrameworks/DataDetectorsCore.framework", matching: "*asia*")
 
-        // Root on the RAM disk, read-write.
+        // Root on the RAM disk, read-write. (No content protection: see
+        // GuestAccommodations.)
         try builder.replaceContents(of: "/private/etc/fstab", with: Array("/dev/md0 / hfs rw 0 1\n".utf8))
 
         // There's no SGX GPU: CoreAnimation's window server only tries an
@@ -276,15 +343,106 @@ enum RootFilesystemRecipe {
         }
 
         // First-boot state a restored device already has: data migration
-        // done for this build, and Setup Assistant's own markers.
+        // done for this build, and Setup Assistant finished. Setup can't
+        // finish here — it activates the device with Apple — so this is
+        // what it records when it does: `SetupDone`, and `SetupVersion` 3
+        // (Preferences.framework's PSSetupAssistantNeedsToRun runs it
+        // again below that). They're read both per host
+        // (kCFPreferencesCurrentHost, which CoreFoundation files under
+        // ByHost — PSSetupAssistantNeedsToRun) and for any host
+        // (CFPreferencesGetAppBooleanValue), so both files are written.
         let preferences = "/private/var/mobile/Library/Preferences/"
         let template = preferences + ".GlobalPreferences.plist"
         try builder.addFile(preferences + "com.apple.backboardd.plist",
                             contents: try binaryPlist(["BKDataMigratorLastSystemVersion": "10B500"]), template: template)
-        try builder.addFile(preferences + "com.apple.purplebuddy.plist",
-                            contents: try binaryPlist(["SetupDone": true, "SetupFinishedAllSteps": true, "SetupVersion": 6]), template: template)
+        let setupDone = try binaryPlist(["SetupDone": true, "SetupFinishedAllSteps": true, "SetupVersion": 3])
+        try builder.addFile(preferences + "com.apple.purplebuddy.plist", contents: setupDone, template: template)
+        try builder.addFolder(preferences + "ByHost", owner: 501, group: 501, mode: 0o755)
+        try builder.addFile(preferences + "ByHost/com.apple.purplebuddy.plist", contents: setupDone, template: template)
         try builder.addFile(preferences + "com.apple.keyboard.plist",
                             contents: try binaryPlist(["BuddySetupDone": true]), template: template)
+
+        try applyHactivation(to: builder)
+
+        if let firstBootState { try applyFirstBootState(firstBootState, to: builder) }
+
+        // The files the guest reads while it boots, stored uncompressed.
+        // Nearly every file here is HFS-compressed (decmpfs), and the
+        // kernel inflates whatever it reads — every page of the ICU data,
+        // every exec of dyld, daemons' binaries, /etc — which was a tenth
+        // of all the instructions a boot ran. The list (measured by
+        // logging the kernel's decmpfs reads across a boot) costs ~43 MB
+        // of the RAM disk and takes away nearly all of that.
+        for path in bootReadFiles { try builder.storeUncompressed(path) }
+    }
+
+    /// First boot's one-time work, done ahead of time: the files a first
+    /// boot of this very image leaves in /private/var — the system
+    /// keybag, the keychain holding lockdownd's activation identity (a
+    /// 1024-bit RSA key pair whose generation was most of a first boot's
+    /// instructions), lockdownd's own records. They were captured once by
+    /// booting in the emulator (see GuestTools/first_boot_capture); the
+    /// keybag and keychain are sealed with the emulated A4's stand-in UID
+    /// key, which is the same on every run, so they open here too.
+    ///
+    /// A binary property list: an array of `path`, `kind` (folder, file,
+    /// symlink), `mode`, `uid`, `gid`, and `data` or `target`, parents
+    /// before children.
+    static func applyFirstBootState(_ plist: Data, to builder: RootFilesystemBuilder) throws {
+        guard let entries = try PropertyListSerialization.propertyList(from: plist, format: nil) as? [[String: Any]] else {
+            throw HFSPlusError.corrupt("first-boot state isn't an array of entries")
+        }
+        let template = "/private/var/mobile/Library/Preferences/.GlobalPreferences.plist"
+        for entry in entries {
+            guard let path = entry["path"] as? String, let kind = entry["kind"] as? String,
+                  let mode = entry["mode"] as? Int, let uid = entry["uid"] as? Int, let gid = entry["gid"] as? Int else { continue }
+            switch kind {
+            case "folder":
+                try builder.addFolder(path, owner: UInt32(uid), group: UInt32(gid), mode: UInt16(mode))
+            case "file":
+                try builder.addFile(path, contents: [UInt8](entry["data"] as? Data ?? Data()), owner: UInt32(uid), group: UInt32(gid),
+                                    mode: UInt16(mode), template: template)
+            case "symlink":
+                try builder.addSymbolicLink(path, target: entry["target"] as? String ?? "", owner: UInt32(uid), group: UInt32(gid), template: template)
+            default:
+                continue
+            }
+        }
+    }
+
+    /// Activation. A restored iOS 6 device is unactivated until Apple's
+    /// activation server signs a record for its hardware identity, and
+    /// until then lockdownd reports it bricked and SpringBoard runs Setup
+    /// to activate it — a virtual iPod has no identity Apple would sign.
+    /// lockdownd has its own way past this for devices that shouldn't be
+    /// activated ("hactivation"): when MobileGestalt's ShouldHactivate
+    /// answer is true it reports the device Activated without a record
+    /// (dealwith_activation: "Short circuiting activation state to
+    /// Activated."). That answer comes from a per-model table in which
+    /// every retail model, the iPod touch 4 included, says no. So this
+    /// changes the one instruction in lockdownd's device-type setup that
+    /// takes the answer (`mov r2, r0` after MGGetBoolAnswer("ShouldHactivate"),
+    /// stored as the flag) to `movs r2, #1`, and recomputes the changed
+    /// page's hash in lockdownd's (ad-hoc) signature so the kernel keeps
+    /// it valid — lockdownd needs its entitlements for the keychain.
+    static let lockdowndShouldHactivate = (offset: 0x1_BD40, original: [0x00, 0xF0, 0xE8, 0xF8, 0x02, 0x46, 0x49, 0xF6] as [UInt8],
+                                           patched: [0x00, 0xF0, 0xE8, 0xF8, 0x01, 0x22, 0x49, 0xF6] as [UInt8])
+
+    static func applyHactivation(to builder: RootFilesystemBuilder) throws {
+        let path = "/usr/libexec/lockdownd"
+        var lockdownd = try builder.contents(of: path)
+        let site = lockdowndShouldHactivate
+        guard lockdownd.count > site.offset + 8, Array(lockdownd[site.offset..<site.offset + 8]) == site.original else {
+            throw HFSPlusError.corrupt("lockdownd isn't the 10B500 build this expects")
+        }
+        lockdownd.replaceSubrange(site.offset..<site.offset + 8, with: site.patched)
+        try CodeDirectory.updatePageHashes(&lockdownd)
+        try builder.replaceContents(of: path, with: lockdownd)
+    }
+
+    /// A file list resource: one path per line; `#` starts a comment.
+    static func fileList(_ text: String) -> [String] {
+        text.split(separator: "\n").map(String.init).filter { !$0.isEmpty && !$0.hasPrefix("#") }
     }
 
     private static func binaryPlist(_ dictionary: [String: Any]) throws -> [UInt8] {

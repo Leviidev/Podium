@@ -1,0 +1,11 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ armv7-ios ]
+install-name:    '/System/Library/Frameworks/Security.framework/Security'
+current-version: 55179.13
+exports:
+  - targets:     [ armv7-ios ]
+    symbols:     [ _SecCertificateCreateWithData, _SecIdentityCreate, _SecItemAdd, _SecItemDelete,
+                   _SecKeyCreateRSAPrivateKey, _kSecAttrAccessGroup, _kSecAttrLabel, _kSecClass,
+                   _kSecClassIdentity, _kSecValueRef ]
+...

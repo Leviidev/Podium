@@ -1,0 +1,9 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ armv7-ios ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 173.8
+exports:
+  - targets:     [ armv7-ios ]
+    symbols:     [ _atoi, _sleep, _sync, _syslog, _reboot, dyld_stub_binder ]
+...
