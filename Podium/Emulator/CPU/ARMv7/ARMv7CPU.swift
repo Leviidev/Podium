@@ -66,11 +66,23 @@ final class ARMv7CPU: CPU {
     var cpsr = CPSR()
     var lastError: CPUError?
     var cp15 = CP15State()
-    var neon = NEONRegisters()
+    var neon: NEONRegisters { NEONRegisters(storage: registers.extensionRegisters) }
     /// VFP system registers — see `ARMv7CPU+VFP.swift`. Both reset to 0:
     /// FPEXC.EN clear, so the unit starts disabled, as on real hardware.
-    var fpscr: UInt32 = 0
-    var fpexc: UInt32 = 0
+    /// Kept beside the register file, for translated code.
+    var fpscr: UInt32 {
+        get { registers.fpscr }
+        set { registers.fpscr = newValue }
+    }
+    var fpexc: UInt32 {
+        get { registers.fpexc }
+        set { registers.fpexc = newValue }
+    }
+    /// Reads and writes the host thread's FPCR, when translated code may
+    /// have changed it from the default: `DBTEngine` leaves the thread in
+    /// FPSCR's standard modes, which VFP arithmetic in other modes has to
+    /// switch away from (see `executeVFPDataProcessing`).
+    var hostFPCR: (read: @convention(c) () -> UInt64, write: @convention(c) (UInt64) -> Void)?
 
     /// Addresses `run(maxUnits:)` stops at (before executing the
     /// instruction there), leaving `registers` exactly as they were on
@@ -223,7 +235,10 @@ final class ARMv7CPU: CPU {
     /// event fires at exactly the same instruction boundary as it would
     /// under the interpreter.
     var nextDeviceEventAt: UInt64 = .max
-    weak var deviceEventHandler: DeviceEventHandler?
+    /// Not retained, and not weak either: a weak reference gives its
+    /// object a side table, which sends every retain and release of it
+    /// down Swift's slow path. The platform outlives the CPU's running.
+    unowned(unsafe) var deviceEventHandler: DeviceEventHandler?
 
     /// Brings devices up to date and takes a pending, unmasked interrupt,
     /// if any — once per unit, i.e. between instructions (including inside
@@ -1054,7 +1069,8 @@ final class ARMv7CPU: CPU {
     /// of RAM, when a `DBTEngine` is attached; a store to one invalidates
     /// what was translated from it.
     var codePageBitmap: UnsafeMutablePointer<UInt64>?
-    weak var codeWriteObserver: DBTEngine?
+    /// The engine is `dbt`; not retained twice (see `deviceEventHandler`).
+    unowned(unsafe) var codeWriteObserver: DBTEngine?
 
     @inline(__always)
     func isCodePage(_ physical: UInt32) -> Bool {

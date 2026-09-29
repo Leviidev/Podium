@@ -14,7 +14,7 @@ import Foundation
 final class GuestPageCache {
     private static let entries = 64
 
-    private unowned let cpu: ARMv7CPU
+    private unowned(unsafe) let cpu: ARMv7CPU
     private let readTags = UnsafeMutablePointer<UInt32>.allocate(capacity: entries)
     private let readHosts = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: entries)
     private let writeTags = UnsafeMutablePointer<UInt32>.allocate(capacity: entries)

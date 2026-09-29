@@ -159,7 +159,17 @@ enum ThumbTranslator {
         case .hint(let hint): return hint != .waitForInterrupt
         case .armEquivalent(let arm): return ARMTranslator.isSupportedExclusive(arm)
         case .clearExclusive: return true
-        case .coprocessorRegisterTransfer(let i): return ARMTranslator.isThreadIDRead(i)
+        case .coprocessorRegisterTransfer(let i):
+            return ARMTranslator.isThreadIDRead(i) || ARMTranslator.isCacheMaintenance(i) || VectorTranslator.isSupported(i)
+        case .advancedSIMD(let simd): return VectorTranslator.isSupported(simd.instruction)
+        default: return false
+        }
+    }
+
+    private static func usesVectorUnit(_ instruction: ThumbInstruction) -> Bool {
+        switch instruction {
+        case .coprocessorRegisterTransfer(let i): return i.coprocessor == 10 || i.coprocessor == 11
+        case .advancedSIMD: return true
         default: return false
         }
     }
@@ -205,6 +215,7 @@ enum ThumbTranslator {
         let conditional = condition != .always
         let next = pc &+ UInt32(size)
         e.pcRead = next
+        if usesVectorUnit(instruction) { e.requireVectorUnit(pc: pc, itState: itState) }
         let skip = e.skipUnless(condition)
         var outcome = Outcome.continued
 
@@ -375,7 +386,10 @@ enum ThumbTranslator {
             e.clearExclusive()
 
         case .coprocessorRegisterTransfer(let i):
-            _ = e.readThreadID(i)
+            if !ARMTranslator.isCacheMaintenance(i), !e.readThreadID(i) { VectorTranslator.emit(i, into: &e) }
+
+        case .advancedSIMD(let simd):
+            VectorTranslator.emit(simd.instruction, pc: pc, next: next, itState: itState, thumb: true, into: &e)
 
         case .movWide(let i):
             if i.isTop {

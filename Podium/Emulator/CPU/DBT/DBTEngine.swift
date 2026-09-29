@@ -35,7 +35,10 @@ import Foundation
 /// since the TLB withholds their host address for writes); a store to one
 /// discards everything translated from it.
 final class DBTEngine {
-    unowned let cpu: ARMv7CPU
+    /// Unretained, and without the checks `unowned` makes on every use —
+    /// translated code calls back into the engine for every instruction
+    /// it leaves to the interpreter. The CPU owns the engine.
+    unowned(unsafe) let cpu: ARMv7CPU
     private let region: JITMemory
 
     // MARK: Context shared with generated code
@@ -52,6 +55,10 @@ final class DBTEngine {
         /// ID registers TPIDRURW/TPIDRURO/TPIDRPRW, mirrored from the CPU.
         static let monitorValid = 0x80, monitorAddress = 0x84
         static let threadID = 0x88
+        /// Nonzero while translated VFP/Advanced SIMD code may run: the
+        /// unit is enabled and FPSCR has the standard modes. See
+        /// `BlockEmitter.requireVectorUnit`.
+        static let vectorReady = 0x98
         static let size = 0x100
     }
 
@@ -71,6 +78,13 @@ final class DBTEngine {
     // MARK: Code region layout
 
     private var entryStub: UnsafeRawPointer!
+    private var readFPCR: (@convention(c) () -> UInt64)!
+    private var writeFPCR: (@convention(c) (UInt64) -> Void)!
+
+    /// FPCR/FPSCR mode bits (DN, FZ, RMode) of the Advanced SIMD "standard
+    /// FPSCR value": default NaN, flush to zero, round to nearest.
+    static let standardFPCR: UInt64 = 0x0300_0000
+    static let fpscrModeMask: UInt32 = 0x03C0_0000
     /// Word offsets of the shared stubs in the region.
     private(set) var dispatchWord = 0
     private(set) var exitWord = 0
@@ -103,10 +117,12 @@ final class DBTEngine {
         var interpretedInPlace = 0
         /// 0 deopt or leave after an interpreted instruction, 1 limit,
         /// 2 instruction TLB miss, 3 block table miss.
-        var exitReasons: [Int: Int] = [:]
-        /// Instructions the interpreter ran while translation was on,
-        /// by the reason, keyed by the decoded instruction's case name.
-        var interpretedKinds: [String: Int] = [:]
+        var exitReasons = [0, 0, 0, 0]
+        /// Instructions the interpreter ran while translation was on
+        /// (with `profileInterpreted`), by where they are: the physical
+        /// address, the Thumb bit (bit 32) and why (bits 33...: 0 not
+        /// translated, 1 deopt, 2 in place). See `interpretedKinds()`.
+        var interpretedAt: [UInt64: Int] = [:]
     }
     private(set) var statistics = Statistics()
 
@@ -132,6 +148,7 @@ final class DBTEngine {
                            toByteOffset: Context.interpretHelper, as: UInt64.self)
         cpu.codePageBitmap = codePageBitmap
         cpu.codeWriteObserver = self
+        cpu.hostFPCR = (readFPCR, writeFPCR)
     }
 
     deinit {
@@ -167,6 +184,16 @@ final class DBTEngine {
         a.ldr(w: H.asidTag, H.context, offset: C.asidTag)
         a.ldr(w: 9, H.context, offset: C.nzcv)
         a.msrNZCV(x: 9)
+        // Floating point in the standard modes (see `VectorTranslator`),
+        // left that way for the thread: switching costs more than the
+        // rest of an entry.
+        let modesSet = a.newLabel()
+        a.mrsFPCR(x: 9)
+        a.movz(x: 10, UInt16(Self.standardFPCR >> 16), shift: 16)
+        a.eor(x: 11, 9, 10)
+        a.cbz(x: 11, modesSet)
+        a.msrFPCR(x: 10)
+        a.bind(modesSet)
         a.br(x: 1)
 
         // Dispatch: w0 = guest pc, w1 = Thumb (0/1). Never touches NZCV.
@@ -224,9 +251,19 @@ final class DBTEngine {
         a.ldpPostIndex(x: 29, 30, sp: 96)
         a.ret()
 
+        // For the interpreter (`ARMv7CPU.hostFPCR`).
+        let readFPCRWord = a.position
+        a.mrsFPCR(x: 0)
+        a.ret()
+        let writeFPCRWord = a.position
+        a.msrFPCR(x: 0)
+        a.ret()
+
         let words = a.finalizedWords()
         write(words, at: 0)
         entryStub = UnsafeRawPointer(region.executable)
+        readFPCR = unsafeBitCast(region.executable + readFPCRWord * 4, to: (@convention(c) () -> UInt64).self)
+        writeFPCR = unsafeBitCast(region.executable + writeFPCRWord * 4, to: (@convention(c) (UInt64) -> Void).self)
         runtimeEnd = (words.count * 4 + 63) & ~63
         cursor = runtimeEnd
     }
@@ -279,7 +316,7 @@ final class DBTEngine {
         let thumb = cpu.cpsr.thumbState
         guard !stopAddresses.contains(pc), let code = code(at: pc, thumb: thumb) else {
             if thumb { statistics.notTranslatedThumb += 1 } else { statistics.notTranslatedARM += 1 }
-            if Self.profileInterpreted { noteInterpreted(pc: pc, thumb: thumb) }
+            if Self.profileInterpreted { noteInterpreted(pc: pc, thumb: thumb, reason: 0) }
             return .notTranslated
         }
 
@@ -315,7 +352,7 @@ final class DBTEngine {
         unsafeBitCast(entryStub, to: Entry.self)(context, code)
         statistics.entries += 1
 
-        statistics.exitReasons[Int(context.load(fromByteOffset: C.exitReason, as: UInt32.self)), default: 0] += 1
+        statistics.exitReasons[Int(context.load(fromByteOffset: C.exitReason, as: UInt32.self) & 3)] += 1
         syncOut()
         let nzcv = context.load(fromByteOffset: C.nzcv, as: UInt32.self)
         cpu.cpsr.rawValue = (cpu.cpsr.rawValue & 0x0FFF_FFFF) | (nzcv & 0xF000_0000)
@@ -324,7 +361,7 @@ final class DBTEngine {
         cpu.retiredInstructionCount = context.load(fromByteOffset: C.retired, as: UInt64.self)
         if context.load(fromByteOffset: C.exitDeopt, as: UInt32.self) != 0 {
             statistics.deopts += 1
-            if Self.profileInterpreted { noteInterpreted(pc: cpu.registers.pc, thumb: cpu.cpsr.thumbState, prefix: "deopt ") }
+            if Self.profileInterpreted { noteInterpreted(pc: cpu.registers.pc, thumb: cpu.cpsr.thumbState, reason: 1) }
             return .deopted
         }
         return .ran
@@ -332,14 +369,18 @@ final class DBTEngine {
 
     // MARK: State mirrored in the context
 
-    /// The exclusive monitor and thread ID registers, into the context.
+    /// The exclusive monitor, the thread ID registers and whether vector
+    /// code may run, into the context.
     private func syncIn() {
         let C = Context.self
         context.storeBytes(of: cpu.exclusiveMonitorAddress == nil ? 0 : 1, toByteOffset: C.monitorValid, as: UInt32.self)
         context.storeBytes(of: cpu.exclusiveMonitorAddress ?? 0, toByteOffset: C.monitorAddress, as: UInt32.self)
-        for (index, opc2) in (2...4).enumerated() {
-            context.storeBytes(of: cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 13, crm: 0, opc2: opc2), toByteOffset: C.threadID + index * 4, as: UInt32.self)
-        }
+        let vectorReady = cpu.fpexc & ARMv7CPU.fpexcEnableBit != 0 && cpu.fpscr & Self.fpscrModeMask == UInt32(Self.standardFPCR)
+        context.storeBytes(of: vectorReady ? 1 : 0, toByteOffset: C.vectorReady, as: UInt32.self)
+        let threadIDs = cpu.cp15.threadIDs
+        context.storeBytes(of: threadIDs.0, toByteOffset: C.threadID, as: UInt32.self)
+        context.storeBytes(of: threadIDs.1, toByteOffset: C.threadID + 4, as: UInt32.self)
+        context.storeBytes(of: threadIDs.2, toByteOffset: C.threadID + 8, as: UInt32.self)
     }
 
     /// The exclusive monitor, back to the CPU (translated code never
@@ -374,8 +415,9 @@ final class DBTEngine {
         let stateBefore = cpu.cpsr.rawValue & 0x3F
         let translationBefore = (cpu.cp15.sctlr, cpu.cp15.ttbr0, cpu.cp15.ttbr1, cpu.cp15.ttbcr, cpu.cp15.dacr, cpu.cp15.contextID)
         let tlbGeneration = cpu.tlbGeneration
+        let vectorReadyBefore = context.load(fromByteOffset: C.vectorReady, as: UInt32.self)
         syncOut()
-        if Self.profileInterpreted { noteInterpreted(pc: cpu.registers.pc, thumb: cpu.cpsr.thumbState, prefix: "in place ") }
+        if Self.profileInterpreted { noteInterpreted(pc: cpu.registers.pc, thumb: cpu.cpsr.thumbState, reason: 2) }
         cpu.step()
         syncIn()
         statistics.interpretedInPlace += 1
@@ -392,25 +434,38 @@ final class DBTEngine {
         let translationAfter = (cpu.cp15.sctlr, cpu.cp15.ttbr0, cpu.cp15.ttbr1, cpu.cp15.ttbcr, cpu.cp15.dacr, cpu.cp15.contextID)
         let carryOn = cpu.lastError == nil && cpu.itState == 0 && cpu.cpsr.rawValue & 0x3F == stateBefore
             && cpu.registers.pc == expectedNext && translationBefore == translationAfter && cpu.tlbGeneration == tlbGeneration
-            && !cpu.idleBlocked
+            && !cpu.idleBlocked && context.load(fromByteOffset: C.vectorReady, as: UInt32.self) == vectorReadyBefore
         return carryOn ? 0 : 1
     }
 
     /// Debugging: tally what the interpreter runs instead.
     static var profileInterpreted = false
 
-    private func noteInterpreted(pc: UInt32, thumb: Bool, prefix: String = "") {
-        guard let physical = try? cpu.translatedAddress(pc, access: .execute), let page = ramHost(physical & 0xFFFF_F000) else { return }
-        let offset = Int(physical & 0xFFF)
-        let name: String
-        if thumb {
-            let hw0 = page.loadUnaligned(fromByteOffset: offset, as: UInt16.self)
-            let hw1: UInt16 = offset <= 0xFFC ? page.loadUnaligned(fromByteOffset: offset + 2, as: UInt16.self) : 0
-            name = "T " + String("\(ThumbDecoder.decode(hw0, hw1))".prefix { $0 != "(" })
-        } else {
-            name = "A " + String("\(ARMDecoder.decode(page.loadUnaligned(fromByteOffset: offset & ~3, as: UInt32.self)))".prefix { $0 != "(" })
+    private func noteInterpreted(pc: UInt32, thumb: Bool, reason: UInt64) {
+        guard let physical = try? cpu.translatedAddress(pc, access: .execute) else { return }
+        statistics.interpretedAt[UInt64(physical) | (thumb ? 1 << 32 : 0) | reason << 33, default: 0] += 1
+    }
+
+    /// `statistics.interpretedAt` by the kind of instruction (its decoded
+    /// case name, prefixed with why it was interpreted), decoding each
+    /// address as it is now.
+    func interpretedKinds(_ counts: [UInt64: Int]) -> [String: Int] {
+        var kinds: [String: Int] = [:]
+        for (key, count) in counts {
+            let physical = UInt32(truncatingIfNeeded: key), thumb = key >> 32 & 1 != 0
+            guard let page = ramHost(physical & 0xFFFF_F000) else { continue }
+            let offset = Int(physical & 0xFFF)
+            let name: String
+            if thumb {
+                let hw0 = page.loadUnaligned(fromByteOffset: offset, as: UInt16.self)
+                let hw1: UInt16 = offset <= 0xFFC ? page.loadUnaligned(fromByteOffset: offset + 2, as: UInt16.self) : 0
+                name = "T " + String("\(ThumbDecoder.decode(hw0, hw1))".prefix { $0 != "(" })
+            } else {
+                name = "A " + String("\(ARMDecoder.decode(page.loadUnaligned(fromByteOffset: offset & ~3, as: UInt32.self)))".prefix { $0 != "(" })
+            }
+            kinds[["", "deopt ", "in place "][Int(key >> 33 & 3)] + name, default: 0] += count
         }
-        statistics.interpretedKinds[prefix + name, default: 0] += 1
+        return kinds
     }
 
     /// The translated code for the block at virtual `pc`, translating it

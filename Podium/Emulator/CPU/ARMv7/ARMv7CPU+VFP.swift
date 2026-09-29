@@ -207,11 +207,20 @@ extension ARMv7CPU {
     }
 
     func executeVFPDataProcessing(_ instr: VFPDataProcessingInstruction) {
+        // The host's arithmetic in the guest's modes: FZ and DN are
+        // modeled here too, but not with the host flushing on its own.
+        let modes = UInt64(fpscr & 0x03C0_0000)
+        var savedFPCR: UInt64?
+        if let hostFPCR, modes != DBTEngine.standardFPCR {
+            let current = hostFPCR.read()
+            if current != modes { savedFPCR = current; hostFPCR.write(modes) }
+        }
         if instr.isDouble {
             executeVFPArithmetic(instr, read: readDouble, write: writeDouble)
         } else {
             executeVFPArithmetic(instr, read: readSingle, write: writeSingle)
         }
+        if let savedFPCR { hostFPCR?.write(savedFPCR) }
     }
 
     /// The operations that read and write registers of the instruction's

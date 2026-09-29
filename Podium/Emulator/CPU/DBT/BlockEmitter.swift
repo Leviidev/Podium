@@ -343,6 +343,48 @@ struct BlockEmitter {
         return true
     }
 
+    // MARK: VFP and Advanced SIMD registers
+
+    /// Guest `S`, `D` and `Q` registers at their place beside the core
+    /// ones (see `Registers.extensionOffset`); `v` a host vector register.
+    /// A `Q` operand is named by its first `D` register (even).
+    mutating func loadS(_ v: Int, _ s: Int) { a.ldr(s: v, H.registers, offset: Registers.extensionOffset + 4 * s) }
+    mutating func storeS(_ s: Int, _ v: Int) { a.str(s: v, H.registers, offset: Registers.extensionOffset + 4 * s) }
+    mutating func loadD(_ v: Int, _ d: Int) { a.ldr(d: v, H.registers, offset: Registers.extensionOffset + 8 * d) }
+    mutating func storeD(_ d: Int, _ v: Int) { a.str(d: v, H.registers, offset: Registers.extensionOffset + 8 * d) }
+    mutating func loadVector(_ v: Int, _ d: Int, quad: Bool) {
+        if quad { a.ldr(q: v, H.registers, offset: Registers.extensionOffset + 8 * d) } else { loadD(v, d) }
+    }
+    mutating func storeVector(_ d: Int, _ v: Int, quad: Bool) {
+        if quad { a.str(q: v, H.registers, offset: Registers.extensionOffset + 8 * d) } else { storeD(d, v) }
+    }
+
+    /// Whether this block has checked, before an earlier instruction, that
+    /// translated VFP/Advanced SIMD code may run (see `requireVectorUnit`).
+    private var vectorUnitChecked = false
+
+    /// Before the block's first instruction that uses the VFP/Advanced
+    /// SIMD unit: leaves for the interpreter at `pc` unless the unit is
+    /// enabled and the guest's FPSCR is the standard one translated code
+    /// assumes (`DBTEngine.Context.vectorReady`). Emitted ahead of the
+    /// instruction's condition, so it covers the rest of the block —
+    /// anything that could change either leaves the block first.
+    mutating func requireVectorUnit(pc: UInt32, itState: UInt8) {
+        guard !vectorUnitChecked else { return }
+        vectorUnitChecked = true
+        let leave = deopt(pc: pc, itState: itState)
+        a.ldr(w: 9, H.context, offset: DBTEngine.Context.vectorReady)
+        a.cbz(w: 9, leave)
+    }
+
+    /// A stub that leaves for the interpreter at `pc`, before the
+    /// instruction there, whether or not it's in an IT block.
+    mutating func deopt(pc: UInt32, itState: UInt8) -> Label {
+        let label = a.newLabel()
+        stubs.append(.deopt(label: label, pc: pc, itState: itState, executed: count))
+        return label
+    }
+
     // MARK: Finishing
 
     mutating func finish() -> [UInt32] {

@@ -23,7 +23,7 @@ import Foundation
 /// Before a function is first replaced, its first 32 bytes are compared
 /// with the code it's meant to be — a mismatch leaves the guest's own.
 final class QuartzCoreAcceleration {
-    private unowned let cpu: ARMv7CPU
+    private unowned(unsafe) let cpu: ARMv7CPU
     private let memory: GuestPageCache
 
     private init(cpu: ARMv7CPU) {

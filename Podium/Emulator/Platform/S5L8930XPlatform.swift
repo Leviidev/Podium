@@ -50,7 +50,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
     static let i2c2InterruptLine = 0x15
     private static let aliasBit: UInt32 = 0x8000_0000
 
-    private unowned let cpu: ARMv7CPU
+    private unowned(unsafe) let cpu: ARMv7CPU
     private(set) var interruptController: PL192InterruptController!
     private(set) var timer: S5L8930XTimer!
     let powerManager = S5L8930XPowerManager()
@@ -79,19 +79,19 @@ final class S5L8930XPlatform: DeviceEventHandler {
 
     init(cpu: ARMv7CPU) {
         self.cpu = cpu
-        interruptController = PL192InterruptController { [unowned cpu] irq, fiq in
+        interruptController = PL192InterruptController { [unowned(unsafe) cpu] irq, fiq in
             cpu.irqAsserted = irq
             cpu.fiqAsserted = fiq
         }
         timer = S5L8930XTimer(
-            currentTick: { [unowned cpu] in cpu.virtualTime / Self.instructionsPerTimebaseTick },
+            currentTick: { [unowned(unsafe) cpu] in cpu.virtualTime / Self.instructionsPerTimebaseTick },
             deadlineChanged: { [unowned self] in self.rescheduleNextEvent() },
             setInterruptLine: { [unowned self] asserted in
                 self.interruptController.setLine(S5L8930XTimer.interruptLine, asserted: asserted)
             }
         )
         cdma = S5L8930XCDMA(
-            memory: { [unowned cpu] in cpu.memory },
+            memory: { [unowned(unsafe) cpu] in cpu.memory },
             setInterruptLine: { [unowned self] line, asserted in
                 self.interruptController.setLine(line, asserted: asserted)
             }

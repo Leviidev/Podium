@@ -402,6 +402,186 @@ struct A64Assembler {
         emit(0xA900_0000 | UInt32((offset / 8) & 0x7F) << 15 | UInt32(rt2) << 10 | UInt32(rn) << 5 | UInt32(rt))
     }
 
+    mutating func bic(x rd: Int, _ rn: Int, _ rm: Int) { emit(0x8A20_0000 | UInt32(rm) << 16 | UInt32(rn) << 5 | UInt32(rd)) }
+    mutating func lsr(x rd: Int, _ rn: Int, imm amount: Int) { bitfield64Public(2, rd, rn, immr: amount, imms: 63) }
+
+    // MARK: Floating-point and SIMD registers
+
+    /// Loads and stores of the low 32, 64 or all 128 bits of `v` registers,
+    /// at unsigned scaled offsets.
+    private mutating func loadStoreVector(_ base: UInt32, scale: Int, _ rt: Int, _ rn: Int, offset: Int) {
+        let scaled = offset >> scale
+        precondition(offset >= 0 && scaled << scale == offset && scaled < 4096, "offset \(offset) not encodable")
+        emit(base | UInt32(scaled) << 10 | UInt32(rn) << 5 | UInt32(rt))
+    }
+    mutating func ldr(s rt: Int, _ rn: Int, offset: Int) { loadStoreVector(0xBD40_0000, scale: 2, rt, rn, offset: offset) }
+    mutating func str(s rt: Int, _ rn: Int, offset: Int) { loadStoreVector(0xBD00_0000, scale: 2, rt, rn, offset: offset) }
+    mutating func ldr(d rt: Int, _ rn: Int, offset: Int) { loadStoreVector(0xFD40_0000, scale: 3, rt, rn, offset: offset) }
+    mutating func str(d rt: Int, _ rn: Int, offset: Int) { loadStoreVector(0xFD00_0000, scale: 3, rt, rn, offset: offset) }
+    mutating func ldr(q rt: Int, _ rn: Int, offset: Int) { loadStoreVector(0x3DC0_0000, scale: 4, rt, rn, offset: offset) }
+    mutating func str(q rt: Int, _ rn: Int, offset: Int) { loadStoreVector(0x3D80_0000, scale: 4, rt, rn, offset: offset) }
+
+    /// Register-offset forms: address `xn + xm`.
+    mutating func ldr(d rt: Int, _ rn: Int, _ rm: Int) { emit(0xFC60_6800 | UInt32(rm) << 16 | UInt32(rn) << 5 | UInt32(rt)) }
+    mutating func str(d rt: Int, _ rn: Int, _ rm: Int) { emit(0xFC20_6800 | UInt32(rm) << 16 | UInt32(rn) << 5 | UInt32(rt)) }
+    mutating func ldr(q rt: Int, _ rn: Int, _ rm: Int) { emit(0x3CE0_6800 | UInt32(rm) << 16 | UInt32(rn) << 5 | UInt32(rt)) }
+    mutating func str(q rt: Int, _ rn: Int, _ rm: Int) { emit(0x3CA0_6800 | UInt32(rm) << 16 | UInt32(rn) << 5 | UInt32(rt)) }
+    mutating func ldr(x rt: Int, _ rn: Int, register rm: Int) { loadStoreRegister(size: 3, opc: 1, rt, rn, rm) }
+    mutating func str(x rt: Int, _ rn: Int, register rm: Int) { loadStoreRegister(size: 3, opc: 0, rt, rn, rm) }
+
+    /// Scalar floating point, `double` choosing D over S registers. The
+    /// bases are the encodings with every register field 0.
+    enum FloatOperation: UInt32 {
+        case mul = 0x1E20_0800, div = 0x1E20_1800, add = 0x1E20_2800, sub = 0x1E20_3800
+        case max = 0x1E20_4800, min = 0x1E20_5800, nmul = 0x1E20_8800
+        // One source.
+        case mov = 0x1E20_4000, abs = 0x1E20_C000, neg = 0x1E21_4000, sqrt = 0x1E21_C000
+    }
+    mutating func float(_ op: FloatOperation, double: Bool, _ rd: Int, _ rn: Int, _ rm: Int = 0) {
+        emit(op.rawValue | (double ? 1 << 22 : 0) | UInt32(rm) << 16 | UInt32(rn) << 5 | UInt32(rd))
+    }
+    /// `fcmp` against `rm`, or against +0.0 when nil.
+    mutating func fcmp(double: Bool, _ rn: Int, _ rm: Int?) {
+        emit(0x1E20_2000 | (double ? 1 << 22 : 0) | UInt32(rm ?? 0) << 16 | UInt32(rn) << 5 | (rm == nil ? 8 : 0))
+    }
+    /// `fcvt`: single to double, or double to single.
+    mutating func fcvt(toDouble: Bool, _ rd: Int, _ rn: Int) {
+        emit((toDouble ? 0x1E22_C000 : 0x1E62_4000) | UInt32(rn) << 5 | UInt32(rd))
+    }
+
+    /// Conversions and moves between W/X and S/D registers.
+    enum Conversion: UInt32 {
+        /// Float to 32-bit integer, rounding toward zero (`fcvtz`) or to
+        /// nearest (`fcvtn`); saturating, NaN giving 0.
+        case fcvtzs = 0x1E38_0000, fcvtzu = 0x1E39_0000, fcvtns = 0x1E20_0000, fcvtnu = 0x1E21_0000
+        /// 32-bit integer to float.
+        case scvtf = 0x1E22_0000, ucvtf = 0x1E23_0000
+        /// `fmov wd, sn` and `fmov sd, wn`.
+        case fmovToW = 0x1E26_0000, fmovFromW = 0x1E27_0000
+    }
+    mutating func convert(_ op: Conversion, double: Bool, _ rd: Int, _ rn: Int) {
+        emit(op.rawValue | (double ? 1 << 22 : 0) | UInt32(rn) << 5 | UInt32(rd))
+    }
+    mutating func fmov(d rd: Int, x rn: Int) { emit(0x9E67_0000 | UInt32(rn) << 5 | UInt32(rd)) }
+    mutating func fmov(x rd: Int, d rn: Int) { emit(0x9E66_0000 | UInt32(rn) << 5 | UInt32(rd)) }
+
+    mutating func mrsFPCR(x rt: Int) { emit(0xD53B_4400 | UInt32(rt)) }
+    mutating func msrFPCR(x rt: Int) { emit(0xD51B_4400 | UInt32(rt)) }
+    mutating func mrsFPSR(x rt: Int) { emit(0xD53B_4420 | UInt32(rt)) }
+    mutating func msrFPSR(x rt: Int) { emit(0xD51B_4420 | UInt32(rt)) }
+
+    // MARK: Advanced SIMD
+
+    /// Vector operations by their encoding with Q, size and the registers
+    /// 0: `q` picks the 128-bit arrangement over the 64-bit one, `size`
+    /// the element size (0 bytes ... 3 doublewords) where the operation
+    /// has one. The logical and floating-point ones fix that field
+    /// themselves (it's part of the base).
+    enum VectorOperation: UInt32 {
+        // Three registers of the same type.
+        case add = 0x0E20_8400, sub = 0x2E20_8400, mul = 0x0E20_9C00, pmul = 0x2E20_9C00
+        case mla = 0x0E20_9400, mls = 0x2E20_9400
+        case shadd = 0x0E20_0400, uhadd = 0x2E20_0400, srhadd = 0x0E20_1400, urhadd = 0x2E20_1400
+        case shsub = 0x0E20_2400, uhsub = 0x2E20_2400
+        case cmgt = 0x0E20_3400, cmhi = 0x2E20_3400, cmge = 0x0E20_3C00, cmhs = 0x2E20_3C00
+        case sshl = 0x0E20_4400, ushl = 0x2E20_4400, srshl = 0x0E20_5400, urshl = 0x2E20_5400
+        case smax = 0x0E20_6400, umax = 0x2E20_6400, smin = 0x0E20_6C00, umin = 0x2E20_6C00
+        case sabd = 0x0E20_7400, uabd = 0x2E20_7400, saba = 0x0E20_7C00, uaba = 0x2E20_7C00
+        case cmtst = 0x0E20_8C00, cmeq = 0x2E20_8C00
+        case smaxp = 0x0E20_A400, umaxp = 0x2E20_A400, sminp = 0x0E20_AC00, uminp = 0x2E20_AC00
+        case addp = 0x0E20_BC00
+        case and = 0x0E20_1C00, bic = 0x0E60_1C00, orr = 0x0EA0_1C00, orn = 0x0EE0_1C00
+        case eor = 0x2E20_1C00, bsl = 0x2E60_1C00, bit = 0x2EA0_1C00, bif = 0x2EE0_1C00
+        case fadd = 0x0E20_D400, fsub = 0x0EA0_D400, fmul = 0x2E20_DC00, fabd = 0x2EA0_D400, faddp = 0x2E20_D400
+        case fmax = 0x0E20_F400, fmin = 0x0EA0_F400, fmaxp = 0x2E20_F400, fminp = 0x2EA0_F400
+        case fcmeq = 0x0E20_E400, fcmge = 0x2E20_E400, fcmgt = 0x2EA0_E400, facge = 0x2E20_EC00, facgt = 0x2EA0_EC00
+        // Three registers of different types (long, wide, narrow).
+        case saddl = 0x0E20_0000, uaddl = 0x2E20_0000, saddw = 0x0E20_1000, uaddw = 0x2E20_1000
+        case ssubl = 0x0E20_2000, usubl = 0x2E20_2000, ssubw = 0x0E20_3000, usubw = 0x2E20_3000
+        case addhn = 0x0E20_4000, raddhn = 0x2E20_4000, subhn = 0x0E20_6000, rsubhn = 0x2E20_6000
+        case sabal = 0x0E20_5000, uabal = 0x2E20_5000, sabdl = 0x0E20_7000, uabdl = 0x2E20_7000
+        case smlal = 0x0E20_8000, umlal = 0x2E20_8000, smlsl = 0x0E20_A000, umlsl = 0x2E20_A000
+        case smull = 0x0E20_C000, umull = 0x2E20_C000, pmull = 0x0E20_E000
+        // Permutes.
+        case zip1 = 0x0E00_3800, zip2 = 0x0E00_7800, uzp1 = 0x0E00_1800, uzp2 = 0x0E00_5800
+        case trn1 = 0x0E00_2800, trn2 = 0x0E00_6800
+    }
+    mutating func vector(_ op: VectorOperation, q: Bool, size: Int = 0, _ rd: Int, _ rn: Int, _ rm: Int) {
+        emit(op.rawValue | (q ? 1 << 30 : 0) | UInt32(size) << 22 | UInt32(rm) << 16 | UInt32(rn) << 5 | UInt32(rd))
+    }
+
+    /// Two-register operations, like `VectorOperation`.
+    enum VectorUnaryOperation: UInt32 {
+        case rev64 = 0x0E20_0800, rev32 = 0x2E20_0800, rev16 = 0x0E20_1800
+        case saddlp = 0x0E20_2800, uaddlp = 0x2E20_2800, sadalp = 0x0E20_6800, uadalp = 0x2E20_6800
+        case cls = 0x0E20_4800, clz = 0x2E20_4800, cnt = 0x0E20_5800, not = 0x2E20_5800
+        case cmgt0 = 0x0E20_8800, cmge0 = 0x2E20_8800, cmeq0 = 0x0E20_9800, cmle0 = 0x2E20_9800, cmlt0 = 0x0E20_A800
+        case abs = 0x0E20_B800, neg = 0x2E20_B800, xtn = 0x0E21_2800, shll = 0x2E21_3800
+        case fcmgt0 = 0x0EA0_C800, fcmeq0 = 0x0EA0_D800, fcmlt0 = 0x0EA0_E800, fcmge0 = 0x2EA0_C800, fcmle0 = 0x2EA0_D800
+        case fabs = 0x0EA0_F800, fneg = 0x2EA0_F800
+        case fcvtzs = 0x0EA1_B800, fcvtzu = 0x2EA1_B800, scvtf = 0x0E21_D800, ucvtf = 0x2E21_D800
+    }
+    mutating func vector(_ op: VectorUnaryOperation, q: Bool, size: Int = 0, _ rd: Int, _ rn: Int) {
+        emit(op.rawValue | (q ? 1 << 30 : 0) | UInt32(size) << 22 | UInt32(rn) << 5 | UInt32(rd))
+    }
+
+    /// Shifts by an immediate: `esize` the element size in bits (for the
+    /// narrowing and widening ones, the narrow size), `amount` the shift.
+    enum VectorShift: UInt32 {
+        case sshr = 0x0F00_0400, ushr = 0x2F00_0400, ssra = 0x0F00_1400, usra = 0x2F00_1400
+        case srshr = 0x0F00_2400, urshr = 0x2F00_2400, srsra = 0x0F00_3400, ursra = 0x2F00_3400
+        case sri = 0x2F00_4400, shl = 0x0F00_5400, sli = 0x2F00_5400
+        case shrn = 0x0F00_8400, rshrn = 0x0F00_8C00, sshll = 0x0F00_A400, ushll = 0x2F00_A400
+
+        var isLeft: Bool { self == .shl || self == .sli || self == .sshll || self == .ushll }
+    }
+    mutating func vector(_ op: VectorShift, q: Bool, esize: Int, amount: Int, _ rd: Int, _ rn: Int) {
+        let immhb = op.isLeft ? esize + amount : 2 * esize - amount
+        precondition(immhb >= esize && immhb < 2 * esize, "shift not encodable")
+        emit(op.rawValue | (q ? 1 << 30 : 0) | UInt32(immhb) << 16 | UInt32(rn) << 5 | UInt32(rd))
+    }
+
+    /// Operations by an element of `rm`: 16-bit elements (`size` 1) take
+    /// `rm` 0...15 and `index` 0...7, 32-bit ones (`size` 2) any `rm` and
+    /// `index` 0...3. `fmul` is the single-precision form.
+    enum VectorByElement: UInt32 {
+        case mla = 0x2F00_0000, mls = 0x2F00_4000, mul = 0x0F00_8000
+        case smlal = 0x0F00_2000, umlal = 0x2F00_2000, smlsl = 0x0F00_6000, umlsl = 0x2F00_6000
+        case smull = 0x0F00_A000, umull = 0x2F00_A000, fmul = 0x0F80_9000
+    }
+    mutating func vector(_ op: VectorByElement, q: Bool, size: Int, _ rd: Int, _ rn: Int, _ rm: Int, index: Int) {
+        let h: UInt32, l: UInt32, m: UInt32
+        if size == 1 {
+            precondition(rm < 16 && index < 8)
+            h = UInt32(index >> 2 & 1); l = UInt32(index >> 1 & 1); m = UInt32(index & 1)
+        } else {
+            precondition(index < 4)
+            h = UInt32(index >> 1 & 1); l = UInt32(index & 1); m = UInt32(rm >> 4)
+        }
+        let sizeBits: UInt32 = op == .fmul ? 0 : UInt32(size) << 22
+        emit(op.rawValue | (q ? 1 << 30 : 0) | sizeBits | l << 21 | m << 20 | UInt32(rm & 15) << 16 | h << 11 | UInt32(rn) << 5 | UInt32(rd))
+    }
+
+    /// `ext vd, vn, vm, #index` (bytes).
+    mutating func ext(q: Bool, _ rd: Int, _ rn: Int, _ rm: Int, index: Int) {
+        emit(0x2E00_0000 | (q ? 1 << 30 : 0) | UInt32(rm) << 16 | UInt32(index) << 11 | UInt32(rn) << 5 | UInt32(rd))
+    }
+    /// `tbl`/`tbx vd, {vn...vn+length-1}.16b, vm`.
+    mutating func tbl(q: Bool, extends: Bool, _ rd: Int, _ rn: Int, length: Int, _ rm: Int) {
+        emit(0x0E00_0000 | (q ? 1 << 30 : 0) | UInt32(rm) << 16 | UInt32(length - 1) << 13 | (extends ? 1 << 12 : 0) | UInt32(rn) << 5 | UInt32(rd))
+    }
+    /// `imm5` encodes the element size and index: `index << 1 | 1` for
+    /// bytes, `index << 2 | 2` halfwords, `index << 3 | 4` words, `index << 4 | 8` doublewords.
+    mutating func dup(q: Bool, _ rd: Int, element rn: Int, imm5: Int) {
+        emit(0x0E00_0400 | (q ? 1 << 30 : 0) | UInt32(imm5) << 16 | UInt32(rn) << 5 | UInt32(rd))
+    }
+    mutating func dup(q: Bool, _ rd: Int, general rn: Int, imm5: Int) {
+        emit(0x0E00_0C00 | (q ? 1 << 30 : 0) | UInt32(imm5) << 16 | UInt32(rn) << 5 | UInt32(rd))
+    }
+    /// `add`/`sub dd, dn, dm`: the 64-bit scalar forms.
+    mutating func addScalar(d rd: Int, _ rn: Int, _ rm: Int) { emit(0x5EE0_8400 | UInt32(rm) << 16 | UInt32(rn) << 5 | UInt32(rd)) }
+    mutating func subScalar(d rd: Int, _ rn: Int, _ rm: Int) { emit(0x7EE0_8400 | UInt32(rm) << 16 | UInt32(rn) << 5 | UInt32(rd)) }
+
     // MARK: Branches out of the code being assembled
 
     /// `b` to a word `delta` away from this instruction.

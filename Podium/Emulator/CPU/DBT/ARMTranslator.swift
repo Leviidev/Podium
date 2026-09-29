@@ -61,8 +61,14 @@ enum ARMTranslator {
         case .storeExclusiveDouble(let i): return i.condition
         case .coprocessorRegisterTransfer(let i): return i.condition
         case .hint(let i): return i.condition
-        default: return nil
+        default: return VectorTranslator.condition(of: instruction)
         }
+    }
+
+    /// Whether a translated `instruction` needs `BlockEmitter.requireVectorUnit` first.
+    static func usesVectorUnit(_ instruction: ARMInstruction) -> Bool {
+        if case .coprocessorRegisterTransfer(let i) = instruction { return i.coprocessor == 10 || i.coprocessor == 11 }
+        return VectorTranslator.isSupported(instruction)
     }
 
     /// The exclusives, shared with Thumb-2 (which decodes them to these
@@ -99,6 +105,11 @@ enum ARMTranslator {
         i.isLoad && i.coprocessor == 15 && i.opc1 == 0 && i.crn == 13 && i.crm == 0 && (2...4).contains(i.opc2) && i.rt != 15
     }
 
+    /// `MCR` of a cache maintenance operation: nothing to do.
+    static func isCacheMaintenance(_ i: CoprocessorRegisterTransferInstruction) -> Bool {
+        !i.isLoad && CP15State.isCacheMaintenance(coprocessor: i.coprocessor, opc1: i.opc1, crn: i.crn, crm: i.crm)
+    }
+
     private static func isSupported(_ instruction: ARMInstruction) -> Bool {
         switch instruction {
         case .dataProcessing(let i):
@@ -120,9 +131,9 @@ enum ARMTranslator {
         case .bitFieldExtract(let i): return i.rd != 15 && i.width >= 1 && i.lsb + i.width <= 32
         case .multiply(let i): return i.rd != 15 && i.ra != 15
         case .clz(let i): return i.rd != 15
-        case .coprocessorRegisterTransfer(let i): return isThreadIDRead(i)
+        case .coprocessorRegisterTransfer(let i): return isThreadIDRead(i) || isCacheMaintenance(i) || VectorTranslator.isSupported(i)
         case .hint(let i): return i.hint != .waitForInterrupt
-        default: return isSupportedExclusive(instruction)
+        default: return isSupportedExclusive(instruction) || VectorTranslator.isSupported(instruction)
         }
     }
 
@@ -133,6 +144,7 @@ enum ARMTranslator {
         let next = pc &+ 4
         let operandPC = pc &+ 8
         e.pcRead = next
+        if usesVectorUnit(instruction) { e.requireVectorUnit(pc: pc, itState: 0) }
         let skip = e.skipUnless(condition)
         var outcome = Outcome.continued
 
@@ -179,7 +191,7 @@ enum ARMTranslator {
             emitExclusive(instruction, pc: pc, next: next, itState: 0, into: &e)
 
         case .coprocessorRegisterTransfer(let i):
-            _ = e.readThreadID(i)
+            if !ARMTranslator.isCacheMaintenance(i), !e.readThreadID(i) { VectorTranslator.emit(i, into: &e) }
 
         case .loadStore(let i):
             let slow = e.slowPath(pc: pc, next: next, itState: 0)
@@ -336,7 +348,7 @@ enum ARMTranslator {
             }
 
         default:
-            preconditionFailure("unsupported ARM form reached translation")
+            VectorTranslator.emit(instruction, pc: pc, next: next, itState: 0, thumb: false, into: &e)
         }
 
         let resumes = e.bindResumes()

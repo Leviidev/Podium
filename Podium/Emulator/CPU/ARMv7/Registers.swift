@@ -24,9 +24,37 @@ struct Registers {
     static let lrIndex = 14
     static let spIndex = 13
 
+    /// The same block holds the VFP/Advanced SIMD state after the 16
+    /// words, so translated code reaches all of it from one base
+    /// register: `D0`...`D31` from `extensionOffset` (`Sn` and `Qn` alias
+    /// them, as on the hardware: little-endian halves and pairs), then
+    /// FPSCR and FPEXC.
+    static let extensionOffset = 64
+    static let fpscrOffset = 320
+    static let fpexcOffset = 324
+    private static let byteCount = 384
+
     init() {
-        storage = .allocate(capacity: 16)
-        storage.initialize(repeating: 0, count: 16)
+        let block = UnsafeMutableRawPointer.allocate(byteCount: Self.byteCount, alignment: 64)
+        block.initializeMemory(as: UInt8.self, repeating: 0, count: Self.byteCount)
+        storage = block.bindMemory(to: UInt32.self, capacity: 16)
+        (block + Self.extensionOffset).bindMemory(to: UInt64.self, capacity: 32)
+        (block + Self.fpscrOffset).bindMemory(to: UInt32.self, capacity: 2)
+    }
+
+    /// `D0`...`D31`.
+    var extensionRegisters: UnsafeMutablePointer<UInt64> {
+        (UnsafeMutableRawPointer(storage) + Self.extensionOffset).assumingMemoryBound(to: UInt64.self)
+    }
+
+    var fpscr: UInt32 {
+        get { (UnsafeMutableRawPointer(storage) + Self.fpscrOffset).load(as: UInt32.self) }
+        nonmutating set { (UnsafeMutableRawPointer(storage) + Self.fpscrOffset).storeBytes(of: newValue, as: UInt32.self) }
+    }
+
+    var fpexc: UInt32 {
+        get { (UnsafeMutableRawPointer(storage) + Self.fpexcOffset).load(as: UInt32.self) }
+        nonmutating set { (UnsafeMutableRawPointer(storage) + Self.fpexcOffset).storeBytes(of: newValue, as: UInt32.self) }
     }
 
     subscript(index: Int) -> UInt32 {
@@ -70,7 +98,7 @@ struct Registers {
 
     /// Frees the storage; for the owning CPU's `deinit` only.
     func deallocate() {
-        storage.deallocate()
+        UnsafeMutableRawPointer(storage).deallocate()
     }
 
     /// The register file as a raw pointer, for the old JIT's blocks.
