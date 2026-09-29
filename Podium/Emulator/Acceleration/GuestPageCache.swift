@@ -47,7 +47,10 @@ final class GuestPageCache {
         let base = address & 0xFFFF_F000
         let slot = Int((address >> 12) & UInt32(Self.entries - 1))
         if tags[slot] == base { return hosts[slot] }
-        guard let host = cpu.hostAddress(ofVirtual: base, for: access) else { return nil }
+        // Never a page translated code came from: stores to those have to
+        // go through the CPU, which throws the translations away.
+        guard let physical = try? cpu.translatedAddress(base, access: access), access != .write || !cpu.isCodePage(physical),
+              let host = cpu.hostAddress(ofPhysicalRAM: physical) else { return nil }
         tags[slot] = base
         hosts[slot] = host
         return host
@@ -67,6 +70,21 @@ final class GuestPageCache {
         host.storeBytes(of: value.littleEndian, toByteOffset: Int(address & 0xFFF), as: UInt32.self)
         return true
     }
+
+    /// Where the `count` bytes at `address` are in host memory, when they
+    /// all lie on one page the guest could access that way.
+    @inline(__always)
+    func span(_ address: UInt32, count: Int, access: ARMv7MMU.Access) -> UnsafeMutableRawPointer? {
+        guard Int(address & 0xFFF) + count <= 0x1000 else { return nil }
+        let host = access == .write
+            ? page(address, tags: writeTags, hosts: writeHosts, access: .write)
+            : page(address, tags: readTags, hosts: readHosts, access: access)
+        return host.map { $0 + Int(address & 0xFFF) }
+    }
+
+    /// Words from `address` (aligned) to the end of its page.
+    @inline(__always)
+    static func wordsLeftOnPage(_ address: UInt32) -> Int { Int(0x1000 - (address & 0xFFF)) >> 2 }
 
     /// `count` bytes at `address`, if the guest could read them all.
     func bytes(_ address: UInt32, count: Int, access: ARMv7MMU.Access = .read) -> [UInt8]? {

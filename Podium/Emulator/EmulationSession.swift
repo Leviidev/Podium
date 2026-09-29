@@ -254,6 +254,9 @@ final class EmulationSession {
 
     // MARK: Running
 
+    /// This boot's dyld shared cache slide, once known.
+    private(set) var sharedCacheSlide: UInt32?
+
     private func runLoop() {
         var finalState = State.stopped
         while true {
@@ -275,6 +278,7 @@ final class EmulationSession {
             if cpu.hitBreakpoint == Self.sharedRegionEntry {
                 cpu.breakpoints.remove(Self.sharedRegionEntry)
                 if let arguments = cpu.hostAddress(ofVirtual: cpu.registers[1] &+ 0xC, for: .read) {
+                    sharedCacheSlide = arguments.load(as: UInt32.self)
                     QuartzCoreAcceleration.install(on: cpu, sharedCacheSlide: arguments.load(as: UInt32.self))
                 }
                 continue

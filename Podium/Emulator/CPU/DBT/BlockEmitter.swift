@@ -17,8 +17,14 @@ struct BlockEmitter {
     /// word offsets — branches out of the block are relative to these.
     let startWord: Int
     let dispatchWord: Int
+    let dispatchLinkWord: Int
     let exitWord: Int
     let thumb: Bool
+    /// The block's virtual page: exits to other addresses on it, in the
+    /// same instruction set, can be chained (see `exit(to:thumb:executed:)`).
+    let page: UInt32
+    /// Word offsets, in the region, of this block's link slots.
+    private(set) var linkSlots: [Int] = []
 
     /// Guest instructions emitted so far: while emitting instruction `i`,
     /// `count == i`.
@@ -45,11 +51,13 @@ struct BlockEmitter {
     /// Resume points of this instruction's slow paths, bound after it.
     private var pendingResumes: [Label] = []
 
-    init(startWord: Int, dispatchWord: Int, exitWord: Int, thumb: Bool) {
+    init(startWord: Int, dispatchWord: Int, dispatchLinkWord: Int, exitWord: Int, thumb: Bool, page: UInt32) {
         self.startWord = startWord
         self.dispatchWord = dispatchWord
+        self.dispatchLinkWord = dispatchLinkWord
         self.exitWord = exitWord
         self.thumb = thumb
+        self.page = page
     }
 
     private mutating func branch(toWord word: Int) {
@@ -187,10 +195,36 @@ struct BlockEmitter {
 
     /// Continues at `pc` once this instruction (included) has run.
     mutating func jump(to pc: UInt32, thumb: Bool) {
-        a.add(x: H.retired, H.retired, imm: UInt32(count + 1))
+        exit(to: pc, thumb: thumb, executed: count + 1)
+    }
+
+    /// Leaves for a known guest address with `executed` instructions of
+    /// the block run. On the block's own page and in its instruction set,
+    /// through a link slot: a branch that goes on to the dispatcher until
+    /// `DBTEngine.link` points it at the translation there, so the jump
+    /// then costs a limit check (for device events and interrupts) rather
+    /// than a lookup. Elsewhere the mapping could change without this
+    /// block knowing, so those always go through the dispatcher.
+    private mutating func exit(to pc: UInt32, thumb: Bool, executed: Int) {
+        if executed > 0 { a.add(x: H.retired, H.retired, imm: UInt32(executed)) }
+        guard pc & 0xFFFF_F000 == page, thumb == self.thumb else {
+            a.mov(w: 0, pc)
+            a.mov(w: 1, thumb ? 1 : 0)
+            branch(toWord: dispatchWord)
+            return
+        }
+        let unlinked = a.newLabel()
+        a.sub(x: 9, H.limit, H.retired)
+        a.cbz(x: 9, unlinked)
+        a.tbnz(9, bit: 63, unlinked)
+        let slot = startWord + a.position
+        linkSlots.append(slot)
+        a.b(unlinked) // the link slot: to the next instruction until linked
+        a.bind(unlinked)
         a.mov(w: 0, pc)
         a.mov(w: 1, thumb ? 1 : 0)
-        branch(toWord: dispatchWord)
+        a.mov(w: 2, UInt32(slot))
+        branch(toWord: dispatchLinkWord)
     }
 
     /// Like `jump(to:thumb:)`, from an out-of-line stub; for a branch
@@ -211,10 +245,7 @@ struct BlockEmitter {
     /// Ends the block before instruction `count` (at `pc`): the block's
     /// work so far is done, and the dispatcher takes it from `pc`.
     mutating func fallThrough(to pc: UInt32, thumb: Bool) {
-        if count > 0 { a.add(x: H.retired, H.retired, imm: UInt32(count)) }
-        a.mov(w: 0, pc)
-        a.mov(w: 1, thumb ? 1 : 0)
-        branch(toWord: dispatchWord)
+        exit(to: pc, thumb: thumb, executed: count)
     }
 
     // MARK: Memory
@@ -416,10 +447,7 @@ struct BlockEmitter {
                 branch(toWord: exitWord)
             case .jump(let label, let pc, let thumb, let executed):
                 a.bind(label)
-                a.add(x: H.retired, H.retired, imm: UInt32(executed))
-                a.mov(w: 0, pc)
-                a.mov(w: 1, thumb ? 1 : 0)
-                branch(toWord: dispatchWord)
+                exit(to: pc, thumb: thumb, executed: executed)
             }
         }
         return a.finalizedWords()

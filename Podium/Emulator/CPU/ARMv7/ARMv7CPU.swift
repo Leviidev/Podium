@@ -942,7 +942,7 @@ final class ARMv7CPU: CPU {
         let asidMix = asid &* 0x9E37_79B1 // Knuth multiplicative hash constant
         let pageIndex = ((virtualAddress >> 12) ^ (asidMix >> 20)) & UInt32(Self.tlbEntries - 1)
         let slot = (kind + (user ? 1 : 0)) &* Self.tlbEntries &+ Int(pageIndex)
-        let tag = (virtualAddress & 0xFFFF_F000) | (asid << 1) | 1
+        let tag = (virtualAddress & 0xFFFF_F000) | tlbTagContext
         if tlbTags[slot] == tag {
             return tlbPages[slot] | (virtualAddress & 0xFFF)
         }
@@ -962,14 +962,14 @@ final class ARMv7CPU: CPU {
     /// cached per 4 KB virtual page, per access kind (read/write/execute),
     /// privilege and ASID; faults are never cached. It follows real
     /// hardware's contract — the guest must invalidate (CP15 c8) after
-    /// changing a valid mapping — and is emptied whenever SCTLR, TTBR1,
-    /// TTBCR or DACR change.
+    /// changing a valid mapping — and is emptied whenever SCTLR, TTBR1 or
+    /// DACR change.
     ///
-    /// TTBR0 and CONTEXTIDR are deliberately *not* on that list, even
-    /// though they change on every context switch (a new address space
-    /// means a new page table base and a new ASID) — unlike the others,
-    /// entries are tagged with the ASID they were created under (see
-    /// `translatedAddress`), so switching back to a process whose
+    /// TTBR0, TTBCR and CONTEXTIDR are deliberately *not* on that list,
+    /// even though they change on context switches (a new address space
+    /// means a new page table base, a new ASID, perhaps a new split) —
+    /// unlike the others, entries are tagged with the ASID and TTBCR.N
+    /// they were created under (see `tlbTagContext`), so switching back to a process whose
     /// mappings are still cached is a hit, not a guaranteed re-walk. Real
     /// ARM MMUs work the same way for the same reason: without ASID
     /// tagging, ordinary multitasking would thrash a TLB flushed on every
@@ -990,11 +990,31 @@ final class ARMv7CPU: CPU {
     /// invalidates the code). What `DBTEngine`'s loads and stores use.
     let tlbHosts = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 6 * tlbEntries)
 
-    /// Counts TLB flushes, for translated code that has to notice one.
+    /// The low 12 bits of a TLB tag: valid (bit 0), the ASID (bits 8:1)
+    /// and TTBCR.N (bits 11:9). N picks which table translates the
+    /// addresses between the two splits it chooses from, and XNU changes
+    /// it on context switches between processes with different address
+    /// space sizes (over a thousand times a second while the UI
+    /// animates); with it in the tag those switches need no flush, like
+    /// ASID changes.
+    var tlbTagContext: UInt32 {
+        (cp15.ttbcr & 7) << 9 | (cp15.contextID & 0xFF) << 1 | 1
+    }
+
+    /// Counts TLB flushes and invalidations, for translated code that has
+    /// to notice one.
     private(set) var tlbGeneration = 0
+    /// Counts just the full flushes.
+    private(set) var tlbFlushes = 0
+
+    /// Debugging: count full flushes by the instruction that caused them.
+    static var recordFlushSources = false
+    private(set) var flushSources: [UInt32: Int] = [:]
 
     func flushTLB() {
         tlbGeneration &+= 1
+        tlbFlushes &+= 1
+        if Self.recordFlushSources { flushSources[currentInstructionAddress, default: 0] += 1 }
         tlbTags.initialize(repeating: 0, count: 6 * Self.tlbEntries)
         instructionCache.forgetPage()
     }
@@ -1005,7 +1025,7 @@ final class ARMv7CPU: CPU {
     /// What a fetch page's translation depended on besides its address.
     private var fetchContext: UInt32 {
         guard mmuEnabled else { return 0 }
-        return 1 | (cpsr.rawValue & Self.modeBitsMask == Self.userModeBits ? 2 : 0) | (cp15.contextID & 0xFF) << 8
+        return 1 | (cpsr.rawValue & Self.modeBitsMask == Self.userModeBits ? 2 : 0) | (cp15.contextID & 0xFF) << 8 | (cp15.ttbcr & 7) << 16
     }
 
     /// Where the instruction at virtual `address` is: its physical
@@ -1023,11 +1043,50 @@ final class ARMv7CPU: CPU {
     }
 
     /// CP15 writes that change translation and need a full flush: SCTLR
-    /// (c1), TTBR1/TTBCR (c2, opc2 1/2 — not opc2 0, TTBR0, which the ASID
-    /// tag already handles), DACR (c3), the TLB maintenance operations
-    /// (c8). CONTEXTIDR (c13, opc2 1) isn't here for the same reason.
+    /// (c1), TTBR1 (c2, opc2 1), DACR (c3). Not TTBR0 or TTBCR (c2, opc2 0
+    /// and 2) or CONTEXTIDR (c13, opc2 1), which `tlbTagContext` already
+    /// covers; the TLB maintenance operations (c8) go through `maintainTLB`.
     private static func cp15WriteAffectsTranslation(crn: Int, opc2: Int) -> Bool {
-        crn == 1 || crn == 3 || crn == 8 || (crn == 2 && opc2 != 0)
+        crn == 1 || crn == 3 || (crn == 2 && opc2 == 1)
+    }
+
+    /// A TLB maintenance operation (c8; the inner-shareable, instruction,
+    /// data and unified forms alike), by what it names: a page (`opc2` 1,
+    /// by MVA and ASID, or 3, by MVA for every ASID), an ASID (2), or
+    /// everything (0). XNU invalidates pages as it changes mappings —
+    /// over a thousand times a second while the UI animates — and
+    /// flushing the whole TLB for each cost every later access a walk.
+    ///
+    /// Entries aren't marked global: a global page is cached once per
+    /// ASID it was used under, each tagged with that ASID. So the page
+    /// operations drop the page for every ASID, and the ASID one drops
+    /// global pages cached under it too — more than asked, never less.
+    private func maintainTLB(opc2: Int, value: UInt32) {
+        switch opc2 {
+        case 1, 3: invalidateTLB(page: value & 0xFFFF_F000)
+        case 2: invalidateTLB(asid: value & 0xFF)
+        default: flushTLB()
+        }
+    }
+
+    private func invalidateTLB(page: UInt32) {
+        tlbGeneration &+= 1
+        let virtualPage = page >> 12
+        for asid in UInt32(0)..<256 {
+            // `translatedAddress`'s slot for this page under `asid`.
+            let index = Int((virtualPage ^ ((asid &* 0x9E37_79B1) >> 20)) & UInt32(Self.tlbEntries - 1))
+            for bank in 0..<6 where tlbTags[bank * Self.tlbEntries + index] & 0xFFFF_F000 == page {
+                tlbTags[bank * Self.tlbEntries + index] = 0
+            }
+        }
+        instructionCache.forgetPage()
+    }
+
+    private func invalidateTLB(asid: UInt32) {
+        tlbGeneration &+= 1
+        let tag = asid << 1 | 1
+        for slot in 0..<(6 * Self.tlbEntries) where tlbTags[slot] & 0x1FF == tag { tlbTags[slot] = 0 }
+        instructionCache.forgetPage()
     }
 
     // MARK: - Guest RAM fast path
@@ -1482,7 +1541,9 @@ final class ARMv7CPU: CPU {
             }
 
             cp15.write(coprocessor: instr.coprocessor, opc1: instr.opc1, crn: instr.crn, crm: instr.crm, opc2: instr.opc2, value: value)
-            if instr.coprocessor == 15, Self.cp15WriteAffectsTranslation(crn: instr.crn, opc2: instr.opc2) {
+            if instr.coprocessor == 15, instr.opc1 == 0, instr.crn == 8 {
+                maintainTLB(opc2: instr.opc2, value: value)
+            } else if instr.coprocessor == 15, Self.cp15WriteAffectsTranslation(crn: instr.crn, opc2: instr.opc2) {
                 flushTLB()
             }
         }

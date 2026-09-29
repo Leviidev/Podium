@@ -155,6 +155,20 @@ final class QuartzCoreAcceleration {
         guard count != 0 else { return true }
         guard var s = sampler() else { return false }
         let alpha: UInt32 = opaque ? 0xFF00_0000 : 0
+
+        // Most spans are a row of the image at its own size: a copy.
+        let lastX = Int64(Int32(bitPattern: s.x)) + Int64(count - 1) * 0x10000
+        if s.dy == 0, s.dx == 0x10000, Int32(bitPattern: s.x) >= 0, lastX < Int64(Int32(bitPattern: s.maxX)) {
+            let source = s.pixels &+ Self.integer(Self.clamp(s.y, s.maxY)) &* s.rowBytes &+ (Self.integer(s.x) << 2)
+            if (source | destination) & 3 == 0 {
+                return runs(count: Int(count), destination: destination, sources: source, nil) { d, a, _, n in
+                    for i in 0..<n {
+                        d.storeBytes(of: a.load(fromByteOffset: i * 4, as: UInt32.self) | alpha, toByteOffset: i * 4, as: UInt32.self)
+                    }
+                }
+            }
+        }
+
         while count != 0 {
             let row = Self.integer(Self.clamp(s.y, s.maxY)) &* s.rowBytes
             let column = Self.integer(Self.clamp(s.x, s.maxX)) << 2
@@ -170,18 +184,46 @@ final class QuartzCoreAcceleration {
     /// `(destination, below, above, count)`: premultiplied `above` over
     /// `below`, pixel by pixel: `above + below * (256 - above's alpha) / 256`.
     private func sourceOverSpan() -> Bool {
-        var destination = cpu.registers[0], below = cpu.registers[1], above = cpu.registers[2]
-        var count = cpu.registers[3]
-        while count != 0 {
-            guard let top = memory.read32(above), let bottom = memory.read32(below) else { return false }
-            let weight = 256 &- (top >> 24)
-            let low = (Self.uxtb16(bottom) &* weight) >> 8 & 0x00FF_00FF
-            let high = (Self.uxtb16ror8(bottom) &* weight) & ~0x00FF_00FF
-            guard memory.write32(top &+ (low | high), at: destination) else { return false }
-            destination &+= 4
-            below &+= 4
-            above &+= 4
-            count &-= 1
+        let destination = cpu.registers[0], below = cpu.registers[1], above = cpu.registers[2]
+        let count = Int(cpu.registers[3])
+        guard (destination | below | above) & 3 == 0 else { return false }
+        return runs(count: count, destination: destination, sources: below, above) { d, b, a, n in
+            for i in 0..<n {
+                let top = a!.load(fromByteOffset: i * 4, as: UInt32.self)
+                let bottom = b.load(fromByteOffset: i * 4, as: UInt32.self)
+                let weight = 256 &- (top >> 24)
+                let low = (Self.uxtb16(bottom) &* weight) >> 8 & 0x00FF_00FF
+                let high = (Self.uxtb16ror8(bottom) &* weight) & ~0x00FF_00FF
+                d.storeBytes(of: top &+ (low | high), toByteOffset: i * 4, as: UInt32.self)
+            }
+        }
+    }
+
+    /// `count` words at `destination` and at one or two sources, in runs
+    /// that stay on one page for all of them: `body(destination, first,
+    /// second, words)` for each. Every page is checked before the first
+    /// run — a call handed back to the guest is redone from the start, so
+    /// it mustn't have written anything (a blend's destination is often
+    /// one of its sources).
+    private func runs(count: Int, destination: UInt32, sources first: UInt32, _ second: UInt32?,
+                      _ body: (UnsafeMutableRawPointer, UnsafeMutableRawPointer, UnsafeMutableRawPointer?, Int) -> Void) -> Bool {
+        for writing in [false, true] {
+            var d = destination, a = first, b = second ?? 0, left = count
+            while left > 0 {
+                var n = min(left, GuestPageCache.wordsLeftOnPage(d), GuestPageCache.wordsLeftOnPage(a))
+                if second != nil { n = min(n, GuestPageCache.wordsLeftOnPage(b)) }
+                guard let dp = memory.span(d, count: n * 4, access: .write), let ap = memory.span(a, count: n * 4, access: .read) else { return false }
+                var bp: UnsafeMutableRawPointer?
+                if second != nil {
+                    guard let host = memory.span(b, count: n * 4, access: .read) else { return false }
+                    bp = host
+                }
+                if writing { body(dp, ap, bp, n) }
+                d &+= UInt32(n * 4)
+                a &+= UInt32(n * 4)
+                b &+= UInt32(n * 4)
+                left -= n
+            }
         }
         return true
     }

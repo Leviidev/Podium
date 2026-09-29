@@ -59,6 +59,9 @@ final class DBTEngine {
         /// unit is enabled and FPSCR has the standard modes. See
         /// `BlockEmitter.requireVectorUnit`.
         static let vectorReady = 0x98
+        /// A link request (exit reason 4): the slot's word offset, the
+        /// block found for it and that block's key.
+        static let linkSlot = 0x9C, linkTarget = 0xA0, linkKey = 0xA8
         static let size = 0x100
     }
 
@@ -87,6 +90,7 @@ final class DBTEngine {
     static let fpscrModeMask: UInt32 = 0x03C0_0000
     /// Word offsets of the shared stubs in the region.
     private(set) var dispatchWord = 0
+    private(set) var dispatchLinkWord = 0
     private(set) var exitWord = 0
     private var runtimeEnd = 0
     /// Bytes of the region in use.
@@ -101,6 +105,10 @@ final class DBTEngine {
     /// page.
     private var keysByPage: [UInt32: [UInt64]] = [:]
     private var keysByVirtualPage: [UInt32: [UInt64]] = [:]
+    /// Chaining: which block each link slot (by word offset) belongs to,
+    /// and the slots pointed at each block — put back when it's discarded.
+    private var slotOwners: [Int: UInt64] = [:]
+    private var linksInto: [UInt64: [Int]] = [:]
     private let codePageBitmap: UnsafeMutablePointer<UInt64>
     private let ramBase: UInt32
     private let ramPages: Int
@@ -116,8 +124,10 @@ final class DBTEngine {
         var deopts = 0
         var interpretedInPlace = 0
         /// 0 deopt or leave after an interpreted instruction, 1 limit,
-        /// 2 instruction TLB miss, 3 block table miss.
-        var exitReasons = [0, 0, 0, 0]
+        /// 2 instruction TLB miss, 3 block table miss, 4 link request.
+        var exitReasons = [0, 0, 0, 0, 0]
+        var links = 0
+        var unlinks = 0
         /// Instructions the interpreter ran while translation was on
         /// (with `profileInterpreted`), by where they are: the physical
         /// address, the Thumb bit (bit 32) and why (bits 33...: 0 not
@@ -197,40 +207,56 @@ final class DBTEngine {
         a.br(x: 1)
 
         // Dispatch: w0 = guest pc, w1 = Thumb (0/1). Never touches NZCV.
-        dispatchWord = a.position
+        // The linking dispatcher (from an exit that can be chained, with
+        // its link slot's word offset in w2) finds the block the same way,
+        // then leaves to have the slot patched to it (see `link`).
         let exit = a.newLabel()
-        let exitLimit = a.newLabel(), exitTLB = a.newLabel(), exitTable = a.newLabel()
-        a.str(w: 0, H.registers, offset: 15 * 4)
-        a.str(w: 1, H.context, offset: C.thumb)
-        a.str(w: 31, H.context, offset: C.exitITState)
-        a.str(w: 31, H.context, offset: C.exitDeopt)
-        a.sub(x: 9, H.limit, H.retired)
-        a.cbz(x: 9, exitLimit)
-        a.tbnz(9, bit: 63, exitLimit)
-        a.lsr(w: 9, 0, 12)
-        a.eor(w: 9, 9, H.asidMix)
-        a.and(w: 9, 9, imm: UInt32(ARMv7CPU.tlbEntries - 1), scratch: 15)
-        a.ldr(x: 10, H.context, offset: C.executeTags)
-        a.ldr(w: 11, 10, index: 9)
-        a.and(w: 12, 0, imm: 0xFFFF_F000, scratch: 15)
-        a.orr(w: 12, 12, H.asidTag)
-        a.eor(w: 11, 11, 12)
-        a.cbnz(w: 11, exitTLB)
-        a.ldr(x: 10, H.context, offset: C.executePages)
-        a.ldr(w: 11, 10, index: 9)
-        a.orr(w: 11, 11, imm: 1, scratch: 15)
-        a.orr(w: 12, 0, 1)
-        a.eor(w: 13, 12, 12, .lsr, 15)
-        a.and(w: 13, 13, imm: UInt32(Self.tableEntries - 1), scratch: 15)
-        a.ldr(x: 10, H.context, offset: C.table)
-        a.add(x: 10, 10, 13, lsl: 4)
-        a.ldr(x: 14, 10, offset: 0)
-        a.orr(x: 12, 12, 11, lsl: 32)
-        a.eor(x: 14, 14, 12)
-        a.cbnz(x: 14, exitTable)
-        a.ldr(x: 14, 10, offset: 8)
-        a.br(x: 14)
-        for (label, reason) in [(exitLimit, 1), (exitTLB, 2), (exitTable, 3)] {
+        let exitLimit = a.newLabel(), exitTLB = a.newLabel(), exitTable = a.newLabel(), exitLink = a.newLabel()
+        for linking in [false, true] {
+            if linking {
+                dispatchLinkWord = a.position
+                a.str(w: 2, H.context, offset: C.linkSlot)
+            } else {
+                dispatchWord = a.position
+            }
+            a.str(w: 0, H.registers, offset: 15 * 4)
+            a.str(w: 1, H.context, offset: C.thumb)
+            a.str(w: 31, H.context, offset: C.exitITState)
+            a.str(w: 31, H.context, offset: C.exitDeopt)
+            a.sub(x: 9, H.limit, H.retired)
+            a.cbz(x: 9, exitLimit)
+            a.tbnz(9, bit: 63, exitLimit)
+            a.lsr(w: 9, 0, 12)
+            a.eor(w: 9, 9, H.asidMix)
+            a.and(w: 9, 9, imm: UInt32(ARMv7CPU.tlbEntries - 1), scratch: 15)
+            a.ldr(x: 10, H.context, offset: C.executeTags)
+            a.ldr(w: 11, 10, index: 9)
+            a.and(w: 12, 0, imm: 0xFFFF_F000, scratch: 15)
+            a.orr(w: 12, 12, H.asidTag)
+            a.eor(w: 11, 11, 12)
+            a.cbnz(w: 11, exitTLB)
+            a.ldr(x: 10, H.context, offset: C.executePages)
+            a.ldr(w: 11, 10, index: 9)
+            a.orr(w: 11, 11, imm: 1, scratch: 15)
+            a.orr(w: 12, 0, 1)
+            a.eor(w: 13, 12, 12, .lsr, 15)
+            a.and(w: 13, 13, imm: UInt32(Self.tableEntries - 1), scratch: 15)
+            a.ldr(x: 10, H.context, offset: C.table)
+            a.add(x: 10, 10, 13, lsl: 4)
+            a.ldr(x: 14, 10, offset: 0)
+            a.orr(x: 12, 12, 11, lsl: 32)
+            a.eor(x: 14, 14, 12)
+            a.cbnz(x: 14, exitTable)
+            a.ldr(x: 14, 10, offset: 8)
+            if linking {
+                a.str(x: 14, H.context, offset: C.linkTarget)
+                a.str(x: 12, H.context, offset: C.linkKey)
+                a.b(exitLink)
+            } else {
+                a.br(x: 14)
+            }
+        }
+        for (label, reason) in [(exitLimit, 1), (exitTLB, 2), (exitTable, 3), (exitLink, 4)] {
             a.bind(label)
             a.mov(w: 9, UInt32(reason))
             a.str(w: 9, H.context, offset: C.exitReason)
@@ -341,7 +367,7 @@ final class DBTEngine {
         context.storeBytes(of: tags(4), toByteOffset: C.executeTags, as: UInt64.self)
         context.storeBytes(of: UInt64(UInt(bitPattern: cpu.tlbPages + (4 + privilege) * bank)), toByteOffset: C.executePages, as: UInt64.self)
         context.storeBytes(of: (asid &* 0x9E37_79B1) >> 20, toByteOffset: C.asidMix, as: UInt32.self)
-        context.storeBytes(of: asid << 1 | 1, toByteOffset: C.asidTag, as: UInt32.self)
+        context.storeBytes(of: cpu.tlbTagContext, toByteOffset: C.asidTag, as: UInt32.self)
         context.storeBytes(of: UInt64(UInt(bitPattern: table)), toByteOffset: C.table, as: UInt64.self)
         syncIn()
         context.storeBytes(of: 0, toByteOffset: C.exitITState, as: UInt32.self)
@@ -352,7 +378,13 @@ final class DBTEngine {
         unsafeBitCast(entryStub, to: Entry.self)(context, code)
         statistics.entries += 1
 
-        statistics.exitReasons[Int(context.load(fromByteOffset: C.exitReason, as: UInt32.self) & 3)] += 1
+        let reason = Int(context.load(fromByteOffset: C.exitReason, as: UInt32.self))
+        statistics.exitReasons[min(reason, 4)] += 1
+        if reason == 4 {
+            link(slot: Int(context.load(fromByteOffset: C.linkSlot, as: UInt32.self)),
+                 to: UnsafeRawPointer(bitPattern: UInt(context.load(fromByteOffset: C.linkTarget, as: UInt64.self)))!,
+                 key: context.load(fromByteOffset: C.linkKey, as: UInt64.self))
+        }
         syncOut()
         let nzcv = context.load(fromByteOffset: C.nzcv, as: UInt32.self)
         cpu.cpsr.rawValue = (cpu.cpsr.rawValue & 0x0FFF_FFFF) | (nzcv & 0xF000_0000)
@@ -438,6 +470,28 @@ final class DBTEngine {
         return carryOn ? 0 : 1
     }
 
+    /// Debugging: the host code a block at `virtual` would get, without
+    /// installing it (placed as if at the region's start).
+    func inspectTranslation(virtual: UInt32, thumb: Bool) -> (words: [UInt32], guestInstructions: Int)? {
+        guard let physical = try? cpu.translatedAddress(virtual, access: .execute), let pageHost = ramHost(physical & 0xFFFF_F000) else { return nil }
+        var emitter = BlockEmitter(startWord: runtimeEnd / 4, dispatchWord: dispatchWord, dispatchLinkWord: dispatchLinkWord,
+                                   exitWord: exitWord, thumb: thumb, page: virtual & 0xFFFF_F000)
+        let count = thumb ? ThumbTranslator.translate(into: &emitter, virtual: virtual, page: UnsafeRawPointer(pageHost), stopAddresses: [])
+            : ARMTranslator.translate(into: &emitter, virtual: virtual, page: UnsafeRawPointer(pageHost), stopAddresses: [])
+        return count > 0 ? (emitter.finish(), count) : nil
+    }
+
+    /// Debugging: every block translated since the last flush, as (region
+    /// offset, byte length, guest address with the Thumb bit).
+    static var recordBlocks = false
+    private(set) var blockRecords: [(offset: Int, length: Int, guest: UInt32)] = []
+
+    /// Debugging: the code region as it stands — its address and the
+    /// bytes in use — for matching host samples to translated code.
+    func regionContents() -> (address: UInt, bytes: Data) {
+        (UInt(bitPattern: region.executable), Data(bytes: region.executable, count: cursor))
+    }
+
     /// Debugging: tally what the interpreter runs instead.
     static var profileInterpreted = false
 
@@ -487,10 +541,12 @@ final class DBTEngine {
             translations[key] = .some(nil)
             return nil
         }
-        let code = translate(virtual: pc, physical: physical, thumb: thumb, page: UnsafeRawPointer(pageHost))
+        let translation = translate(virtual: pc, physical: physical, thumb: thumb, page: UnsafeRawPointer(pageHost))
+        let code = translation?.code
         translations[key] = code
         keysByPage[page, default: []].append(key)
         keysByVirtualPage[pc & 0xFFFF_F000, default: []].append(key)
+        for slot in translation?.linkSlots ?? [] { slotOwners[slot] = key }
         if let code { install(key, code: code) }
         return code
     }
@@ -504,10 +560,11 @@ final class DBTEngine {
     static var translationLimit = Int.max
     static var reportTranslation: ((UInt32, Bool, Int) -> Void)?
 
-    private func translate(virtual: UInt32, physical: UInt32, thumb: Bool, page: UnsafeRawPointer) -> UnsafeRawPointer? {
+    private func translate(virtual: UInt32, physical: UInt32, thumb: Bool, page: UnsafeRawPointer) -> (code: UnsafeRawPointer, linkSlots: [Int])? {
         guard statistics.blocksTranslated < Self.translationLimit else { return nil }
         let startWord = cursor / 4
-        var emitter = BlockEmitter(startWord: startWord, dispatchWord: dispatchWord, exitWord: exitWord, thumb: thumb)
+        var emitter = BlockEmitter(startWord: startWord, dispatchWord: dispatchWord, dispatchLinkWord: dispatchLinkWord,
+                                   exitWord: exitWord, thumb: thumb, page: virtual & 0xFFFF_F000)
         let translated: Int
         if thumb {
             translated = ThumbTranslator.translate(into: &emitter, virtual: virtual, page: page, stopAddresses: stopAddresses)
@@ -527,7 +584,35 @@ final class DBTEngine {
         statistics.blocksTranslated += 1
         statistics.guestInstructionsTranslated += translated
         Self.reportTranslation?(virtual, thumb, translated)
-        return code
+        if Self.recordBlocks { blockRecords.append((code - UnsafeRawPointer(region.executable), words.count * 4, virtual | (thumb ? 1 : 0))) }
+        return (code, emitter.linkSlots)
+    }
+
+    // MARK: Chaining
+
+    /// A link request: the block whose slot is `slot` jumped to `code`,
+    /// the translation for `key`, through the dispatcher. From now on the
+    /// slot branches there directly — unless either block has been
+    /// discarded meanwhile.
+    private func link(slot: Int, to code: UnsafeRawPointer, key: UInt64) {
+        guard let owner = slotOwners[slot], translations[owner] != nil,
+              let known = translations[key], known == code else { return }
+        let delta = (code - UnsafeRawPointer(region.executable)) / 4 - slot
+        write([0x1400_0000 | UInt32(truncatingIfNeeded: delta) & 0x03FF_FFFF], at: slot * 4)
+        linksInto[key, default: []].append(slot)
+        statistics.links += 1
+    }
+
+    /// Forgets the translation for `key`, pointing the slots linked to it
+    /// back at the dispatcher.
+    private func discard(_ key: UInt64) {
+        uninstall(key)
+        translations[key] = nil
+        for slot in linksInto.removeValue(forKey: key) ?? [] {
+            // `b` to the next instruction: the slot's unlinked path.
+            write([0x1400_0001], at: slot * 4)
+            statistics.unlinks += 1
+        }
     }
 
     // MARK: Invalidation
@@ -546,10 +631,7 @@ final class DBTEngine {
         let index = Int((page &- ramBase) >> 12)
         guard index >= 0, index < ramPages else { return }
         codePageBitmap[index >> 6] &= ~(UInt64(1) << UInt64(index & 63))
-        for key in keysByPage.removeValue(forKey: page) ?? [] {
-            uninstall(key)
-            translations[key] = nil
-        }
+        for key in keysByPage.removeValue(forKey: page) ?? [] { discard(key) }
         cpu.restoreWriteHosts(forPhysicalPage: page)
         statistics.pagesInvalidated += 1
     }
@@ -561,6 +643,9 @@ final class DBTEngine {
         translations.removeAll(keepingCapacity: true)
         keysByPage.removeAll(keepingCapacity: true)
         keysByVirtualPage.removeAll(keepingCapacity: true)
+        slotOwners.removeAll(keepingCapacity: true)
+        linksInto.removeAll(keepingCapacity: true)
+        blockRecords.removeAll(keepingCapacity: true)
         codePageBitmap.update(repeating: 0, count: (ramPages + 63) / 64)
         cpu.flushTLB()
         cursor = runtimeEnd
@@ -577,10 +662,7 @@ final class DBTEngine {
         // translated at its virtual page (a removed one only means blocks
         // stop early where they needn't).
         for page in Set(added.map { $0 & 0xFFFF_F000 }) {
-            for key in keysByVirtualPage.removeValue(forKey: page) ?? [] {
-                uninstall(key)
-                translations[key] = nil
-            }
+            for key in keysByVirtualPage.removeValue(forKey: page) ?? [] { discard(key) }
         }
     }
 }
