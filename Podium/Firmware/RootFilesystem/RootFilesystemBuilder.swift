@@ -19,6 +19,8 @@ final class RootFilesystemBuilder {
     /// attribute and resource fork are dropped.
     private var decompressed = Set<UInt32>()
     private var nextCatalogID: UInt32
+    /// The journal's files, when the volume is written journaled.
+    private var journalFiles: (infoBlock: UInt32, journal: UInt32)?
 
     init(volume: HFSPlusVolume) throws {
         self.volume = volume
@@ -240,9 +242,30 @@ final class RootFilesystemBuilder {
         }
     }
 
+    /// Writes the volume journaled, with a `size`-byte journal in its own
+    /// `/.journal` (and `/.journal_info_block`), made if they aren't there:
+    /// after a sudden power-off the kernel replays the journal, rather
+    /// than fsck checking the whole volume.
+    func journal(size: UInt64) throws {
+        let files = [("/.journal_info_block", UInt64(volume.blockSize)), ("/.journal", size)]
+        var ids: [UInt32] = []
+        for (path, length) in files {
+            let zeros = [UInt8](repeating: 0, count: Int(length))
+            if index(of: path) != nil {
+                try replaceContents(of: path, with: zeros)
+            } else {
+                try addFile(path, contents: zeros, owner: 0, group: 0, mode: 0o400, template: "/private/etc/fstab")
+            }
+            guard let index = index(of: path) else { throw HFSPlusError.missingPath(path) }
+            ids.append(records[index].catalogNodeID)
+        }
+        journalFiles = (ids[0], ids[1])
+    }
+
     // MARK: Output
 
-    /// Writes the edited volume, unjournaled, with `freeSpace` bytes free.
+    /// Writes the edited volume with `freeSpace` bytes free (journaled
+    /// after `journal(size:)`).
     func write(to url: URL, freeSpace: UInt64, progress: (HFSPlusVolumeWriter.Progress) -> Void = { _ in }) throws {
         var removedIDs = Set<UInt32>()
         var catalog: [HFSPlusCatalogRecord] = []
@@ -274,6 +297,7 @@ final class RootFilesystemBuilder {
             content: content,
             nextCatalogID: nextCatalogID,
             freeSpace: freeSpace,
+            journalFiles: journalFiles,
             to: url,
             progress: progress
         )
@@ -285,14 +309,18 @@ final class RootFilesystemBuilder {
 /// applies on a Mac.
 enum RootFilesystemRecipe {
     /// Bumped whenever the edits change, so prepared images are rebuilt.
-    static let version = 11
+    static let version = 13
     /// Room left for the guest to write into (logs, caches, preferences).
     static let freeSpace: UInt64 = 64 << 20
 
-    static func apply(to builder: RootFilesystemBuilder, keybagBootstrap: [UInt8], firstBootState: Data? = nil, bootReadFiles: [String] = []) throws {
-        // The volume is rebuilt unjournaled; its old journal is just space.
-        try builder.remove("/.journal")
-        try builder.remove("/.journal_info_block")
+    static func apply(to builder: RootFilesystemBuilder, keybagBootstrap: [UInt8], syncDaemon: [UInt8]? = nil, firstBootState: Data? = nil,
+                      bootReadFiles: [String] = []) throws {
+        // The volume is rebuilt with a fresh 8 MB journal (the kernel sets
+        // it up on first mount): the app keeps the guest's writes, and a
+        // sudden power-off then costs a journal replay instead of a full
+        // fsck of the volume at the next boot (about 10 billion guest
+        // instructions).
+        try builder.journal(size: 8 << 20)
 
         // Trim assets the lock screen never touches, so the image leaves
         // room in the guest's 1 GB of RAM.
@@ -340,6 +368,18 @@ enum RootFilesystemRecipe {
         try builder.addFile("/usr/libexec/keybag_bootstrap", contents: keybagBootstrap, template: "/usr/libexec/keybagd", mode: 0o755)
         try builder.editPropertyList("/System/Library/LaunchDaemons/com.apple.mobile.keybagd.plist") { plist in
             plist["ProgramArguments"] = ["/usr/libexec/keybag_bootstrap", "/usr/libexec/keybagd", "-t", "15"]
+        }
+
+        // The app boots a copy of this image that keeps the guest's writes,
+        // and its Power Off stops the machine at once; the volume has no
+        // journal. podium_syncd flushes the guest's cache to it every few
+        // seconds, so little can be lost and the volume stays consistent.
+        if let syncDaemon {
+            try builder.addFile("/usr/libexec/podium_syncd", contents: syncDaemon, template: "/usr/libexec/keybagd", mode: 0o755)
+            try builder.addFile("/System/Library/LaunchDaemons/com.podium.syncd.plist",
+                                contents: try binaryPlist(["Label": "com.podium.syncd", "ProgramArguments": ["/usr/libexec/podium_syncd"],
+                                                           "RunAtLoad": true, "KeepAlive": true]),
+                                template: "/System/Library/LaunchDaemons/com.apple.mobile.keybagd.plist")
         }
 
         // First-boot state a restored device already has: data migration

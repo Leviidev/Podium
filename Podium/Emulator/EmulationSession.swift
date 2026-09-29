@@ -78,7 +78,9 @@ final class EmulationSession {
     /// Called on the emulation thread once the run ends, for any reason.
     var onFinish: ((State) -> Void)?
 
-    init(kernel: Data, deviceTree: Data, rootFilesystem: URL) throws {
+    /// `persistent`: the guest's writes to its root filesystem go to the
+    /// image file, and last; otherwise every boot starts from the image.
+    init(kernel: Data, deviceTree: Data, rootFilesystem: URL, persistent: Bool = false) throws {
         ram = FlatPhysicalMemory(length: GuestMemoryLayout.ramSize, baseAddress: GuestMemoryLayout.ramPhysicalBase)
         // A small on-chip SRAM at low physical addresses, separate from
         // DRAM: the kernel's pmap has put early page tables there.
@@ -104,7 +106,7 @@ final class EmulationSession {
         let size = try FileManager.default.attributesOfItem(atPath: rootFilesystem.path)[.size] as? Int ?? 0
         let prepared = try KernelBootstrap.prepare(kernel: kernel, deviceTree: deviceTree, on: bus, ramDiskSize: size)
         if let address = prepared.ramDiskAddress {
-            _ = try ram.mapFile(rootFilesystem, at: address)
+            _ = try ram.mapFile(rootFilesystem, at: address, shared: persistent)
             let start = Int(address - GuestMemoryLayout.ramPhysicalBase)
             ramDiskRange = start..<start + size
         }

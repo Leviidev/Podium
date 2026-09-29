@@ -95,12 +95,14 @@ final class EmulatorCore {
                 appendLog("Preparing the root filesystem from the IPSW (first launch only)…")
                 bootStage = .preparingFilesystem(.extracting, fraction: 0)
                 let keybagBootstrap = try Self.bundledKeybagBootstrap()
+                let syncDaemon = Bundle.main.url(forResource: "podium_syncd", withExtension: "bin").flatMap { try? Data(contentsOf: $0) }.map { [UInt8]($0) }
                 let firstBootState = Bundle.main.url(forResource: "first_boot_state", withExtension: "plist").flatMap { try? Data(contentsOf: $0) }
                 let bootReadFiles = Bundle.main.url(forResource: "boot_read_files", withExtension: "txt")
                     .flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map(RootFilesystemRecipe.fileList) ?? []
                 let started = Date()
                 try await Task.detached(priority: .userInitiated) {
-                    try RootFilesystemPreparer.prepare(firmwareAt: fileURL, keybagBootstrap: keybagBootstrap, firstBootState: firstBootState,
+                    try RootFilesystemPreparer.prepare(firmwareAt: fileURL, keybagBootstrap: keybagBootstrap, syncDaemon: syncDaemon,
+                                                       firstBootState: firstBootState,
                                                        bootReadFiles: bootReadFiles) { progress in
                         Task { @MainActor [weak self] in
                             guard let self, case .preparingFilesystem = self.bootStage else { return }
@@ -111,11 +113,15 @@ final class EmulatorCore {
                 appendLog(String(format: "Root filesystem ready in %.1f s.", Date().timeIntervalSince(started)))
             }
             bootStage = .loadingKernel
-            let rootFilesystem = RootFilesystemPreparer.imageURL(forFirmwareAt: fileURL)
+            let userImage = try RootFilesystemPreparer.prepareUserImage(forFirmwareAt: fileURL)
+            if userImage.fromOlderRecipe {
+                appendLog("This iOS install was made by an older Podium; erase it in Settings to pick up the newer system image.")
+            }
+            let rootFilesystem = userImage.url
             let session = try await Task.detached(priority: .userInitiated) {
                 let kernel = try KernelcacheExtractor.extractKernelMachO(from: firmware, storedAt: fileURL)
                 let deviceTree = try DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: fileURL)
-                return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem)
+                return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem, persistent: true)
             }.value
             session.onFinish = { [weak self] state in
                 Task { @MainActor in self?.sessionFinished(state) }

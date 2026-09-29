@@ -42,12 +42,15 @@ final class FlatPhysicalMemory: MemoryBus {
     /// reach it. `address` must sit on a host page boundary within this
     /// region. Returns the number of bytes mapped (the file's size).
     @discardableResult
-    func mapFile(_ url: URL, at address: UInt32) throws -> Int {
+    /// Maps `url` over guest memory at `address`. Private by default:
+    /// the guest's writes stay in memory. `shared`, they go to the file,
+    /// so it keeps them after the process ends.
+    func mapFile(_ url: URL, at address: UInt32, shared: Bool = false) throws -> Int {
         let pageSize = Int(getpagesize())
         guard address >= baseAddress, Int(address - baseAddress) % pageSize == 0 else {
             throw MapFileError.misaligned(address: address)
         }
-        let fd = open(url.path, O_RDONLY)
+        let fd = open(url.path, shared ? O_RDWR : O_RDONLY)
         guard fd >= 0 else { throw MapFileError.cannotOpen(path: url.path, errno: errno) }
         defer { close(fd) }
         var info = stat()
@@ -56,7 +59,7 @@ final class FlatPhysicalMemory: MemoryBus {
         let offset = Int(address - baseAddress)
         guard size > 0, offset + size <= length else { throw MapFileError.outOfRange(address: address, length: size) }
         let target = pointer + offset
-        guard let mapped = mmap(target, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0), mapped == target else {
+        guard let mapped = mmap(target, size, PROT_READ | PROT_WRITE, (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED, fd, 0), mapped == target else {
             throw MapFileError.mapFailed(errno: errno)
         }
         return size

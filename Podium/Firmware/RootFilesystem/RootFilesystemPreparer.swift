@@ -43,6 +43,34 @@ enum RootFilesystemPreparer {
         ipswURL.deletingPathExtension().appendingPathExtension("rootfs.hfs")
     }
 
+    /// The copy of the prepared image the app boots and the guest writes
+    /// to — its data and what's installed on it outlive a power-off.
+    static func userImageURL(forFirmwareAt ipswURL: URL) -> URL {
+        ipswURL.deletingPathExtension().appendingPathExtension("user.hfs")
+    }
+
+    /// The user image, made from the prepared one if there isn't one yet
+    /// (or `erasing` the one there): a clone, where the file system
+    /// supports it, so it takes no time or space until the guest writes.
+    /// Returns whether it was made from an older recipe than the current
+    /// one — kept, since it holds the user's data.
+    @discardableResult
+    static func prepareUserImage(forFirmwareAt ipswURL: URL, erasing: Bool = false) throws -> (url: URL, fromOlderRecipe: Bool) {
+        let fileManager = FileManager.default
+        let prepared = imageURL(forFirmwareAt: ipswURL)
+        let user = userImageURL(forFirmwareAt: ipswURL)
+        let marker = markerURL(for: user)
+        if erasing || !fileManager.fileExists(atPath: user.path) {
+            try? fileManager.removeItem(at: user)
+            if clonefile(prepared.path, user.path, 0) != 0 {
+                try fileManager.copyItem(at: prepared, to: user)
+            }
+            try String(RootFilesystemRecipe.version).write(to: marker, atomically: true, encoding: .utf8)
+        }
+        let version = (try? String(contentsOf: marker, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (user, version != String(RootFilesystemRecipe.version))
+    }
+
     private static func markerURL(for imageURL: URL) -> URL {
         imageURL.appendingPathExtension("version")
     }
@@ -56,7 +84,8 @@ enum RootFilesystemPreparer {
 
     /// Returns the prepared image, building it first if needed.
     @discardableResult
-    static func prepare(firmwareAt ipswURL: URL, keybagBootstrap: [UInt8], firstBootState: Data? = nil, bootReadFiles: [String] = [],
+    static func prepare(firmwareAt ipswURL: URL, keybagBootstrap: [UInt8], syncDaemon: [UInt8]? = nil, firstBootState: Data? = nil,
+                        bootReadFiles: [String] = [],
                         progress: (Progress) -> Void = { _ in }) throws -> URL {
         let image = imageURL(forFirmwareAt: ipswURL)
         if isPrepared(forFirmwareAt: ipswURL) { return image }
@@ -71,11 +100,11 @@ enum RootFilesystemPreparer {
 
         // 1. Extract and decrypt.
         if keepDecrypted, fileManager.fileExists(atPath: decrypted.path) {
-            return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap, firstBootState: firstBootState, bootReadFiles: bootReadFiles, progress: progress)
+            return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap, syncDaemon: syncDaemon, firstBootState: firstBootState, bootReadFiles: bootReadFiles, progress: progress)
         }
         try decryptRootFilesystem(fromFirmwareAt: ipswURL, to: decrypted) { progress(Progress(phase: .extracting, fraction: $0)) }
 
-        return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap, firstBootState: firstBootState, bootReadFiles: bootReadFiles, progress: progress)
+        return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap, syncDaemon: syncDaemon, firstBootState: firstBootState, bootReadFiles: bootReadFiles, progress: progress)
     }
 
     /// Streams the root filesystem DMG out of the IPSW, decrypting it into
@@ -108,13 +137,15 @@ enum RootFilesystemPreparer {
     }
 
     // 2. Rebuild the volume.
-    private static func build(from decrypted: URL, to image: URL, partial: URL, keybagBootstrap: [UInt8], firstBootState: Data?, bootReadFiles: [String],
+    private static func build(from decrypted: URL, to image: URL, partial: URL, keybagBootstrap: [UInt8], syncDaemon: [UInt8]?, firstBootState: Data?,
+                              bootReadFiles: [String],
                               progress: (Progress) -> Void) throws -> URL {
         let fileManager = FileManager.default
         progress(Progress(phase: .building, fraction: 0))
         let volume = try HFSPlusVolume(source: try UDIFDiskImage(url: decrypted))
         let builder = try RootFilesystemBuilder(volume: volume)
-        try RootFilesystemRecipe.apply(to: builder, keybagBootstrap: keybagBootstrap, firstBootState: firstBootState, bootReadFiles: bootReadFiles)
+        try RootFilesystemRecipe.apply(to: builder, keybagBootstrap: keybagBootstrap, syncDaemon: syncDaemon, firstBootState: firstBootState,
+                                       bootReadFiles: bootReadFiles)
         try builder.write(to: partial, freeSpace: RootFilesystemRecipe.freeSpace) { written in
             progress(Progress(phase: .building, fraction: Double(written.bytesWritten) / Double(max(written.totalBytes, 1))))
         }

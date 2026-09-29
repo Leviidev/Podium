@@ -180,9 +180,9 @@ enum HFSPlusForkContent {
     }
 }
 
-/// Writes a new, unjournaled HFSX volume: catalog and attributes rebuilt
-/// from the given records, every fork packed contiguously, and
-/// `freeSpace` bytes left free for the guest to write into.
+/// Writes a new HFSX volume: catalog and attributes rebuilt from the given
+/// records, every fork packed contiguously, and `freeSpace` bytes left free
+/// for the guest to write into. Journaled if given the journal's files.
 ///
 /// Layout: the volume header in block 0; the allocation bitmap, extents
 /// overflow, catalog and attributes files; then each file's data and
@@ -196,6 +196,11 @@ final class HFSPlusVolumeWriter {
 
     private let sourceVolume: HFSPlusVolume
     private let blockSize: Int
+
+    /// JournalInfoBlock flags: the journal lives in this file system, and
+    /// hasn't been set up yet.
+    private static let journalInFileSystem: UInt32 = 1 << 0
+    private static let journalNeedsInitializing: UInt32 = 1 << 2
 
     init(copyingParametersOf sourceVolume: HFSPlusVolume) {
         self.sourceVolume = sourceVolume
@@ -213,6 +218,7 @@ final class HFSPlusVolumeWriter {
         content: [UInt32: (data: HFSPlusForkContent?, resource: HFSPlusForkContent?)],
         nextCatalogID: UInt32,
         freeSpace: UInt64,
+        journalFiles: (infoBlock: UInt32, journal: UInt32)? = nil,
         to url: URL,
         progress: (Progress) -> Void = { _ in }
     ) throws {
@@ -272,6 +278,7 @@ final class HFSPlusVolumeWriter {
         let catalogStart = allocate(catalogBlocks)
         let attributesStart = allocate(attributesBlocks)
         var placements: [(start: UInt64, content: HFSPlusForkContent)] = []
+        var dataStarts: [UInt32: (start: UInt64, length: UInt64)] = [:]
         var fileCount: UInt32 = 0
         var folderCount: UInt32 = 0
         for index in catalog.indices {
@@ -285,7 +292,12 @@ final class HFSPlusVolumeWriter {
                 let count = blocks(length)
                 let start = count > 0 ? allocate(count) : 0
                 let fork = HFSPlusForkData.contiguous(logicalSize: length, startBlock: UInt32(start), blockCount: UInt32(count))
-                if forkType == 0 { catalog[index].dataFork = fork } else { catalog[index].resourceFork = fork }
+                if forkType == 0 {
+                    catalog[index].dataFork = fork
+                    dataStarts[catalog[index].catalogNodeID] = (start, length)
+                } else {
+                    catalog[index].resourceFork = fork
+                }
                 if let forkContent, count > 0 { placements.append((start, forkContent)) }
             }
         }
@@ -303,6 +315,21 @@ final class HFSPlusVolumeWriter {
                        | HFSPlusVolumeHeader.unmountedAttribute, at: 4)
         header.putBE32(0x3130_2E30, at: 8) // lastMountedVersion "10.0"
         header.putBE32(0, at: 12) // journalInfoBlock
+
+        // The journal: its info block says where it is, and that it needs
+        // initializing — the kernel makes a fresh, empty journal there when
+        // it first mounts the volume, as for a disk just given one.
+        if let journalFiles, let info = dataStarts[journalFiles.infoBlock], let journal = dataStarts[journalFiles.journal],
+           info.length >= bs, journal.length > 0 {
+            var infoBlock = [UInt8](repeating: 0, count: Int(info.length))
+            infoBlock.putBE32(Self.journalInFileSystem | Self.journalNeedsInitializing, at: 0)
+            infoBlock.putBE64(journal.start * bs, at: 36)
+            infoBlock.putBE64(journal.length, at: 44)
+            if let placement = placements.firstIndex(where: { $0.start == info.start }) { placements[placement].content = .bytes(infoBlock) }
+            header.putBE32(header.be32(4) | HFSPlusVolumeHeader.journaledAttribute, at: 4)
+            header.putBE32(0x4846_534A, at: 8) // lastMountedVersion "HFSJ": a journaled volume
+            header.putBE32(UInt32(info.start), at: 12)
+        }
         header.putBE32(fileCount, at: 32)
         header.putBE32(folderCount, at: 36)
         header.putBE32(UInt32(totalBlocks), at: 44)
