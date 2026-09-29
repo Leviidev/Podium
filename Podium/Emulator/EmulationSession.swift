@@ -84,10 +84,9 @@ final class EmulationSession {
         // DRAM: the kernel's pmap has put early page tables there.
         let lowSRAM = FlatPhysicalMemory(length: 0x0010_0000, baseAddress: 0)
         bus = SegmentedMemoryBus(regions: [ram, lowSRAM])
-        // No JIT: now that the interpreter keeps decoded instructions, its
-        // short kernel-only blocks cost more to look up than they save
-        // (measured 48M instructions/s with it, 51M without), and on a
-        // device it needs a debugger attached to run at all.
+        // Not the old block JIT (its short kernel-only blocks cost more to
+        // look up than they saved); DBTEngine, attached below, is what
+        // translates guest code now.
         cpu = ARMv7CPU(memory: bus, jit: nil)
         cpu.linearMap = (GuestMemoryLayout.kernelVirtualBase, GuestMemoryLayout.ramPhysicalBase, UInt32(GuestMemoryLayout.ramSize))
         GuestAccommodations.install(on: cpu)
@@ -112,6 +111,10 @@ final class EmulationSession {
         cpu.reset()
         cpu.loadInitialRegisters(prepared.initialRegisters)
         cpu.breakpoints = Set(Self.panicEntries.keys).union([Self.shutdownEntry, Self.sharedRegionEntry])
+        // Translated code wherever this process may run generated code (on
+        // iOS, once a debugger such as StikDebug has prepared memory for
+        // it); the interpreter otherwise.
+        cpu.dbt = DBTEngine(cpu: cpu)
         // A reset by any other route (the kernel ends a halt with the
         // watchdog, and spins until it lands) ends the run too; the run
         // loop sees it at the end of the chunk.
@@ -143,7 +146,7 @@ final class EmulationSession {
     func snapshot() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
-        return Snapshot(state: state, retiredInstructions: retired, virtualTime: virtualTime, jitAvailable: cpu.jit?.isAvailable ?? false)
+        return Snapshot(state: state, retiredInstructions: retired, virtualTime: virtualTime, jitAvailable: cpu.dbt != nil)
     }
 
     // MARK: Buttons

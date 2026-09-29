@@ -41,6 +41,7 @@ targets:
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         SWIFT_EMIT_LOC_STRINGS: "YES"
         ENABLE_PREVIEWS: "YES"
+        SWIFT_OBJC_BRIDGING_HEADER: Podium/Podium-Bridging-Header.h
       configs:
         Release:
           # The emulator's hot loop touches CPU state through class

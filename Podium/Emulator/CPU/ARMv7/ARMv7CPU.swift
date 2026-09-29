@@ -62,7 +62,7 @@ final class ARMv7CPU: CPU {
     // needs to mutate these directly, the same way every ARM-state
     // execute method in this file already does. External modules still
     // can't write to them, only read.
-    var registers = Registers()
+    let registers = Registers()
     var cpsr = CPSR()
     var lastError: CPUError?
     var cp15 = CP15State()
@@ -80,6 +80,11 @@ final class ARMv7CPU: CPU {
     /// unlikely to land back exactly on it at a sampled boundary).
     var breakpoints: Set<UInt32> = [] {
         didSet { rebuildBreakpointFilter() }
+    }
+    /// Translated code, when attached: `run(maxUnits:)` runs it wherever
+    /// it can, and the interpreter everywhere else.
+    var dbt: DBTEngine? {
+        didSet { dbt?.setStopAddresses(breakpoints.union(nativeFunctions.keys)) }
     }
     /// Guest functions done natively instead of interpreted. At one of
     /// these addresses, before its first instruction runs, the handler gets
@@ -101,6 +106,7 @@ final class ARMv7CPU: CPU {
     private(set) var hitBreakpoint: UInt32?
 
     private func rebuildBreakpointFilter() {
+        dbt?.setStopAddresses(breakpoints.union(nativeFunctions.keys))
         breakpointFilter = [UInt64](repeating: 0, count: Self.breakpointFilterWords)
         for address in breakpoints.union(nativeFunctions.keys) {
             let bit = Self.breakpointFilterBit(address)
@@ -110,7 +116,7 @@ final class ARMv7CPU: CPU {
     /// Real guest instructions retired so far. Differs from `run(maxUnits:)`'s
     /// unit count once the JIT is involved, since one compiled block is one
     /// unit but many instructions — this is the honest progress/speed figure.
-    private(set) var retiredInstructionCount: UInt64 = 0
+    var retiredInstructionCount: UInt64 = 0
 
     let jit: JITEngine?
 
@@ -336,6 +342,8 @@ final class ARMv7CPU: CPU {
     deinit {
         tlbTags.deallocate()
         tlbPages.deallocate()
+        tlbHosts.deallocate()
+        registers.deallocate()
     }
 
     func reset() {
@@ -431,6 +439,22 @@ final class ARMv7CPU: CPU {
                     cpsr.thumbState = returnAddress & 1 != 0
                     registers.pc = returnAddress & ~1
                     retiredInstructionCount &+= 1
+                    unitsRun += 1
+                    continue
+                }
+            }
+            if let dbt, itState == 0, mmuEnabled {
+                let before = retiredInstructionCount
+                switch dbt.run(budget: UInt64(maxUnits - unitsRun)) {
+                case .notTranslated:
+                    break
+                case .ran:
+                    unitsRun += max(1, Int(retiredInstructionCount &- before))
+                    continue
+                case .deopted:
+                    // The instruction translated code stopped before.
+                    unitsRun += Int(retiredInstructionCount &- before)
+                    runOneUnit()
                     unitsRun += 1
                     continue
                 }
@@ -901,6 +925,7 @@ final class ARMv7CPU: CPU {
         )
         tlbTags[slot] = tag
         tlbPages[slot] = physical & 0xFFFF_F000
+        tlbHosts[slot] = kind == 2 && isCodePage(physical) ? nil : ramPointer(physical & 0xFFFF_F000, width: 0x1000)
         return physical
     }
 
@@ -927,11 +952,22 @@ final class ARMv7CPU: CPU {
     /// never reuse an ASID for a genuinely different address space
     /// without an explicit invalidate, which XNU already has to get right
     /// to work on real silicon.
-    private static let tlbEntries = 8192
-    private let tlbTags = UnsafeMutablePointer<UInt32>.allocate(capacity: 6 * tlbEntries)
-    private let tlbPages = UnsafeMutablePointer<UInt32>.allocate(capacity: 6 * tlbEntries)
+    static let tlbEntries = 8192
+    /// Six banks of `tlbEntries`: read, write and execute (in that
+    /// order), each for privileged then user accesses.
+    let tlbTags = UnsafeMutablePointer<UInt32>.allocate(capacity: 6 * tlbEntries)
+    let tlbPages = UnsafeMutablePointer<UInt32>.allocate(capacity: 6 * tlbEntries)
+    /// Where each entry's page is in host memory, when it's RAM; for the
+    /// write banks, nil too while the page holds translated code, so
+    /// translated stores to it go through the interpreter (which
+    /// invalidates the code). What `DBTEngine`'s loads and stores use.
+    let tlbHosts = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 6 * tlbEntries)
+
+    /// Counts TLB flushes, for translated code that has to notice one.
+    private(set) var tlbGeneration = 0
 
     func flushTLB() {
+        tlbGeneration &+= 1
         tlbTags.initialize(repeating: 0, count: 6 * Self.tlbEntries)
         instructionCache.forgetPage()
     }
@@ -1002,18 +1038,64 @@ final class ARMv7CPU: CPU {
         return try memory.readByte(at: physical)
     }
 
+    /// Pages of RAM holding translated code, one bit each from the start
+    /// of RAM, when a `DBTEngine` is attached; a store to one invalidates
+    /// what was translated from it.
+    var codePageBitmap: UnsafeMutablePointer<UInt64>?
+    weak var codeWriteObserver: DBTEngine?
+
+    @inline(__always)
+    func isCodePage(_ physical: UInt32) -> Bool {
+        guard let bitmap = codePageBitmap, let ram = ramFastPath, physical &- ram.base < ram.length else { return false }
+        let page = Int((physical &- ram.base) >> 12)
+        return bitmap[page >> 6] & (1 << UInt64(page & 63)) != 0
+    }
+
+    @inline(__always)
+    private func noteRAMWrite(_ physical: UInt32) {
+        guard codePageBitmap != nil, isCodePage(physical) else { return }
+        codeWriteObserver?.codeWasWritten(physicalPage: physical & 0xFFFF_F000)
+    }
+
+    /// The host address of a page of guest RAM (nil if it isn't RAM).
+    func hostAddress(ofPhysicalRAM physical: UInt32) -> UnsafeMutableRawPointer? {
+        ramPointer(physical & 0xFFFF_F000, width: 0x1000)
+    }
+
+    /// Stops the TLB giving out `page`'s host address for writes (it now
+    /// holds translated code), or starts again.
+    func withholdWriteHosts(forPhysicalPage page: UInt32) {
+        setWriteHosts(forPhysicalPage: page, to: nil)
+    }
+
+    func restoreWriteHosts(forPhysicalPage page: UInt32) {
+        setWriteHosts(forPhysicalPage: page, to: ramPointer(page, width: 0x1000))
+    }
+
+    private func setWriteHosts(forPhysicalPage page: UInt32, to host: UnsafeMutableRawPointer?) {
+        for slot in (2 * Self.tlbEntries)..<(4 * Self.tlbEntries) where tlbPages[slot] == page {
+            tlbHosts[slot] = host
+        }
+    }
+
+    /// Where RAM starts physically, and how long it is.
+    var ramRange: (base: UInt32, length: UInt32)? {
+        _ = ramPointer(0, width: 0)
+        return ramFastPath.map { ($0.base, $0.length) }
+    }
+
     func writePhysical32(_ value: UInt32, _ physical: UInt32) throws {
-        if let p = ramPointer(physical, width: 4) { p.storeBytes(of: value.littleEndian, as: UInt32.self); return }
+        if let p = ramPointer(physical, width: 4) { p.storeBytes(of: value.littleEndian, as: UInt32.self); noteRAMWrite(physical); return }
         try memory.writeWord32(value, at: physical)
     }
 
     func writePhysical16(_ value: UInt16, _ physical: UInt32) throws {
-        if let p = ramPointer(physical, width: 2) { p.storeBytes(of: value.littleEndian, as: UInt16.self); return }
+        if let p = ramPointer(physical, width: 2) { p.storeBytes(of: value.littleEndian, as: UInt16.self); noteRAMWrite(physical); return }
         try memory.writeWord16(value, at: physical)
     }
 
     func writePhysical8(_ value: UInt8, _ physical: UInt32) throws {
-        if let p = ramPointer(physical, width: 1) { p.storeBytes(of: value, as: UInt8.self); return }
+        if let p = ramPointer(physical, width: 1) { p.storeBytes(of: value, as: UInt8.self); noteRAMWrite(physical); return }
         try memory.writeByte(value, at: physical)
     }
 
