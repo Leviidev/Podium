@@ -115,6 +115,7 @@ final class EmulationSession {
         // iOS, once a debugger such as StikDebug has prepared memory for
         // it); the interpreter otherwise.
         cpu.dbt = DBTEngine(cpu: cpu)
+        KernelAcceleration.install(on: cpu)
         // A reset by any other route (the kernel ends a halt with the
         // watchdog, and spins until it lands) ends the run too; the run
         // loop sees it at the end of the chunk.
@@ -181,8 +182,14 @@ final class EmulationSession {
     private func waitWhileIdle(limit: UInt64) {
         let next = cpu.nextDeviceEventAt
         let seconds = next == .max ? 0.05 : min(Double(next &- min(next, limit)) / Self.virtualTimePerHostSecond, 0.05)
+        let started = DispatchTime.now().uptimeNanoseconds
         _ = inputArrived.wait(timeout: .now() + max(seconds, 0.001))
+        idleNanoseconds &+= DispatchTime.now().uptimeNanoseconds &- started
     }
+
+    /// Host time the emulation thread has spent waiting for guest time to
+    /// catch up (the guest idle), for measuring how busy it is.
+    private(set) var idleNanoseconds: UInt64 = 0
 
     func snapshot() -> Snapshot {
         lock.lock()

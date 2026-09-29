@@ -441,6 +441,8 @@ struct BlockEmitter {
         a.str(w: 9, H.context, offset: C.nzcv)
         a.mov(w: 9, pc)
         a.str(w: 9, H.registers, offset: 15 * 4)
+        a.add(x: 9, H.retired, imm: UInt32(count))
+        a.str(x: 9, H.context, offset: C.retired)
         a.mov(x: 0, x: H.context)
         a.mov(w: 1, UInt32(index))
         a.ldr(x: 16, H.context, offset: C.snippetHelper)

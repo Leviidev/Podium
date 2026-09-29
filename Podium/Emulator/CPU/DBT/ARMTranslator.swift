@@ -20,6 +20,7 @@ enum ARMTranslator {
         var address = virtual
         while e.count < maxInstructions, address & 0xFFFF_F000 == base {
             if address != virtual, stopAddresses.contains(address) { break }
+            if let snippet = e.snippets[address] { e.callSnippet(snippet.index, exit: snippet.exit, pc: address) }
             let word = UInt32(littleEndian: page.loadUnaligned(fromByteOffset: Int(address & 0xFFF), as: UInt32.self))
             let instruction = ARMDecoder.decode(word)
             var outcome = emit(instruction, at: address, into: &e)

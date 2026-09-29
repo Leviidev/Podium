@@ -285,7 +285,7 @@ final class RootFilesystemBuilder {
 /// applies on a Mac.
 enum RootFilesystemRecipe {
     /// Bumped whenever the edits change, so prepared images are rebuilt.
-    static let version = 10
+    static let version = 11
     /// Room left for the guest to write into (logs, caches, preferences).
     static let freeSpace: UInt64 = 64 << 20
 
@@ -365,6 +365,17 @@ enum RootFilesystemRecipe {
         try applyHactivation(to: builder)
 
         if let firstBootState { try applyFirstBootState(firstBootState, to: builder) }
+
+        // Grouped table views — Settings and most other lists — fill their
+        // background with UITableViewTexture.png, 16 by 2 pixels. With no
+        // GPU, CoreAnimation draws a pattern one image-sized tile at a
+        // time, each a quad through its whole software renderer: some
+        // 17,000 for one screen, nearly all the work of a frame while
+        // Settings scrolls. The same stripes tiled out to a screenful look
+        // the same (the pattern is drawn pixel for pixel, and a screen is
+        // a whole number of periods) and draw as one tile.
+        try UIKitArtwork.tile(image: "UITableViewTexture.png", in: "/System/Library/Frameworks/UIKit.framework/Shared@2x.artwork",
+                              toWidth: 640, height: 960, builder: builder)
 
         // The files the guest reads while it boots, stored uncompressed.
         // Nearly every file here is HFS-compressed (decmpfs), and the

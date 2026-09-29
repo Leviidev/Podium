@@ -31,6 +31,9 @@ final class QuartzCoreAcceleration {
         memory = GuestPageCache(cpu: cpu)
     }
 
+    /// For the differential tester: one not installed anywhere.
+    static func forTesting(on cpu: ARMv7CPU) -> QuartzCoreAcceleration { QuartzCoreAcceleration(cpu: cpu) }
+
     private struct Function {
         let unslidAddress: UInt32
         let signature: [UInt8]
@@ -54,6 +57,10 @@ final class QuartzCoreAcceleration {
             0xF0, 0xB5, 0x03, 0xAF, 0x2D, 0xE9, 0x00, 0x05, 0x51, 0xB3, 0xD0, 0xF8, 0x00, 0xE0, 0x06, 0x6A,
             0xD0, 0xF8, 0x24, 0x90, 0x83, 0x6A, 0xD0, 0xF8, 0x2C, 0xC0, 0xDE, 0xE9, 0x00, 0x45, 0xDE, 0xF8,
         ], body: { $0.nearestSpan(opaque: false) }),
+        Function(unslidAddress: 0x32D9_1124, signature: [
+            0xF0, 0xB5, 0x03, 0xAF, 0x2D, 0xE9, 0x00, 0x0D, 0x8A, 0xB0, 0x0C, 0x46, 0x00, 0x2C, 0x00, 0xF0,
+            0xAF, 0x80, 0x46, 0x6A, 0x05, 0x68, 0x03, 0x6A, 0x05, 0x96, 0x86, 0x6A, 0xA3, 0xF5, 0x00, 0x4C,
+        ], body: { $0.bilinearOpaqueSpan() }),
     ]
 
     /// Loops of the scanline rasterizer (`0x32D8E5F8`) that translated
@@ -111,15 +118,16 @@ final class QuartzCoreAcceleration {
         let accelerator = QuartzCoreAcceleration(cpu: cpu)
         for loop in loops {
             let address = loop.unslidAddress &+ slide
+            let code = loop.code, body = loop.body, memory = accelerator.memory
             var verified: Bool?
-            cpu.dbt?.registerSnippet(at: address, thumb: true, exit: address &+ UInt32(loop.code.count)) { cpu in
+            cpu.dbt?.registerSnippet(at: address, thumb: true, exit: address &+ UInt32(code.count)) { cpu in
                 if verified == nil {
-                    guard let code = accelerator.memory.bytes(address, count: loop.code.count, access: .execute) else { return false }
-                    verified = code == loop.code
+                    guard let found = memory.bytes(address, count: code.count, access: .execute) else { return false }
+                    verified = found == code
                 }
                 guard verified == true else { return false }
-                accelerator.memory.begin()
-                return loop.body(cpu, accelerator.memory)
+                memory.begin()
+                return body(cpu, memory)
             }
         }
         for function in functions {
@@ -176,6 +184,13 @@ final class QuartzCoreAcceleration {
 
     // MARK: The functions
 
+    /// Runs native function `index` of `functions` on the CPU's state, for
+    /// the differential tester.
+    func runForTesting(_ index: Int) -> Bool {
+        memory.begin()
+        return Self.functions[index].body(self)
+    }
+
     /// `(sampler, count, destination)`: `count` bilinearly filtered
     /// premultiplied pixels along the sampler's line.
     private func bilinearSpan() -> Bool {
@@ -200,6 +215,43 @@ final class QuartzCoreAcceleration {
             let low = Self.uxtb16(aLow &+ (((bLow &- aLow) &* wx) >> 8))
             let high = ((bHigh &- aHigh) &* wx &+ (aHigh << 8)) & ~0x00FF_00FF
             guard memory.write32(low | high, at: destination) else { return false }
+
+            destination &+= 4
+            x &+= s.dx
+            y &+= s.dy
+            count &-= 1
+        }
+        return true
+    }
+
+    /// `(sampler, count, destination)`: the bilinear sampler for opaque
+    /// images (`0x32D91124`) — what scrolling a list mostly draws. The
+    /// same filter as `bilinearSpan`, with the alpha lane of each source
+    /// pixel taken as 255, and the samples read in its own order.
+    private func bilinearOpaqueSpan() -> Bool {
+        var count = cpu.registers[1]
+        var destination = cpu.registers[2]
+        guard count != 0 else { return true }
+        guard let s = sampler() else { return false }
+        /// A pixel's green and alpha lanes, alpha 255: `lsr #8`, then `bfi` of 0xFF00 over bits 8 up.
+        @inline(__always) func high(_ p: UInt32) -> UInt32 { (p >> 8) & 0xFF | 0x00FF_0000 }
+        var x = s.x &- 0x8000, y = s.y &- 0x8000
+        while count != 0 {
+            let y0 = Self.clamp(y, s.maxY), x1 = Self.clamp(x &+ 0x10000, s.maxX)
+            let y1 = Self.clamp(y &+ 0x10000, s.maxY), x0 = Self.clamp(x, s.maxX)
+            let row0 = Self.integer(y0) &* s.rowBytes, row1 = Self.integer(y1) &* s.rowBytes
+            let column0 = Self.integer(x0) << 2, column1 = Self.integer(x1) << 2
+            guard let p01 = memory.read32(s.pixels &+ row0 &+ column1), let p11 = memory.read32(s.pixels &+ row1 &+ column1),
+                  let p10 = memory.read32(s.pixels &+ row1 &+ column0), let p00 = memory.read32(s.pixels &+ row0 &+ column0) else { return false }
+            let wy = (y0 >> 8) & 0xFF, wx = (x0 >> 8) & 0xFF
+
+            let lowRight = Self.uxtb16(Self.uxtb16(p01) &+ (((Self.uxtb16(p11) &- Self.uxtb16(p01)) &* wy) >> 8))
+            let lowLeft = Self.uxtb16(Self.uxtb16(p00) &+ (((Self.uxtb16(p10) &- Self.uxtb16(p00)) &* wy) >> 8))
+            let highLeft = Self.uxtb16(high(p00) &+ (((high(p10) &- high(p00)) &* wy) >> 8))
+            let highRight = Self.uxtb16(high(p01) &+ (((high(p11) &- high(p01)) &* wy) >> 8))
+            let low = Self.uxtb16(lowLeft &+ (((lowRight &- lowLeft) &* wx) >> 8))
+            let highLanes = ((highRight &- highLeft) &* wx &+ (highLeft << 8)) & ~0x00FF_00FF
+            guard memory.write32(low | highLanes, at: destination) else { return false }
 
             destination &+= 4
             x &+= s.dx
@@ -314,19 +366,15 @@ final class QuartzCoreAcceleration {
 
     @inline(__always) private static func setLow(_ d: UInt64, _ value: UInt32) -> UInt64 { d & 0xFFFF_FFFF_0000_0000 | UInt64(value) }
 
-    /// Iterations of a mask loop (`while (mask >>= 1) != 0`, at least one)
-    /// and the host addresses of `count` words from each pointer, if the
-    /// guest could access them all (every one checked before anything is
-    /// written).
-    private static func loopRuns(_ mask: UInt32, _ pointers: [(UInt32, ARMv7MMU.Access)], _ memory: GuestPageCache)
-        -> (Int, [UnsafeMutableRawPointer])? {
-        let count = max(1, 32 - mask.leadingZeroBitCount)
-        var hosts: [UnsafeMutableRawPointer] = []
-        for (address, access) in pointers {
-            guard address & 3 == 0, let host = memory.span(address, count: count * 4, access: access) else { return nil }
-            hosts.append(host)
-        }
-        return (count, hosts)
+    /// Iterations of a mask loop (`while (mask >>= 1) != 0`, at least one).
+    @inline(__always) private static func iterations(_ mask: UInt32) -> Int { max(1, 32 - mask.leadingZeroBitCount) }
+
+    /// Where `count` words from `address` are in host memory, if the guest
+    /// could access them all. Callers check every array before writing
+    /// anything.
+    @inline(__always) private static func words(_ address: UInt32, _ count: Int, _ access: ARMv7MMU.Access, _ memory: GuestPageCache)
+        -> UnsafeMutableRawPointer? {
+        address & 3 == 0 ? memory.span(address, count: count * 4, access: access) : nil
     }
 
     /// Needs the unit enabled and the standard modes, like any translated
@@ -346,9 +394,9 @@ final class QuartzCoreAcceleration {
     /// D-register code computes them.
     static func interpolateAttributes(_ cpu: ARMv7CPU, _ memory: GuestPageCache) -> Bool {
         let r = cpu.registers
-        guard vectorUnitReady(cpu),
-              let (count, hosts) = loopRuns(r[4], [(r[3], .read), (r[2], .read), (r[14], .write), (r[0], .write)], memory) else { return false }
-        let (from3, from2, into14, into0) = (hosts[0], hosts[1], hosts[2], hosts[3])
+        let count = iterations(r[4])
+        guard vectorUnitReady(cpu), let from3 = words(r[3], count, .read, memory), let from2 = words(r[2], count, .read, memory),
+              let into14 = words(r[14], count, .write, memory), let into0 = words(r[0], count, .write, memory) else { return false }
         let neon = cpu.neon
         let d0 = neon[0], d16 = neon[16]
         var d1 = neon[1], d2 = neon[2], d17 = neon[17]
@@ -387,9 +435,9 @@ final class QuartzCoreAcceleration {
     /// r1, which is always 0 there; any other r1 is left to the guest.
     static func accumulateScaledAttributes(_ cpu: ARMv7CPU, _ memory: GuestPageCache) -> Bool {
         let r = cpu.registers
-        guard r[1] == 0, vectorUnitReady(cpu),
-              let (count, hosts) = loopRuns(r[6], [(r[2], .read), (r[3], .write)], memory) else { return false }
-        let (deltas, values) = (hosts[0], hosts[1])
+        let count = iterations(r[6])
+        guard r[1] == 0, vectorUnitReady(cpu), let deltas = words(r[2], count, .read, memory),
+              let values = words(r[3], count, .write, memory) else { return false }
         let neon = cpu.neon
         let d16 = neon[16]
         var d0 = neon[0], d1 = neon[1], d17 = neon[17]
@@ -431,9 +479,9 @@ final class QuartzCoreAcceleration {
     /// both lanes of d0 and d1).
     static func stepAttributes(_ cpu: ARMv7CPU, _ memory: GuestPageCache, _ at: StepRegisters) -> Bool {
         let r = cpu.registers
-        guard vectorUnitReady(cpu),
-              let (count, hosts) = loopRuns(r[at.mask], [(r[at.source], .read), (r[at.destination], .write)], memory) else { return false }
-        let (deltas, values) = (hosts[0], hosts[1])
+        let count = iterations(r[at.mask])
+        guard vectorUnitReady(cpu), let deltas = words(r[at.source], count, .read, memory),
+              let values = words(r[at.destination], count, .write, memory) else { return false }
         let neon = cpu.neon
         var d0 = neon[0], d1 = neon[1]
         var mask = r[at.mask]

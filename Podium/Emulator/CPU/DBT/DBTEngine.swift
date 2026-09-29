@@ -530,7 +530,9 @@ final class DBTEngine {
     /// body works on the CPU's state and returns true with the guest code
     /// done, the registers, flags and memory as it would have left them
     /// (the guest's pc aside: translated code goes on at `exit`); false,
-    /// having changed nothing, for the guest code to run instead.
+    /// having changed nothing, for the guest code to run instead. It sees
+    /// the retired count as it stands there (a device read may depend on
+    /// the time), and mustn't change device or interrupt state.
     private struct Snippet {
         let exit: UInt32
         let body: (ARMv7CPU) -> Bool
@@ -558,6 +560,7 @@ final class DBTEngine {
         let C = Context.self
         let flags = context.load(fromByteOffset: C.nzcv, as: UInt32.self) & 0xF000_0000
         cpu.cpsr.rawValue = (cpu.cpsr.rawValue & 0x0FFF_FFFF) | flags
+        cpu.retiredInstructionCount = context.load(fromByteOffset: C.retired, as: UInt64.self)
         guard snippets[index].body(cpu) else { return 0 }
         statistics.snippetsRun += 1
         context.storeBytes(of: cpu.cpsr.rawValue & 0xF000_0000, toByteOffset: C.nzcv, as: UInt32.self)
