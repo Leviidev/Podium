@@ -272,13 +272,24 @@ final class ARMv7CPU: CPU {
     /// WFI: nothing happens until an interrupt is asserted (masked or
     /// not — WFI wakes on the pin, ARM DDI 0406C B1.8.13). With nothing
     /// pending, virtual time jumps straight to the next device event, so
-    /// an idle guest costs no host time at all. With no event scheduled
-    /// either, nothing could ever wake the CPU; time stays put and the
-    /// guest simply re-executes its idle loop.
+    /// an idle guest costs no host time at all — but no further than
+    /// `idleSkipLimit`. Short of the event, the CPU is `idleBlocked` and
+    /// `run(maxUnits:)` returns, for its caller to wait for real time (or
+    /// input) to catch up; with no event scheduled at all, likewise.
     func waitForInterrupt() {
-        guard !irqAsserted, !fiqAsserted, nextDeviceEventAt != .max, nextDeviceEventAt > virtualTime else { return }
-        idleInstructionsSkipped &+= nextDeviceEventAt - virtualTime
+        guard !irqAsserted, !fiqAsserted, nextDeviceEventAt > virtualTime else { return }
+        let target = min(nextDeviceEventAt, idleSkipLimit)
+        if target > virtualTime { idleInstructionsSkipped &+= target &- virtualTime }
+        if target < nextDeviceEventAt {
+            idleBlocked = true
+            isRunning = false
+        }
     }
+
+    /// How far WFI may skip virtual time ahead (see `waitForInterrupt`).
+    var idleSkipLimit: UInt64 = .max
+    /// The last run stopped at a WFI that couldn't skip to its wake-up.
+    private(set) var idleBlocked = false
 
     func savedProgramStatus(forModeBits modeBits: UInt32) -> UInt32? {
         spsrForMode[modeBits]
@@ -424,6 +435,7 @@ final class ARMv7CPU: CPU {
     @discardableResult
     func run(maxUnits: Int) -> Int {
         isRunning = true
+        idleBlocked = false
         hitBreakpoint = nil
         var unitsRun = 0
         while isRunning && lastError == nil && unitsRun < maxUnits {

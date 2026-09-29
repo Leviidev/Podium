@@ -141,6 +141,47 @@ final class EmulationSession {
         lock.lock()
         pendingInput.append((event, Date()))
         lock.unlock()
+        inputArrived.signal()
+    }
+
+    // MARK: Pacing
+
+    /// Wakes the emulation thread from an idle wait.
+    private let inputArrived = DispatchSemaphore(value: 0)
+    /// The host moment guest time was last pinned to, and that time.
+    private var paceAnchor: (host: UInt64, virtual: UInt64)?
+
+    /// The guest's clock, in `virtualTime` units per host second.
+    private static let virtualTimePerHostSecond = 24_000_000 * Double(S5L8930XPlatform.instructionsPerTimebaseTick)
+    /// Lag behind real time forgiven rather than caught up.
+    private static let forgivenLag = 0.25
+
+    /// How far virtual time may run: no faster than real time, so an idle
+    /// guest's clock — its timeouts, auto-lock, animations — keeps real
+    /// time instead of racing ahead as WFI skips. A busy guest runs
+    /// behind real time; that lag is forgiven rather than caught up in a
+    /// burst.
+    private func paceLimit() -> UInt64 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let virtual = cpu.virtualTime
+        guard let anchor = paceAnchor else {
+            paceAnchor = (now, virtual)
+            return virtual
+        }
+        let allowed = anchor.virtual &+ UInt64(Double(now &- anchor.host) / 1e9 * Self.virtualTimePerHostSecond)
+        if allowed > virtual, Double(allowed &- virtual) / Self.virtualTimePerHostSecond > Self.forgivenLag {
+            paceAnchor = (now, virtual)
+            return virtual &+ UInt64(Self.forgivenLag * Self.virtualTimePerHostSecond)
+        }
+        return allowed
+    }
+
+    /// Sleeps until guest time may reach the next device event (or a bit,
+    /// if there's none), or input arrives.
+    private func waitWhileIdle(limit: UInt64) {
+        let next = cpu.nextDeviceEventAt
+        let seconds = next == .max ? 0.05 : min(Double(next &- min(next, limit)) / Self.virtualTimePerHostSecond, 0.05)
+        _ = inputArrived.wait(timeout: .now() + max(seconds, 0.001))
     }
 
     func snapshot() -> Snapshot {
@@ -174,11 +215,12 @@ final class EmulationSession {
 
     /// Guest time, in `virtualTime` units, per second: the 24 MHz timebase.
     private static let virtualTimePerSecond = 24_000_000 * Double(S5L8930XPlatform.instructionsPerTimebaseTick)
-    /// The longest hold a release waits for. iOS takes a hold of about
-    /// two seconds for "slide to power off", but only once SpringBoard's
-    /// timer for it fires, which is late while it's busy (just after an
-    /// unlock, say) — so a few seconds more than that.
-    private static let longestHold: TimeInterval = 5
+    /// The longest hold a release waits for: a little over the two
+    /// seconds iOS takes for "slide to power off". Not much more — while
+    /// the guest is busy its clock runs behind real time, so a longer wait
+    /// keeps iOS thinking the button is down (and ignoring the slider)
+    /// for real seconds after it was let go.
+    private static let longestHold: TimeInterval = 3
 
     /// Applies input, all at once except button releases. The guest's
     /// clock runs several times slower than the host's while it's busy,
@@ -223,6 +265,8 @@ final class EmulationSession {
             if stopping { break }
             apply(input)
 
+            let limit = paceLimit()
+            cpu.idleSkipLimit = limit
             let ran = cpu.run(maxUnits: 1_000_000)
             if guestReset {
                 finalState = .shutDown
@@ -248,7 +292,9 @@ final class EmulationSession {
                 finalState = .halted("\(error)")
                 break
             }
-            if ran == 0, cpu.hitBreakpoint == nil {
+            if cpu.idleBlocked {
+                waitWhileIdle(limit: limit)
+            } else if ran == 0, cpu.hitBreakpoint == nil {
                 finalState = .halted("the CPU stopped making progress")
                 break
             }

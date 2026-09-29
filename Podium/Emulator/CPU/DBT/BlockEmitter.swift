@@ -275,6 +275,74 @@ struct BlockEmitter {
         a.add(x: 10, 10, 11)
     }
 
+    // MARK: Exclusives and thread ID registers
+
+    /// `LDREX{B,H,D}`: loads, and opens the monitor on the address.
+    mutating func loadExclusive(rt: Int, rt2: Int?, rn: Int, offset: UInt32, size: Int, slow: Label) {
+        let C = DBTEngine.Context.self
+        load(1, guest: rn)
+        a.add(w: 1, 1, anyImm: offset, scratch: 15)
+        if let rt2 {
+            locateRun(1, width: 8, access: .read, deopt: slow)
+            a.ldr(w: 4, 10, offset: 0)
+            a.ldr(w: 5, 10, offset: 4)
+            store(guest: rt, 4)
+            store(guest: rt2, 5)
+        } else {
+            loadMemory(0, address: 1, width: size, signed: false, deopt: slow)
+            store(guest: rt, 0)
+        }
+        a.str(w: 1, H.context, offset: C.monitorAddress)
+        a.mov(w: 9, 1)
+        a.str(w: 9, H.context, offset: C.monitorValid)
+    }
+
+    /// `STREX{B,H,D}`: stores only if the monitor is open on the address,
+    /// reporting 0 (stored) or 1 in `rd`; closes the monitor either way.
+    mutating func storeExclusive(rd: Int, rt: Int, rt2: Int?, rn: Int, offset: UInt32, size: Int, slow: Label) {
+        let C = DBTEngine.Context.self
+        let fail = a.newLabel(), done = a.newLabel()
+        load(1, guest: rn)
+        a.add(w: 1, 1, anyImm: offset, scratch: 15)
+        a.ldr(w: 9, H.context, offset: C.monitorValid)
+        a.cbz(w: 9, fail)
+        a.ldr(w: 9, H.context, offset: C.monitorAddress)
+        a.eor(w: 9, 9, 1)
+        a.cbnz(w: 9, fail)
+        if let rt2 {
+            locateRun(1, width: 8, access: .write, deopt: slow)
+            load(4, guest: rt)
+            load(5, guest: rt2)
+            a.str(w: 4, 10, offset: 0)
+            a.str(w: 5, 10, offset: 4)
+        } else {
+            load(0, guest: rt)
+            storeMemory(0, address: 1, width: size, deopt: slow)
+        }
+        a.str(w: 31, H.context, offset: C.monitorValid)
+        store(guest: rd, 31)
+        a.b(done)
+        a.bind(fail)
+        a.str(w: 31, H.context, offset: C.monitorValid)
+        a.mov(w: 2, 1)
+        store(guest: rd, 2)
+        a.bind(done)
+    }
+
+    mutating func clearExclusive() {
+        a.str(w: 31, H.context, offset: DBTEngine.Context.monitorValid)
+    }
+
+    /// `MRC p15, 0, rt, c13, c0, opc2` for the thread ID registers
+    /// (`opc2` 2...4); false for anything else.
+    mutating func readThreadID(_ instruction: CoprocessorRegisterTransferInstruction) -> Bool {
+        guard instruction.isLoad, instruction.coprocessor == 15, instruction.opc1 == 0, instruction.crn == 13,
+              instruction.crm == 0, (2...4).contains(instruction.opc2), instruction.rt != 15 else { return false }
+        a.ldr(w: 0, H.context, offset: DBTEngine.Context.threadID + (instruction.opc2 - 2) * 4)
+        store(guest: instruction.rt, 0)
+        return true
+    }
+
     // MARK: Finishing
 
     mutating func finish() -> [UInt32] {

@@ -32,6 +32,15 @@ final class S5L8930XDisplayPipe: MMIODevice {
     private var registers = [UInt32](repeating: 0, count: Int(windowLength / 4))
     private var command: (id: UInt32, remaining: Int, words: [UInt32])?
     private var pendingCommands: [(id: UInt32, words: [UInt32])] = []
+    /// Frames the guest has put on screen so far: changes of a layer's
+    /// buffer address, however they're written.
+    private(set) var swapCount = 0
+    private static let layerAddressRegisters: Set<UInt32> = [0x4044, 0x5044]
+
+    private func store(_ value: UInt32, at offset: UInt32) {
+        if Self.layerAddressRegisters.contains(offset), registers[Int(offset / 4)] != value { swapCount += 1 }
+        registers[Int(offset / 4)] = value
+    }
     /// Diagnostic hook: one line per register write.
     var traceWrite: ((String) -> Void)?
 
@@ -48,7 +57,7 @@ final class S5L8930XDisplayPipe: MMIODevice {
         switch offset {
         case Self.interruptStatus: registers[Int(offset / 4)] &= ~value
         case Self.commandFIFO: receiveCommandWord(value)
-        default: registers[Int(offset / 4)] = value
+        default: store(value, at: offset)
         }
         updateInterruptLine()
     }
@@ -90,7 +99,7 @@ final class S5L8930XDisplayPipe: MMIODevice {
             let start = words[index] & 0xFFFF
             for n in 0..<count where index + 1 + n < words.count {
                 let offset = start &+ UInt32(n * 4)
-                if offset < Self.windowLength { registers[Int(offset / 4)] = words[index + 1 + n] }
+                if offset < Self.windowLength { store(words[index + 1 + n], at: offset) }
             }
             index += 1 + count
         }

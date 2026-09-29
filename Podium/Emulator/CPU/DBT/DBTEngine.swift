@@ -48,7 +48,11 @@ final class DBTEngine {
         static let executeTags = 0x40, executePages = 0x48, asidMix = 0x50, asidTag = 0x54
         static let table = 0x58, exitITState = 0x60, exitDeopt = 0x64
         static let engine = 0x68, interpretHelper = 0x70, exitReason = 0x78
-        static let size = 0x80
+        /// The exclusive monitor (valid flag, address), and the CP15 thread
+        /// ID registers TPIDRURW/TPIDRURO/TPIDRPRW, mirrored from the CPU.
+        static let monitorValid = 0x80, monitorAddress = 0x84
+        static let threadID = 0x88
+        static let size = 0x100
     }
 
     /// Host registers generated code relies on (x18 is the platform's).
@@ -302,6 +306,7 @@ final class DBTEngine {
         context.storeBytes(of: (asid &* 0x9E37_79B1) >> 20, toByteOffset: C.asidMix, as: UInt32.self)
         context.storeBytes(of: asid << 1 | 1, toByteOffset: C.asidTag, as: UInt32.self)
         context.storeBytes(of: UInt64(UInt(bitPattern: table)), toByteOffset: C.table, as: UInt64.self)
+        syncIn()
         context.storeBytes(of: 0, toByteOffset: C.exitITState, as: UInt32.self)
         context.storeBytes(of: 0, toByteOffset: C.exitDeopt, as: UInt32.self)
         context.storeBytes(of: 0, toByteOffset: C.exitReason, as: UInt32.self)
@@ -311,6 +316,7 @@ final class DBTEngine {
         statistics.entries += 1
 
         statistics.exitReasons[Int(context.load(fromByteOffset: C.exitReason, as: UInt32.self)), default: 0] += 1
+        syncOut()
         let nzcv = context.load(fromByteOffset: C.nzcv, as: UInt32.self)
         cpu.cpsr.rawValue = (cpu.cpsr.rawValue & 0x0FFF_FFFF) | (nzcv & 0xF000_0000)
         cpu.cpsr.thumbState = context.load(fromByteOffset: C.thumb, as: UInt32.self) != 0
@@ -322,6 +328,26 @@ final class DBTEngine {
             return .deopted
         }
         return .ran
+    }
+
+    // MARK: State mirrored in the context
+
+    /// The exclusive monitor and thread ID registers, into the context.
+    private func syncIn() {
+        let C = Context.self
+        context.storeBytes(of: cpu.exclusiveMonitorAddress == nil ? 0 : 1, toByteOffset: C.monitorValid, as: UInt32.self)
+        context.storeBytes(of: cpu.exclusiveMonitorAddress ?? 0, toByteOffset: C.monitorAddress, as: UInt32.self)
+        for (index, opc2) in (2...4).enumerated() {
+            context.storeBytes(of: cpu.cp15.read(coprocessor: 15, opc1: 0, crn: 13, crm: 0, opc2: opc2), toByteOffset: C.threadID + index * 4, as: UInt32.self)
+        }
+    }
+
+    /// The exclusive monitor, back to the CPU (translated code never
+    /// writes the thread ID registers).
+    private func syncOut() {
+        let C = Context.self
+        cpu.exclusiveMonitorAddress = context.load(fromByteOffset: C.monitorValid, as: UInt32.self) != 0
+            ? context.load(fromByteOffset: C.monitorAddress, as: UInt32.self) : nil
     }
 
     // MARK: Interpreting in place
@@ -348,8 +374,10 @@ final class DBTEngine {
         let stateBefore = cpu.cpsr.rawValue & 0x3F
         let translationBefore = (cpu.cp15.sctlr, cpu.cp15.ttbr0, cpu.cp15.ttbr1, cpu.cp15.ttbcr, cpu.cp15.dacr, cpu.cp15.contextID)
         let tlbGeneration = cpu.tlbGeneration
+        syncOut()
         if Self.profileInterpreted { noteInterpreted(pc: cpu.registers.pc, thumb: cpu.cpsr.thumbState, prefix: "in place ") }
         cpu.step()
+        syncIn()
         statistics.interpretedInPlace += 1
         context.storeBytes(of: cpu.cpsr.rawValue & 0xF000_0000, toByteOffset: C.nzcv, as: UInt32.self)
         context.storeBytes(of: cpu.cpsr.thumbState ? 1 : 0, toByteOffset: C.thumb, as: UInt32.self)
@@ -359,11 +387,12 @@ final class DBTEngine {
         // wanted: leave at the next dispatch.
         var limit = context.load(fromByteOffset: C.limit, as: UInt64.self)
         if cpu.nextDeviceEventAt != .max { limit = min(limit, cpu.nextDeviceEventAt &- cpu.idleInstructionsSkipped) }
-        if (cpu.irqAsserted && !cpu.cpsr.irqDisabled) || (cpu.fiqAsserted && !cpu.cpsr.fiqDisabled) { limit = 0 }
+        if (cpu.irqAsserted && !cpu.cpsr.irqDisabled) || (cpu.fiqAsserted && !cpu.cpsr.fiqDisabled) || cpu.idleBlocked { limit = 0 }
         context.storeBytes(of: limit, toByteOffset: C.limit, as: UInt64.self)
         let translationAfter = (cpu.cp15.sctlr, cpu.cp15.ttbr0, cpu.cp15.ttbr1, cpu.cp15.ttbcr, cpu.cp15.dacr, cpu.cp15.contextID)
         let carryOn = cpu.lastError == nil && cpu.itState == 0 && cpu.cpsr.rawValue & 0x3F == stateBefore
             && cpu.registers.pc == expectedNext && translationBefore == translationAfter && cpu.tlbGeneration == tlbGeneration
+            && !cpu.idleBlocked
         return carryOn ? 0 : 1
     }
 

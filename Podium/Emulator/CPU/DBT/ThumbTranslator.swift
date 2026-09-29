@@ -157,6 +157,9 @@ enum ThumbTranslator {
         case .bitFieldInsert(let i): return i.width >= 1 && i.lsb + i.width <= 32
         case .extendWide(let i): return i.kind != .unsignedByte16 && i.kind != .signedByte16
         case .hint(let hint): return hint != .waitForInterrupt
+        case .armEquivalent(let arm): return ARMTranslator.isSupportedExclusive(arm)
+        case .clearExclusive: return true
+        case .coprocessorRegisterTransfer(let i): return ARMTranslator.isThreadIDRead(i)
         default: return false
         }
     }
@@ -364,6 +367,15 @@ enum ThumbTranslator {
 
         case .hint, .memoryBarrier:
             break
+
+        case .armEquivalent(let arm):
+            ARMTranslator.emitExclusive(arm, pc: pc, next: next, itState: itState, into: &e)
+
+        case .clearExclusive:
+            e.clearExclusive()
+
+        case .coprocessorRegisterTransfer(let i):
+            _ = e.readThreadID(i)
 
         case .movWide(let i):
             if i.isTop {

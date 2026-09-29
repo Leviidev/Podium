@@ -54,9 +54,49 @@ enum ARMTranslator {
         case .bitFieldExtract(let i): return i.condition
         case .multiply(let i): return i.condition
         case .clz(let i): return i.condition
-        case .memoryBarrier: return .always
+        case .memoryBarrier, .clearExclusive: return .always
+        case .loadExclusive(let i): return i.condition
+        case .storeExclusive(let i): return i.condition
+        case .loadExclusiveDouble(let i): return i.condition
+        case .storeExclusiveDouble(let i): return i.condition
+        case .coprocessorRegisterTransfer(let i): return i.condition
+        case .hint(let i): return i.condition
         default: return nil
         }
+    }
+
+    /// The exclusives, shared with Thumb-2 (which decodes them to these
+    /// forms): whether `instruction` is one this handles.
+    static func isSupportedExclusive(_ instruction: ARMInstruction) -> Bool {
+        switch instruction {
+        case .loadExclusive(let i): return i.rn != 15 && i.rt != 15
+        case .storeExclusive(let i): return i.rn != 15 && i.rt != 15 && i.rd != 15
+        case .loadExclusiveDouble(let i): return i.rn != 15 && i.rt != 15 && i.rt2 != 15
+        case .storeExclusiveDouble(let i): return i.rn != 15 && i.rt != 15 && i.rt2 != 15 && i.rd != 15
+        case .clearExclusive: return true
+        default: return false
+        }
+    }
+
+    static func emitExclusive(_ instruction: ARMInstruction, pc: UInt32, next: UInt32, itState: UInt8, into e: inout BlockEmitter) {
+        switch instruction {
+        case .loadExclusive(let i):
+            e.loadExclusive(rt: i.rt, rt2: nil, rn: i.rn, offset: i.offset, size: i.size, slow: e.slowPath(pc: pc, next: next, itState: itState))
+        case .storeExclusive(let i):
+            e.storeExclusive(rd: i.rd, rt: i.rt, rt2: nil, rn: i.rn, offset: i.offset, size: i.size, slow: e.slowPath(pc: pc, next: next, itState: itState))
+        case .loadExclusiveDouble(let i):
+            e.loadExclusive(rt: i.rt, rt2: i.rt2, rn: i.rn, offset: 0, size: 8, slow: e.slowPath(pc: pc, next: next, itState: itState))
+        case .storeExclusiveDouble(let i):
+            e.storeExclusive(rd: i.rd, rt: i.rt, rt2: i.rt2, rn: i.rn, offset: 0, size: 8, slow: e.slowPath(pc: pc, next: next, itState: itState))
+        case .clearExclusive:
+            e.clearExclusive()
+        default:
+            preconditionFailure("not an exclusive")
+        }
+    }
+
+    static func isThreadIDRead(_ i: CoprocessorRegisterTransferInstruction) -> Bool {
+        i.isLoad && i.coprocessor == 15 && i.opc1 == 0 && i.crn == 13 && i.crm == 0 && (2...4).contains(i.opc2) && i.rt != 15
     }
 
     private static func isSupported(_ instruction: ARMInstruction) -> Bool {
@@ -80,7 +120,9 @@ enum ARMTranslator {
         case .bitFieldExtract(let i): return i.rd != 15 && i.width >= 1 && i.lsb + i.width <= 32
         case .multiply(let i): return i.rd != 15 && i.ra != 15
         case .clz(let i): return i.rd != 15
-        default: return false
+        case .coprocessorRegisterTransfer(let i): return isThreadIDRead(i)
+        case .hint(let i): return i.hint != .waitForInterrupt
+        default: return isSupportedExclusive(instruction)
         }
     }
 
@@ -130,8 +172,14 @@ enum ARMTranslator {
             e.jump(to: UInt32(bitPattern: Int32(bitPattern: operandPC) &+ i.signedOffset), thumb: true)
             outcome = .ended
 
-        case .memoryBarrier:
+        case .memoryBarrier, .hint:
             break
+
+        case .loadExclusive, .storeExclusive, .loadExclusiveDouble, .storeExclusiveDouble, .clearExclusive:
+            emitExclusive(instruction, pc: pc, next: next, itState: 0, into: &e)
+
+        case .coprocessorRegisterTransfer(let i):
+            _ = e.readThreadID(i)
 
         case .loadStore(let i):
             let slow = e.slowPath(pc: pc, next: next, itState: 0)
