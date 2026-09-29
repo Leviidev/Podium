@@ -79,13 +79,31 @@ final class QuartzCoreAcceleration {
             0x14, 0xF0, 0x01, 0x0F, 0x4F, 0xEA, 0x54, 0x0E, 0x20, 0xEF, 0x10, 0x01, 0x1F, 0xBF, 0x93, 0xED, 0x00, 0x0A, 0x92, 0xED,
             0x00, 0x1A, 0x01, 0xEF, 0x00, 0x0D, 0x82, 0xED, 0x00, 0x0A, 0x00, 0x25, 0xB5, 0xEB, 0x54, 0x0F, 0x03, 0xF1, 0x04, 0x03,
             0x02, 0xF1, 0x04, 0x02, 0x6C, 0xA8, 0x94, 0xA9, 0x74, 0x46, 0xE5, 0xD1,
-        ], body: { stepAttributesAtR2($0, $1) }),
+        ], body: { stepAttributes($0, $1, stepAtR2) }),
         Loop(unslidAddress: 0x32D8_E83C, code: [
             0x12, 0xF0, 0x01, 0x0F, 0x4F, 0xEA, 0x52, 0x03, 0x20, 0xEF, 0x10, 0x01, 0x1F, 0xBF, 0x90, 0xED, 0x00, 0x0A, 0x91, 0xED,
             0x00, 0x1A, 0x01, 0xEF, 0x00, 0x0D, 0x81, 0xED, 0x00, 0x0A, 0x00, 0x24, 0xB4, 0xEB, 0x52, 0x0F, 0x00, 0xF1, 0x04, 0x00,
             0x01, 0xF1, 0x04, 0x01, 0x1A, 0x46, 0xE7, 0xD1,
-        ], body: { stepAttributesAtR1($0, $1) }),
-    ]
+        ], body: { stepAttributes($0, $1, stepAtR1) }),
+        // The same two, for the scanlines a clipped polygon skips.
+        Loop(unslidAddress: 0x32D8_EB4E, code: [
+            0x10, 0xF0, 0x01, 0x0F, 0x4F, 0xEA, 0x50, 0x05, 0x20, 0xEF, 0x10, 0x01, 0x1F, 0xBF, 0x94, 0xED, 0x00, 0x0A, 0x93, 0xED,
+            0x00, 0x1A, 0x01, 0xEF, 0x00, 0x0D, 0x83, 0xED, 0x00, 0x0A, 0x4F, 0xF0, 0x00, 0x0C, 0xBC, 0xEB, 0x50, 0x0F, 0x04, 0xF1,
+            0x04, 0x04, 0x03, 0xF1, 0x04, 0x03, 0x6C, 0xA9, 0x94, 0xAA, 0x28, 0x46, 0xE4, 0xD1,
+        ], body: { stepAttributes($0, $1, stepSkippedAtR3) }),
+        Loop(unslidAddress: 0x32D8_EB88, code: [
+            0x10, 0xF0, 0x01, 0x0F, 0x4F, 0xEA, 0x50, 0x03, 0x20, 0xEF, 0x10, 0x01, 0x1F, 0xBF, 0x91, 0xED, 0x00, 0x0A, 0x92, 0xED,
+            0x00, 0x1A, 0x01, 0xEF, 0x00, 0x0D, 0x82, 0xED, 0x00, 0x0A, 0x00, 0x24, 0xB4, 0xEB, 0x50, 0x0F, 0x01, 0xF1, 0x04, 0x01,
+            0x02, 0xF1, 0x04, 0x02, 0x18, 0x46, 0xE7, 0xD1,
+        ], body: { stepAttributes($0, $1, stepSkippedAtR2) }),
+    ] + [0x32D8_DCD6, 0x32D8_DD18].map { address in
+        // The span setup (`0x32D8D978`) has the same loop twice.
+        Loop(unslidAddress: address, code: [
+            0x16, 0xF0, 0x01, 0x0F, 0x0B, 0xD0, 0x92, 0xED, 0x00, 0x1A, 0x41, 0xFF, 0x30, 0x1D, 0x93, 0xED, 0x00, 0x0A, 0x00, 0xEF,
+            0x21, 0x0D, 0x83, 0xED, 0x00, 0x0A, 0x20, 0xEF, 0x10, 0x01, 0x75, 0x08, 0xB1, 0xEB, 0x56, 0x0F, 0x02, 0xF1, 0x04, 0x02,
+            0x03, 0xF1, 0x04, 0x03, 0x2E, 0x46, 0xE7, 0xD1,
+        ], body: { accumulateScaledAttributes($0, $1) })
+    }
 
     /// Replaces the functions in every process, once the shared cache's
     /// slide for this boot is known.
@@ -364,46 +382,61 @@ final class QuartzCoreAcceleration {
         return true
     }
 
-    /// `0x32D8E804`: for each set bit of r4, `r2[i] += r3[i]` (the add
-    /// done on both lanes of d0 and d1).
-    static func stepAttributesAtR2(_ cpu: ARMv7CPU, _ memory: GuestPageCache) -> Bool {
+    /// `0x32D8DCD6` and `0x32D8DD18`: for each set bit of r6,
+    /// `r3[i] += r2[i] * d16`. The loop ends when r6 shifted down equals
+    /// r1, which is always 0 there; any other r1 is left to the guest.
+    static func accumulateScaledAttributes(_ cpu: ARMv7CPU, _ memory: GuestPageCache) -> Bool {
         let r = cpu.registers
-        guard vectorUnitReady(cpu), let (count, hosts) = loopRuns(r[4], [(r[3], .read), (r[2], .write)], memory) else { return false }
+        guard r[1] == 0, vectorUnitReady(cpu),
+              let (count, hosts) = loopRuns(r[6], [(r[2], .read), (r[3], .write)], memory) else { return false }
         let (deltas, values) = (hosts[0], hosts[1])
         let neon = cpu.neon
-        var d0 = neon[0], d1 = neon[1]
-        var mask = r[4]
+        let d16 = neon[16]
+        var d0 = neon[0], d1 = neon[1], d17 = neon[17]
+        var mask = r[6]
         for i in 0..<count {
             if mask & 1 != 0 {
-                d0 = setLow(d0, deltas.load(fromByteOffset: i * 4, as: UInt32.self))
-                d1 = setLow(d1, values.load(fromByteOffset: i * 4, as: UInt32.self))
-                d0 = lanes(d1, d0, +)
+                d1 = setLow(d1, deltas.load(fromByteOffset: i * 4, as: UInt32.self))
+                d17 = lanes(d1, d16, *)
+                d0 = setLow(d0, values.load(fromByteOffset: i * 4, as: UInt32.self))
+                d0 = lanes(d0, d17, +)
                 values.storeBytes(of: UInt32(truncatingIfNeeded: d0), toByteOffset: i * 4, as: UInt32.self)
             }
             mask >>= 1
         }
         neon[0] = d0
         neon[1] = d1
+        neon[17] = d17
         let advance = UInt32(count * 4)
         r[2] &+= advance
         r[3] &+= advance
-        r[0] = r[13] &+ 0x1B0
-        r[1] = r[13] &+ 0x250
-        r[4] = 0
         r[5] = 0
-        r[14] = 0
+        r[6] = 0
         setLoopFlags(cpu)
         return true
     }
 
-    /// `0x32D8E83C`: for each set bit of r2, `r1[i] += r0[i]`.
-    static func stepAttributesAtR1(_ cpu: ARMv7CPU, _ memory: GuestPageCache) -> Bool {
+    /// Where a step loop keeps things: the mask and the arrays, the
+    /// registers it leaves 0 (the mask, its shifted copy, the one it
+    /// compares against), and ones it sets to sp plus an offset.
+    struct StepRegisters {
+        let mask, source, destination: Int
+        let zeroed: [Int]
+        let stackAddresses: [(register: Int, offset: UInt32)]
+    }
+
+    /// `0x32D8E804`, `0x32D8E83C`, `0x32D8EB4E` and `0x32D8EB88` — one
+    /// loop compiled four times with different registers: for each set
+    /// bit of the mask, `destination[i] += source[i]` (the add done on
+    /// both lanes of d0 and d1).
+    static func stepAttributes(_ cpu: ARMv7CPU, _ memory: GuestPageCache, _ at: StepRegisters) -> Bool {
         let r = cpu.registers
-        guard vectorUnitReady(cpu), let (count, hosts) = loopRuns(r[2], [(r[0], .read), (r[1], .write)], memory) else { return false }
+        guard vectorUnitReady(cpu),
+              let (count, hosts) = loopRuns(r[at.mask], [(r[at.source], .read), (r[at.destination], .write)], memory) else { return false }
         let (deltas, values) = (hosts[0], hosts[1])
         let neon = cpu.neon
         var d0 = neon[0], d1 = neon[1]
-        var mask = r[2]
+        var mask = r[at.mask]
         for i in 0..<count {
             if mask & 1 != 0 {
                 d0 = setLow(d0, deltas.load(fromByteOffset: i * 4, as: UInt32.self))
@@ -416,12 +449,16 @@ final class QuartzCoreAcceleration {
         neon[0] = d0
         neon[1] = d1
         let advance = UInt32(count * 4)
-        r[0] &+= advance
-        r[1] &+= advance
-        r[2] = 0
-        r[3] = 0
-        r[4] = 0
+        r[at.source] &+= advance
+        r[at.destination] &+= advance
+        for register in at.zeroed { r[register] = 0 }
+        for (register, offset) in at.stackAddresses { r[register] = r[13] &+ offset }
         setLoopFlags(cpu)
         return true
     }
+
+    static let stepAtR2 = StepRegisters(mask: 4, source: 3, destination: 2, zeroed: [4, 5, 14], stackAddresses: [(0, 0x1B0), (1, 0x250)])
+    static let stepAtR1 = StepRegisters(mask: 2, source: 0, destination: 1, zeroed: [2, 3, 4], stackAddresses: [])
+    static let stepSkippedAtR3 = StepRegisters(mask: 0, source: 4, destination: 3, zeroed: [0, 5, 12], stackAddresses: [(1, 0x1B0), (2, 0x250)])
+    static let stepSkippedAtR2 = StepRegisters(mask: 0, source: 1, destination: 2, zeroed: [0, 3, 4], stackAddresses: [])
 }
