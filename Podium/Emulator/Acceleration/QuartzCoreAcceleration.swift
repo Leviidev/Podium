@@ -56,10 +56,54 @@ final class QuartzCoreAcceleration {
         ], body: { $0.nearestSpan(opaque: false) }),
     ]
 
+    /// Loops of the scanline rasterizer (`0x32D8E5F8`) that translated
+    /// code runs natively in place (see `DBTEngine.registerSnippet`): per
+    /// scanline, they step each of a polygon's interpolated attributes —
+    /// an array of floats, selected by a bit mask — and they were most of
+    /// the guest instructions a frame took. `code` is the loop from its
+    /// head to the instruction after its closing branch.
+    private struct Loop {
+        let unslidAddress: UInt32
+        let code: [UInt8]
+        let body: (ARMv7CPU, GuestPageCache) -> Bool
+    }
+
+    private static let loops: [Loop] = [
+        Loop(unslidAddress: 0x32D8_E74A, code: [
+            0x14, 0xF0, 0x01, 0x0F, 0x13, 0xD0, 0x93, 0xED, 0x00, 0x1A, 0x92, 0xED, 0x00, 0x2A, 0x62, 0xEF, 0x01, 0x1D, 0x01, 0xFF,
+            0x90, 0x1D, 0x8E, 0xED, 0x00, 0x1A, 0x41, 0xFF, 0x30, 0x1D, 0x93, 0xED, 0x00, 0x1A, 0x01, 0xEF, 0x21, 0x1D, 0x80, 0xED,
+            0x00, 0x1A, 0x20, 0xEF, 0x10, 0x01, 0x4F, 0xEA, 0x54, 0x09, 0x00, 0x25, 0xB5, 0xEB, 0x54, 0x0F, 0x0E, 0xF1, 0x04, 0x0E,
+            0x00, 0xF1, 0x04, 0x00, 0x02, 0xF1, 0x04, 0x02, 0x03, 0xF1, 0x04, 0x03, 0x4C, 0x46, 0xD9, 0xD1,
+        ], body: { interpolateAttributes($0, $1) }),
+        Loop(unslidAddress: 0x32D8_E804, code: [
+            0x14, 0xF0, 0x01, 0x0F, 0x4F, 0xEA, 0x54, 0x0E, 0x20, 0xEF, 0x10, 0x01, 0x1F, 0xBF, 0x93, 0xED, 0x00, 0x0A, 0x92, 0xED,
+            0x00, 0x1A, 0x01, 0xEF, 0x00, 0x0D, 0x82, 0xED, 0x00, 0x0A, 0x00, 0x25, 0xB5, 0xEB, 0x54, 0x0F, 0x03, 0xF1, 0x04, 0x03,
+            0x02, 0xF1, 0x04, 0x02, 0x6C, 0xA8, 0x94, 0xA9, 0x74, 0x46, 0xE5, 0xD1,
+        ], body: { stepAttributesAtR2($0, $1) }),
+        Loop(unslidAddress: 0x32D8_E83C, code: [
+            0x12, 0xF0, 0x01, 0x0F, 0x4F, 0xEA, 0x52, 0x03, 0x20, 0xEF, 0x10, 0x01, 0x1F, 0xBF, 0x90, 0xED, 0x00, 0x0A, 0x91, 0xED,
+            0x00, 0x1A, 0x01, 0xEF, 0x00, 0x0D, 0x81, 0xED, 0x00, 0x0A, 0x00, 0x24, 0xB4, 0xEB, 0x52, 0x0F, 0x00, 0xF1, 0x04, 0x00,
+            0x01, 0xF1, 0x04, 0x01, 0x1A, 0x46, 0xE7, 0xD1,
+        ], body: { stepAttributesAtR1($0, $1) }),
+    ]
+
     /// Replaces the functions in every process, once the shared cache's
     /// slide for this boot is known.
     static func install(on cpu: ARMv7CPU, sharedCacheSlide slide: UInt32) {
         let accelerator = QuartzCoreAcceleration(cpu: cpu)
+        for loop in loops {
+            let address = loop.unslidAddress &+ slide
+            var verified: Bool?
+            cpu.dbt?.registerSnippet(at: address, thumb: true, exit: address &+ UInt32(loop.code.count)) { cpu in
+                if verified == nil {
+                    guard let code = accelerator.memory.bytes(address, count: loop.code.count, access: .execute) else { return false }
+                    verified = code == loop.code
+                }
+                guard verified == true else { return false }
+                accelerator.memory.begin()
+                return loop.body(cpu, accelerator.memory)
+            }
+        }
         for function in functions {
             let address = function.unslidAddress &+ slide
             var verified = false
@@ -225,6 +269,159 @@ final class QuartzCoreAcceleration {
                 left -= n
             }
         }
+        return true
+    }
+
+    // MARK: The rasterizer's loops
+
+    /// Advanced SIMD floating point with the standard FPSCR — what the
+    /// interpreter does for these instructions (`ARMv7CPU+NEON.swift`).
+    @inline(__always) private static func neonFloat(_ bits: UInt32) -> Float {
+        let value = Float(bitPattern: bits)
+        return value.isSubnormal ? (value.sign == .minus ? -0.0 : 0.0) : value
+    }
+
+    @inline(__always) private static func neonBits(_ value: Float) -> UInt32 {
+        if value.isNaN { return 0x7FC0_0000 }
+        if value.isSubnormal { return value.sign == .minus ? 0x8000_0000 : 0 }
+        return value.bitPattern
+    }
+
+    /// `vadd`/`vsub`/`vmul.f32` of two D registers' lanes.
+    @inline(__always) private static func lanes(_ a: UInt64, _ b: UInt64, _ operation: (Float, Float) -> Float) -> UInt64 {
+        let low = neonBits(operation(neonFloat(UInt32(truncatingIfNeeded: a)), neonFloat(UInt32(truncatingIfNeeded: b))))
+        let high = neonBits(operation(neonFloat(UInt32(truncatingIfNeeded: a >> 32)), neonFloat(UInt32(truncatingIfNeeded: b >> 32))))
+        return UInt64(low) | UInt64(high) << 32
+    }
+
+    @inline(__always) private static func setLow(_ d: UInt64, _ value: UInt32) -> UInt64 { d & 0xFFFF_FFFF_0000_0000 | UInt64(value) }
+
+    /// Iterations of a mask loop (`while (mask >>= 1) != 0`, at least one)
+    /// and the host addresses of `count` words from each pointer, if the
+    /// guest could access them all (every one checked before anything is
+    /// written).
+    private static func loopRuns(_ mask: UInt32, _ pointers: [(UInt32, ARMv7MMU.Access)], _ memory: GuestPageCache)
+        -> (Int, [UnsafeMutableRawPointer])? {
+        let count = max(1, 32 - mask.leadingZeroBitCount)
+        var hosts: [UnsafeMutableRawPointer] = []
+        for (address, access) in pointers {
+            guard address & 3 == 0, let host = memory.span(address, count: count * 4, access: access) else { return nil }
+            hosts.append(host)
+        }
+        return (count, hosts)
+    }
+
+    /// Needs the unit enabled and the standard modes, like any translated
+    /// vector code; otherwise the guest's own code runs (and traps).
+    private static func vectorUnitReady(_ cpu: ARMv7CPU) -> Bool {
+        cpu.fpexc & ARMv7CPU.fpexcEnableBit != 0 && cpu.fpscr & 0x03C0_0000 == 0x0300_0000
+    }
+
+    /// The loop's final compare (0 against 0) leaves NZCV 0110.
+    private static func setLoopFlags(_ cpu: ARMv7CPU) {
+        cpu.cpsr.rawValue = (cpu.cpsr.rawValue & 0x0FFF_FFFF) | 0x6000_0000
+    }
+
+    /// `0x32D8E74A`: for each set bit of r4, from arrays at r3 and r2 into
+    /// arrays at lr and r0 — `lr[i] = (r2[i] - r3[i]) * s0`, then
+    /// `r0[i] = r3[i] + lr[i] * d16`, both lanes of each operation as the
+    /// D-register code computes them.
+    static func interpolateAttributes(_ cpu: ARMv7CPU, _ memory: GuestPageCache) -> Bool {
+        let r = cpu.registers
+        guard vectorUnitReady(cpu),
+              let (count, hosts) = loopRuns(r[4], [(r[3], .read), (r[2], .read), (r[14], .write), (r[0], .write)], memory) else { return false }
+        let (from3, from2, into14, into0) = (hosts[0], hosts[1], hosts[2], hosts[3])
+        let neon = cpu.neon
+        let d0 = neon[0], d16 = neon[16]
+        var d1 = neon[1], d2 = neon[2], d17 = neon[17]
+        var mask = r[4]
+        for i in 0..<count {
+            if mask & 1 != 0 {
+                d1 = setLow(d1, from3.load(fromByteOffset: i * 4, as: UInt32.self))
+                d2 = setLow(d2, from2.load(fromByteOffset: i * 4, as: UInt32.self))
+                d17 = lanes(d2, d1, -)
+                d1 = lanes(d17, d0, *)
+                into14.storeBytes(of: UInt32(truncatingIfNeeded: d1), toByteOffset: i * 4, as: UInt32.self)
+                d17 = lanes(d1, d16, *)
+                d1 = setLow(d1, from3.load(fromByteOffset: i * 4, as: UInt32.self))
+                d1 = lanes(d1, d17, +)
+                into0.storeBytes(of: UInt32(truncatingIfNeeded: d1), toByteOffset: i * 4, as: UInt32.self)
+            }
+            mask >>= 1
+        }
+        neon[1] = d1
+        neon[2] = d2
+        neon[17] = d17
+        let advance = UInt32(count * 4)
+        r[0] &+= advance
+        r[2] &+= advance
+        r[3] &+= advance
+        r[14] &+= advance
+        r[4] = 0
+        r[5] = 0
+        r[9] = 0
+        setLoopFlags(cpu)
+        return true
+    }
+
+    /// `0x32D8E804`: for each set bit of r4, `r2[i] += r3[i]` (the add
+    /// done on both lanes of d0 and d1).
+    static func stepAttributesAtR2(_ cpu: ARMv7CPU, _ memory: GuestPageCache) -> Bool {
+        let r = cpu.registers
+        guard vectorUnitReady(cpu), let (count, hosts) = loopRuns(r[4], [(r[3], .read), (r[2], .write)], memory) else { return false }
+        let (deltas, values) = (hosts[0], hosts[1])
+        let neon = cpu.neon
+        var d0 = neon[0], d1 = neon[1]
+        var mask = r[4]
+        for i in 0..<count {
+            if mask & 1 != 0 {
+                d0 = setLow(d0, deltas.load(fromByteOffset: i * 4, as: UInt32.self))
+                d1 = setLow(d1, values.load(fromByteOffset: i * 4, as: UInt32.self))
+                d0 = lanes(d1, d0, +)
+                values.storeBytes(of: UInt32(truncatingIfNeeded: d0), toByteOffset: i * 4, as: UInt32.self)
+            }
+            mask >>= 1
+        }
+        neon[0] = d0
+        neon[1] = d1
+        let advance = UInt32(count * 4)
+        r[2] &+= advance
+        r[3] &+= advance
+        r[0] = r[13] &+ 0x1B0
+        r[1] = r[13] &+ 0x250
+        r[4] = 0
+        r[5] = 0
+        r[14] = 0
+        setLoopFlags(cpu)
+        return true
+    }
+
+    /// `0x32D8E83C`: for each set bit of r2, `r1[i] += r0[i]`.
+    static func stepAttributesAtR1(_ cpu: ARMv7CPU, _ memory: GuestPageCache) -> Bool {
+        let r = cpu.registers
+        guard vectorUnitReady(cpu), let (count, hosts) = loopRuns(r[2], [(r[0], .read), (r[1], .write)], memory) else { return false }
+        let (deltas, values) = (hosts[0], hosts[1])
+        let neon = cpu.neon
+        var d0 = neon[0], d1 = neon[1]
+        var mask = r[2]
+        for i in 0..<count {
+            if mask & 1 != 0 {
+                d0 = setLow(d0, deltas.load(fromByteOffset: i * 4, as: UInt32.self))
+                d1 = setLow(d1, values.load(fromByteOffset: i * 4, as: UInt32.self))
+                d0 = lanes(d1, d0, +)
+                values.storeBytes(of: UInt32(truncatingIfNeeded: d0), toByteOffset: i * 4, as: UInt32.self)
+            }
+            mask >>= 1
+        }
+        neon[0] = d0
+        neon[1] = d1
+        let advance = UInt32(count * 4)
+        r[0] &+= advance
+        r[1] &+= advance
+        r[2] = 0
+        r[3] = 0
+        r[4] = 0
+        setLoopFlags(cpu)
         return true
     }
 }

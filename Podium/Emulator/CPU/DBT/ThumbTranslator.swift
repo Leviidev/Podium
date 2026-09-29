@@ -27,6 +27,7 @@ enum ThumbTranslator {
         var address = virtual
         while e.count < maxInstructions {
             if address != virtual, stopAddresses.contains(address) { break }
+            if let snippet = e.snippets[address | 1] { e.callSnippet(snippet.index, exit: snippet.exit, pc: address) }
             guard let (instruction, size) = code.fetch(address) else { break }
 
             if case .it(let it) = instruction {

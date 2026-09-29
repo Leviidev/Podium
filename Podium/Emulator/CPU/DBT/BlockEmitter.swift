@@ -51,13 +51,22 @@ struct BlockEmitter {
     /// Resume points of this instruction's slow paths, bound after it.
     private var pendingResumes: [Label] = []
 
-    init(startWord: Int, dispatchWord: Int, dispatchLinkWord: Int, exitWord: Int, thumb: Bool, page: UInt32) {
+    /// `counter`: debugging, a count the block adds one to each time
+    /// it's entered.
+    init(startWord: Int, dispatchWord: Int, dispatchLinkWord: Int, exitWord: Int, thumb: Bool, page: UInt32,
+         counter: UnsafeMutablePointer<UInt64>? = nil) {
         self.startWord = startWord
         self.dispatchWord = dispatchWord
         self.dispatchLinkWord = dispatchLinkWord
         self.exitWord = exitWord
         self.thumb = thumb
         self.page = page
+        if let counter {
+            a.mov(x: 9, UInt64(UInt(bitPattern: counter)))
+            a.ldr(x: 10, 9, offset: 0)
+            a.add(x: 10, 10, imm: 1)
+            a.str(x: 10, 9, offset: 0)
+        }
     }
 
     private mutating func branch(toWord word: Int) {
@@ -414,6 +423,33 @@ struct BlockEmitter {
         let label = a.newLabel()
         stubs.append(.deopt(label: label, pc: pc, itState: itState, executed: count))
         return label
+    }
+
+    // MARK: Native snippets
+
+    /// See `DBTEngine.registerSnippet`: by address with the Thumb bit.
+    var snippets: [UInt32: (index: Int, exit: UInt32)] = [:]
+
+    /// Before the instruction at `pc`, where snippet `index` replaces the
+    /// guest code up to `exit`: runs it, and goes on at `exit` if it did
+    /// the work; otherwise falls through to the guest code's translation.
+    /// The snippet counts as one instruction.
+    mutating func callSnippet(_ index: Int, exit: UInt32, pc: UInt32) {
+        let C = DBTEngine.Context.self
+        let fallback = a.newLabel()
+        a.mrsNZCV(x: 9)
+        a.str(w: 9, H.context, offset: C.nzcv)
+        a.mov(w: 9, pc)
+        a.str(w: 9, H.registers, offset: 15 * 4)
+        a.mov(x: 0, x: H.context)
+        a.mov(w: 1, UInt32(index))
+        a.ldr(x: 16, H.context, offset: C.snippetHelper)
+        a.blr(x: 16)
+        a.ldr(w: 9, H.context, offset: C.nzcv)
+        a.msrNZCV(x: 9)
+        a.cbz(w: 0, fallback)
+        self.exit(to: exit, thumb: thumb, executed: count + 1)
+        a.bind(fallback)
     }
 
     // MARK: Finishing

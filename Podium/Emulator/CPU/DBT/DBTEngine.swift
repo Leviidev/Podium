@@ -62,6 +62,7 @@ final class DBTEngine {
         /// A link request (exit reason 4): the slot's word offset, the
         /// block found for it and that block's key.
         static let linkSlot = 0x9C, linkTarget = 0xA0, linkKey = 0xA8
+        static let snippetHelper = 0xB0
         static let size = 0x100
     }
 
@@ -128,6 +129,7 @@ final class DBTEngine {
         var exitReasons = [0, 0, 0, 0, 0]
         var links = 0
         var unlinks = 0
+        var snippetsRun = 0
         /// Instructions the interpreter ran while translation was on
         /// (with `profileInterpreted`), by where they are: the physical
         /// address, the Thumb bit (bit 32) and why (bits 33...: 0 not
@@ -156,6 +158,8 @@ final class DBTEngine {
         context.storeBytes(of: UInt64(UInt(bitPattern: Unmanaged.passUnretained(self).toOpaque())), toByteOffset: Context.engine, as: UInt64.self)
         context.storeBytes(of: UInt64(UInt(bitPattern: unsafeBitCast(Self.interpretHelper, to: UnsafeRawPointer.self))),
                            toByteOffset: Context.interpretHelper, as: UInt64.self)
+        context.storeBytes(of: UInt64(UInt(bitPattern: unsafeBitCast(Self.snippetHelper, to: UnsafeRawPointer.self))),
+                           toByteOffset: Context.snippetHelper, as: UInt64.self)
         cpu.codePageBitmap = codePageBitmap
         cpu.codeWriteObserver = self
         cpu.hostFPCR = (readFPCR, writeFPCR)
@@ -483,13 +487,81 @@ final class DBTEngine {
 
     /// Debugging: every block translated since the last flush, as (region
     /// offset, byte length, guest address with the Thumb bit).
+    /// With it, blocks also count their entries (see `guestProfile`).
     static var recordBlocks = false
-    private(set) var blockRecords: [(offset: Int, length: Int, guest: UInt32)] = []
+    private(set) var blockRecords: [(offset: Int, length: Int, guest: UInt32, instructions: Int)] = []
+    private static let maxCountedBlocks = 1 << 21
+    private lazy var blockCounters: UnsafeMutablePointer<UInt64> = {
+        let counters = UnsafeMutablePointer<UInt64>.allocate(capacity: Self.maxCountedBlocks)
+        counters.initialize(repeating: 0, count: Self.maxCountedBlocks)
+        return counters
+    }()
+    /// Guest instructions run by translated code since the last reset, by
+    /// block address (with the Thumb bit), counting every entry as the
+    /// whole block — a side exit makes it an overestimate.
+    private var retiredByBlock: [UInt32: UInt64] = [:]
+
+    private func foldBlockCounts() {
+        for (index, record) in blockRecords.enumerated() where index < Self.maxCountedBlocks && blockCounters[index] != 0 {
+            retiredByBlock[record.guest, default: 0] += blockCounters[index] &* UInt64(record.instructions)
+            blockCounters[index] = 0
+        }
+    }
+
+    /// Debugging: `retiredByBlock`, then zeroed.
+    func guestProfile() -> [UInt32: UInt64] {
+        foldBlockCounts()
+        defer { retiredByBlock = [:] }
+        return retiredByBlock
+    }
 
     /// Debugging: the code region as it stands — its address and the
     /// bytes in use — for matching host samples to translated code.
     func regionContents() -> (address: UInt, bytes: Data) {
         (UInt(bitPattern: region.executable), Data(bytes: region.executable, count: cursor))
+    }
+
+    // MARK: Native snippets
+
+    /// Native code that translated code runs in place of a stretch of
+    /// guest code (a hot loop), calling it directly rather than leaving —
+    /// what a native function (`ARMv7CPU.nativeFunctions`) can't do from
+    /// the middle of a function, and costs an exit for at its start. The
+    /// body works on the CPU's state and returns true with the guest code
+    /// done, the registers, flags and memory as it would have left them
+    /// (the guest's pc aside: translated code goes on at `exit`); false,
+    /// having changed nothing, for the guest code to run instead.
+    private struct Snippet {
+        let exit: UInt32
+        let body: (ARMv7CPU) -> Bool
+    }
+    private var snippets: [Snippet] = []
+    /// By address with the Thumb bit: the snippet's index and exit.
+    private var snippetTable: [UInt32: (index: Int, exit: UInt32)] = [:]
+
+    func registerSnippet(at virtual: UInt32, thumb: Bool, exit: UInt32, body: @escaping (ARMv7CPU) -> Bool) {
+        snippetTable[virtual | (thumb ? 1 : 0)] = (snippets.count, exit)
+        snippets.append(Snippet(exit: exit, body: body))
+        // Translations that ran through it are retranslated with the call.
+        for key in keysByVirtualPage.removeValue(forKey: virtual & 0xFFFF_F000) ?? [] { discard(key) }
+    }
+
+    /// Called from translated code: runs snippet `index` with the
+    /// context's flags; 1 if it did the work, 0 if the guest code must.
+    static let snippetHelper: @convention(c) (UnsafeMutableRawPointer, UInt32) -> UInt32 = { context, index in
+        let engine = Unmanaged<DBTEngine>.fromOpaque(UnsafeRawPointer(bitPattern: UInt(context.load(fromByteOffset: Context.engine, as: UInt64.self)))!)
+            .takeUnretainedValue()
+        return engine.runSnippet(Int(index))
+    }
+
+    private func runSnippet(_ index: Int) -> UInt32 {
+        let C = Context.self
+        let flags = context.load(fromByteOffset: C.nzcv, as: UInt32.self) & 0xF000_0000
+        cpu.cpsr.rawValue = (cpu.cpsr.rawValue & 0x0FFF_FFFF) | flags
+        guard snippets[index].body(cpu) else { return 0 }
+        statistics.snippetsRun += 1
+        context.storeBytes(of: cpu.cpsr.rawValue & 0xF000_0000, toByteOffset: C.nzcv, as: UInt32.self)
+        return 1
     }
 
     /// Debugging: tally what the interpreter runs instead.
@@ -563,8 +635,10 @@ final class DBTEngine {
     private func translate(virtual: UInt32, physical: UInt32, thumb: Bool, page: UnsafeRawPointer) -> (code: UnsafeRawPointer, linkSlots: [Int])? {
         guard statistics.blocksTranslated < Self.translationLimit else { return nil }
         let startWord = cursor / 4
+        let counter = Self.recordBlocks && blockRecords.count < Self.maxCountedBlocks ? blockCounters + blockRecords.count : nil
         var emitter = BlockEmitter(startWord: startWord, dispatchWord: dispatchWord, dispatchLinkWord: dispatchLinkWord,
-                                   exitWord: exitWord, thumb: thumb, page: virtual & 0xFFFF_F000)
+                                   exitWord: exitWord, thumb: thumb, page: virtual & 0xFFFF_F000, counter: counter)
+        emitter.snippets = snippetTable
         let translated: Int
         if thumb {
             translated = ThumbTranslator.translate(into: &emitter, virtual: virtual, page: page, stopAddresses: stopAddresses)
@@ -584,7 +658,9 @@ final class DBTEngine {
         statistics.blocksTranslated += 1
         statistics.guestInstructionsTranslated += translated
         Self.reportTranslation?(virtual, thumb, translated)
-        if Self.recordBlocks { blockRecords.append((code - UnsafeRawPointer(region.executable), words.count * 4, virtual | (thumb ? 1 : 0))) }
+        if Self.recordBlocks {
+            blockRecords.append((code - UnsafeRawPointer(region.executable), words.count * 4, virtual | (thumb ? 1 : 0), translated))
+        }
         return (code, emitter.linkSlots)
     }
 
@@ -645,6 +721,7 @@ final class DBTEngine {
         keysByVirtualPage.removeAll(keepingCapacity: true)
         slotOwners.removeAll(keepingCapacity: true)
         linksInto.removeAll(keepingCapacity: true)
+        if Self.recordBlocks { foldBlockCounts() }
         blockRecords.removeAll(keepingCapacity: true)
         codePageBitmap.update(repeating: 0, count: (ramPages + 63) / 64)
         cpu.flushTLB()
