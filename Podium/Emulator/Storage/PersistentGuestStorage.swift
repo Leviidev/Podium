@@ -17,6 +17,10 @@ final class PersistentGuestStorage {
         case deviceMustBePoweredOff
         case firmwareInUse
         case noFirmwareForErase
+        case storageNotPrepared
+        case invalidGuestFile(String)
+        case duplicateGuestFile(String)
+        case insufficientGuestSpace(required: UInt64, available: UInt64)
 
         var errorDescription: String? { description }
 
@@ -27,6 +31,10 @@ final class PersistentGuestStorage {
             case .deviceMustBePoweredOff: return "Power off the virtual iPod before erasing its contents."
             case .firmwareInUse: return "Power off the virtual iPod before removing its firmware."
             case .noFirmwareForErase: return "Import compatible firmware before erasing the virtual iPod."
+            case .storageNotPrepared: return "Power on the virtual iPod once before adding files."
+            case .invalidGuestFile: return "A selected item isn't a regular file name that can be stored on the virtual iPod."
+            case .duplicateGuestFile: return "A selected filename is repeated or already exists in Media/Podium."
+            case .insufficientGuestSpace: return "There isn't enough free space to add these files while keeping guest storage available."
             }
         }
     }
@@ -84,6 +92,55 @@ final class PersistentGuestStorage {
         } else {
             try removeImportedFile()
         }
+    }
+
+    /// Adds regular host files to a dedicated folder on the guest's persistent volume.
+    /// All reads/writes happen with the emulator stopped; no host path is exposed to iOS.
+    func addFiles(_ urls: [URL], emulatorIsBusy: Bool) throws {
+        guard !emulatorIsBusy else { throw StorageError.deviceMustBePoweredOff }
+        guard !urls.isEmpty else { return }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+
+        let imageURL = RootFilesystemPreparer.userImageURL(in: try directoryURL())
+        guard fileManager.fileExists(atPath: imageURL.path) else { throw StorageError.storageNotPrepared }
+        var selectedNames = Set<String>()
+        var files: [RootFilesystemPreparer.GuestFile] = []
+        var totalBytes: UInt64 = 0
+        for url in urls {
+            let name = url.lastPathComponent
+            guard Self.isSafeGuestFileName(name), selectedNames.insert(name).inserted,
+                  let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+                  attributes[.type] as? FileAttributeType == .typeRegular,
+                  let fileSize = attributes[.size] as? NSNumber else {
+                throw StorageError.invalidGuestFile(name)
+            }
+            let (nextBytes, overflow) = totalBytes.addingReportingOverflow(fileSize.uint64Value)
+            guard !overflow else { throw StorageError.invalidGuestFile(name) }
+            totalBytes = nextBytes
+            files.append(.init(name: name, sourceURL: url, size: fileSize.uint64Value))
+        }
+
+        let header = try RootFilesystemPreparer.readHFSPlusVolumeHeader(at: imageURL)
+        let freeBytes = UInt64(header.freeBlocks) * UInt64(header.blockSize)
+        let guestReserve: UInt64 = 8 << 20
+        let metadataReserve: UInt64 = 1 << 20
+        let (required, overflow) = totalBytes.addingReportingOverflow(guestReserve + metadataReserve)
+        guard !overflow, required <= freeBytes else {
+            throw StorageError.insufficientGuestSpace(required: overflow ? .max : required, available: freeBytes)
+        }
+
+        let existing = try HFSPlusVolume(source: FileVolumeSource(url: imageURL))
+        let existingBuilder = try RootFilesystemBuilder(volume: existing)
+        for file in files where existingBuilder.contains("/private/var/mobile/Media/Podium/" + file.name) {
+            throw StorageError.duplicateGuestFile(file.name)
+        }
+        try RootFilesystemPreparer.addGuestFiles(files, to: imageURL, keepingFreeSpace: guestReserve)
+    }
+
+    static func isSafeGuestFileName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." &&
+        !name.contains("/") && !name.unicodeScalars.contains(where: { $0.value == 0 }) && name.utf16.count <= 255
     }
 
     func snapshot() throws -> Snapshot? {

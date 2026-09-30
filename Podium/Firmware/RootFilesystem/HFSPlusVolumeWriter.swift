@@ -171,11 +171,14 @@ enum HFSPlusForkContent {
     /// A fork of the source volume, copied as is.
     case sourceFork(HFSPlusForkData, fileID: UInt32, forkType: UInt8)
     case bytes([UInt8])
+    /// A host file streamed into the rebuilt volume without loading it all into memory.
+    case file(URL, length: UInt64)
 
     var length: UInt64 {
         switch self {
         case .sourceFork(let fork, _, _): return fork.logicalSize
         case .bytes(let bytes): return UInt64(bytes.count)
+        case .file(_, let length): return length
         }
     }
 }
@@ -218,6 +221,7 @@ final class HFSPlusVolumeWriter {
         content: [UInt32: (data: HFSPlusForkContent?, resource: HFSPlusForkContent?)],
         nextCatalogID: UInt32,
         freeSpace: UInt64,
+        maximumVolumeBytes: UInt64? = nil,
         journalFiles: (infoBlock: UInt32, journal: UInt32)? = nil,
         to url: URL,
         progress: (Progress) -> Void = { _ in }
@@ -254,25 +258,54 @@ final class HFSPlusVolumeWriter {
             let forks = content[record.catalogNodeID]
             forkBlocks += blocks(forks?.data?.length ?? 0) + blocks(forks?.resource?.length ?? 0)
         }
-        let fixedBlocks = 1 + extentsBlocks + catalogBlocks + attributesBlocks + forkBlocks + blocks(freeSpace) + 1
-        var allocationBlocks: UInt64 = 1
-        while blocks((fixedBlocks + allocationBlocks + 7) / 8) > allocationBlocks { allocationBlocks += 1 }
-        let totalBlocks = fixedBlocks + allocationBlocks
-        guard totalBlocks <= UInt64(UInt32.max) else { throw HFSPlusError.unsupported("volume too large") }
+        // The primary volume header starts at byte 1024, so reserve every
+        // allocation block that contains it before placing the allocation
+        // bitmap or other forks. With 512-byte blocks that is blocks 0...2;
+        // otherwise the bitmap can overwrite the header during the write.
+        let primaryHeaderBlocks = blocks(HFSPlusVolumeHeader.offset + UInt64(HFSPlusVolumeHeader.byteCount))
+        let alternateHeaderBlocks = blocks(1024)
+        let occupiedBlocks = primaryHeaderBlocks + extentsBlocks + catalogBlocks + attributesBlocks + forkBlocks + alternateHeaderBlocks
+        let minimumFixedBlocks = occupiedBlocks + blocks(freeSpace)
+        var minimumAllocationBlocks: UInt64 = 1
+        while blocks((minimumFixedBlocks + minimumAllocationBlocks + 7) / 8) > minimumAllocationBlocks {
+            minimumAllocationBlocks += 1
+        }
+        let minimumTotalBlocks = minimumFixedBlocks + minimumAllocationBlocks
+        let totalBlocks: UInt64
+        let allocationBlocks: UInt64
+        if let maximumVolumeBytes {
+            let capacityBlocks = maximumVolumeBytes / bs
+            guard capacityBlocks >= minimumTotalBlocks else {
+                throw HFSPlusError.unsupported("the rebuilt volume exceeds its maximum capacity")
+            }
+            totalBlocks = capacityBlocks
+            let bitmapBytes = (capacityBlocks + 7) / 8
+            allocationBlocks = (bitmapBytes + bs - 1) / bs
+            let actualFreeBlocks = capacityBlocks - occupiedBlocks - allocationBlocks
+            guard actualFreeBlocks >= blocks(freeSpace) else {
+                throw HFSPlusError.unsupported("the rebuilt volume cannot retain the requested free space")
+            }
+        } else {
+            totalBlocks = minimumTotalBlocks
+            allocationBlocks = minimumAllocationBlocks
+        }
+        guard totalBlocks <= UInt64(UInt32.max), allocationBlocks <= UInt64(UInt32.max) else {
+            throw HFSPlusError.unsupported("volume too large")
+        }
 
         // Assign blocks.
         var bitmap = [UInt8](repeating: 0, count: Int(allocationBlocks * bs))
         func markUsed(_ start: UInt64, _ count: UInt64) {
             for block in start..<start + count { bitmap[Int(block / 8)] |= 0x80 >> UInt8(block % 8) }
         }
-        var next: UInt64 = 1
+        for block in 0..<primaryHeaderBlocks { markUsed(block, 1) }
+        var next = primaryHeaderBlocks
         func allocate(_ count: UInt64) -> UInt64 {
             let start = next
             markUsed(start, count)
             next += count
             return start
         }
-        markUsed(0, 1)
         let allocationStart = allocate(allocationBlocks)
         let extentsStart = allocate(extentsBlocks)
         let catalogStart = allocate(catalogBlocks)
@@ -302,7 +335,7 @@ final class HFSPlusVolumeWriter {
             }
         }
         let nextAllocation = next
-        markUsed(totalBlocks - 1, 1)
+        for block in (totalBlocks - alternateHeaderBlocks)..<totalBlocks { markUsed(block, 1) }
 
         // Metadata.
         let catalogBytes = try BTreeBuilder.build(records: catalog.map { BTreeRecord(key: $0.key, data: $0.data) },
@@ -382,9 +415,27 @@ final class HFSPlusVolumeWriter {
                         progress(Progress(bytesWritten: written, totalBytes: totalForkBytes))
                     }
                 }
+            case .file(let sourceURL, let length):
+                let source = try FileHandle(forReadingFrom: sourceURL)
+                defer { try? source.close() }
+                var remaining = length
+                while remaining > 0 {
+                    let requested = Int(min(remaining, 1 << 20))
+                    guard let chunk = try source.read(upToCount: requested), !chunk.isEmpty else {
+                        throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: sourceURL.path])
+                    }
+                    try handle.write(contentsOf: chunk)
+                    remaining -= UInt64(chunk.count)
+                    written += UInt64(chunk.count)
+                    if written - lastReported >= 8 << 20 {
+                        lastReported = written
+                        progress(Progress(bytesWritten: written, totalBytes: totalForkBytes))
+                    }
+                }
             }
         }
         progress(Progress(bytesWritten: written, totalBytes: totalForkBytes))
+        try handle.synchronize()
     }
 }
 

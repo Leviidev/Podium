@@ -102,6 +102,48 @@ enum RootFilesystemPreparer {
         imageURL.appendingPathExtension("version")
     }
 
+    struct GuestFile {
+        let name: String
+        let sourceURL: URL
+        let size: UInt64
+    }
+
+    /// Rebuilds the user volume with staged host files in the guest-visible
+    /// `/private/var/mobile/Media/Podium` directory.
+    static func addGuestFiles(_ files: [GuestFile], to image: URL, keepingFreeSpace freeSpace: UInt64) throws {
+        guard !files.isEmpty else { return }
+        let fileManager = FileManager.default
+        let sourceSize = (try fileManager.attributesOfItem(atPath: image.path)[.size] as? NSNumber)?.uint64Value ?? 0
+        let sourceVolume = try HFSPlusVolume(source: FileVolumeSource(url: image))
+        let builder = try RootFilesystemBuilder(volume: sourceVolume)
+        let targetDirectory = "/private/var/mobile/Media/Podium"
+        for path in ["/private/var/mobile/Media", targetDirectory] where !builder.contains(path) {
+            try builder.addFolder(path, owner: 501, group: 501, mode: 0o755)
+        }
+        for file in files {
+            try builder.addFile(targetDirectory + "/" + file.name, from: file.sourceURL, length: file.size,
+                                owner: 501, group: 501, mode: 0o644, template: "/private/etc/fstab")
+        }
+
+        let temporary = image.appendingPathExtension("updating")
+        let temporaryMarker = markerURL(for: temporary)
+        let version = try? String(contentsOf: markerURL(for: image), encoding: .utf8)
+        try? fileManager.removeItem(at: temporary)
+        try? fileManager.removeItem(at: temporaryMarker)
+        do {
+            try builder.write(to: temporary, freeSpace: freeSpace, maximumVolumeBytes: sourceSize)
+            let updatedHeader = try readHFSPlusVolumeHeader(at: temporary)
+            guard updatedHeader.freeBlocks >= UInt32(freeSpace / UInt64(updatedHeader.blockSize)) else {
+                throw PreparationError.invalidHFSImage("the rebuilt guest volume did not retain its reserved free space")
+            }
+            try safelyPromote(temporary, to: image, markerVersion: version, fileManager: fileManager)
+        } catch {
+            try? fileManager.removeItem(at: temporary)
+            try? fileManager.removeItem(at: temporaryMarker)
+            throw error
+        }
+    }
+
     /// Validates and transactionally copies a legacy IPSW-adjacent user
     /// image into the durable Application Support location. Existing data
     /// at the destination is never overwritten by a migration.
@@ -212,6 +254,7 @@ enum RootFilesystemPreparer {
         let temporaryMarker = markerURL(for: temporary)
         let backup = destination.appendingPathExtension("replacing")
         let backupMarker = markerURL(for: backup)
+        try? fileManager.removeItem(at: temporaryMarker)
         if let markerVersion {
             try markerVersion.write(to: temporaryMarker, atomically: true, encoding: .utf8)
         } else {

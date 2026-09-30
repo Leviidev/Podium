@@ -15,6 +15,7 @@ final class RootFilesystemBuilder {
     private var childrenByParent: [UInt32: [Int]] = [:]
     private var attributes: [HFSPlusAttributeRecord]
     private var replacedContent: [UInt32: [UInt8]] = [:]
+    private var replacedFileContent: [UInt32: (url: URL, length: UInt64)] = [:]
     /// Compressed files whose contents were replaced: their decmpfs
     /// attribute and resource fork are dropped.
     private var decompressed = Set<UInt32>()
@@ -57,6 +58,33 @@ final class RootFilesystemBuilder {
         guard let folder = index(of: path), records[folder].isFolder else { throw HFSPlusError.missingPath(path) }
         return (childrenByParent[records[folder].catalogNodeID] ?? []).filter { !removed.contains($0) }
             .map { (String(decoding: records[$0].name, as: UTF16.self), $0) }
+    }
+
+    func contains(_ path: String) -> Bool { index(of: path) != nil }
+
+    func addFile(_ path: String, from sourceURL: URL, length: UInt64, owner: UInt32, group: UInt32, mode: UInt16,
+                 template templatePath: String) throws {
+        guard index(of: path) == nil else { throw HFSPlusError.unsupported("file already exists: \(path)") }
+        var parts = Self.components(path)
+        guard let name = parts.popLast() else { throw HFSPlusError.missingPath(path) }
+        let parentPath = "/" + parts.map { String(decoding: $0, as: UTF16.self) }.joined(separator: "/")
+        guard let parent = index(of: parentPath), records[parent].isFolder else { throw HFSPlusError.missingPath(parentPath) }
+        guard let templateIndex = index(of: templatePath), records[templateIndex].isFile, !records[templateIndex].isHardLink else {
+            throw HFSPlusError.missingPath(templatePath)
+        }
+        let id = nextCatalogID
+        nextCatalogID += 1
+        var data = records[templateIndex].data
+        data.putBE16(0x0002, at: 2)
+        data.putBE32(id, at: 8)
+        data[40] = 0
+        data[41] = 0
+        data.putBE16((data.be16(42) & 0xF000) | (mode & 0x0FFF), at: 42)
+        data.putBE32(0, at: 44)
+        for offset in 48..<80 { data[offset] = 0 }
+        insert(HFSPlusCatalogRecord(parentID: records[parent].catalogNodeID, name: name, data: data), parent: parent)
+        setOwnership(records.count - 1, owner: owner, group: group, mode: mode)
+        replacedFileContent[id] = (sourceURL, length)
     }
 
     func contents(of path: String) throws -> [UInt8] {
@@ -266,7 +294,8 @@ final class RootFilesystemBuilder {
 
     /// Writes the edited volume with `freeSpace` bytes free (journaled
     /// after `journal(size:)`).
-    func write(to url: URL, freeSpace: UInt64, progress: (HFSPlusVolumeWriter.Progress) -> Void = { _ in }) throws {
+    func write(to url: URL, freeSpace: UInt64, maximumVolumeBytes: UInt64? = nil,
+               progress: (HFSPlusVolumeWriter.Progress) -> Void = { _ in }) throws {
         var removedIDs = Set<UInt32>()
         var catalog: [HFSPlusCatalogRecord] = []
         var content: [UInt32: (data: HFSPlusForkContent?, resource: HFSPlusForkContent?)] = [:]
@@ -277,7 +306,8 @@ final class RootFilesystemBuilder {
             catalog.append(HFSPlusCatalogRecord.thread(for: record))
             guard record.isFile else { continue }
             let id = record.catalogNodeID
-            let data: HFSPlusForkContent? = replacedContent[id].map { .bytes($0) }
+            let data: HFSPlusForkContent? = replacedFileContent[id].map { .file($0.url, length: $0.length) }
+                ?? replacedContent[id].map { .bytes($0) }
                 ?? (record.dataFork.logicalSize > 0 ? .sourceFork(record.dataFork, fileID: id, forkType: 0) : nil)
             let resource: HFSPlusForkContent? = record.resourceFork.logicalSize > 0 && !decompressed.contains(id)
                 ? .sourceFork(record.resourceFork, fileID: id, forkType: 0xFF) : nil
@@ -297,6 +327,7 @@ final class RootFilesystemBuilder {
             content: content,
             nextCatalogID: nextCatalogID,
             freeSpace: freeSpace,
+            maximumVolumeBytes: maximumVolumeBytes,
             journalFiles: journalFiles,
             to: url,
             progress: progress

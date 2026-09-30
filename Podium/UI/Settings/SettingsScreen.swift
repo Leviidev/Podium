@@ -8,6 +8,9 @@ struct SettingsScreen: View {
     @State private var storageError: String?
     @State private var showingEraseConfirmation = false
     @State private var isErasingGuest = false
+    @State private var isImportingGuestFiles = false
+    @State private var guestFileError: String?
+    @State private var guestFileStatus: String?
 
     @AppStorage(AppStorageKeys.appearance) private var appearanceRawValue = AppearanceOption.system.rawValue
     @AppStorage(AppStorageKeys.confirmBeforeDeletingFirmware) private var confirmBeforeDeleting = true
@@ -21,6 +24,24 @@ struct SettingsScreen: View {
         } catch {
             guestStorage = nil
             storageError = error.localizedDescription
+        }
+    }
+
+    private func addGuestFiles(_ result: Result<[URL], Error>) {
+        do {
+            let urls = try result.get()
+            let accessStates = urls.map { $0.startAccessingSecurityScopedResource() }
+            defer {
+                for (url, accessed) in zip(urls, accessStates) where accessed {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            try firmwareLibrary.persistentGuestStorage.addFiles(urls, emulatorIsBusy: emulatorCore.isBusy)
+            let noun = urls.count == 1 ? "file" : "files"
+            guestFileStatus = urls.isEmpty ? nil : "Added \(urls.count) \(noun) to Media/Podium."
+            refreshGuestStorage()
+        } catch {
+            guestFileError = error.localizedDescription
         }
     }
 
@@ -92,6 +113,13 @@ struct SettingsScreen: View {
                         Text("Not prepared yet").foregroundStyle(.secondary)
                     }
                 }
+                Button("Add Files to Virtual iPod…", systemImage: "doc.badge.plus") {
+                    isImportingGuestFiles = true
+                }
+                .disabled(emulatorCore.isBusy || isErasingGuest || guestStorage == nil)
+                if let guestFileStatus {
+                    Text(guestFileStatus).font(.footnote).foregroundStyle(.secondary)
+                }
                 Button("Erase Virtual iPod…", role: .destructive) {
                     showingEraseConfirmation = true
                 }
@@ -99,7 +127,7 @@ struct SettingsScreen: View {
             } header: {
                 Text("Virtual iPod Storage")
             } footer: {
-                Text("Apps, tweaks, settings, and their data are kept in a private disk image on this device, not in the imported firmware file.")
+                Text("Apps, tweaks, settings, and their data are kept in a private disk image. Add Files copies host files into /private/var/mobile/Media/Podium on the guest.")
             }
 
             Section {
@@ -138,6 +166,9 @@ struct SettingsScreen: View {
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
         .task { refreshGuestStorage() }
+        .fileImporter(isPresented: $isImportingGuestFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            addGuestFiles(result)
+        }
         .confirmationDialog("Erase all virtual iPod data?", isPresented: $showingEraseConfirmation, titleVisibility: .visible) {
             Button("Erase Virtual iPod", role: .destructive) { eraseGuestStorage() }
             Button("Cancel", role: .cancel) {}
@@ -148,6 +179,11 @@ struct SettingsScreen: View {
             Button("OK", role: .cancel) { storageError = nil }
         } message: {
             Text(storageError ?? "")
+        }
+        .alert("Couldn't Add Files", isPresented: Binding(get: { guestFileError != nil }, set: { if !$0 { guestFileError = nil } })) {
+            Button("OK", role: .cancel) { guestFileError = nil }
+        } message: {
+            Text(guestFileError ?? "")
         }
     }
 }

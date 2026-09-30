@@ -139,6 +139,104 @@ final class PersistentGuestStorageTests: XCTestCase {
         XCTAssertNil(try storage.snapshot())
     }
 
+    func testGuestFileNamesCannotEscapeTheDedicatedMediaFolder() {
+        XCTAssertTrue(PersistentGuestStorage.isSafeGuestFileName("notes.txt"))
+        XCTAssertTrue(PersistentGuestStorage.isSafeGuestFileName("Calendar.sqlite"))
+        XCTAssertFalse(PersistentGuestStorage.isSafeGuestFileName("../outside"))
+        XCTAssertFalse(PersistentGuestStorage.isSafeGuestFileName("subfolder/file"))
+        XCTAssertFalse(PersistentGuestStorage.isSafeGuestFileName(""))
+        XCTAssertFalse(PersistentGuestStorage.isSafeGuestFileName(String(repeating: "x", count: 256)))
+    }
+
+    func testAddingGuestFileRebuildsTheVolumeAndPreservesTheOriginalImage() throws {
+        let firmwareURL = temporaryDirectory.appendingPathComponent("guest-file.ipsw")
+        try writeSyntheticHFSVolume(at: RootFilesystemPreparer.imageURL(forFirmwareAt: firmwareURL))
+        let storage = PersistentGuestStorage(appSupportURL: applicationSupportURL)
+        let volumeURL = try storage.prepareUserVolume(forFirmwareAt: firmwareURL).url
+        let originalImage = try Data(contentsOf: volumeURL)
+        let hostFile = temporaryDirectory.appendingPathComponent("hello.txt")
+        let guestBytes = Data("hello from the host".utf8)
+        try guestBytes.write(to: hostFile)
+
+        try storage.addFiles([hostFile], emulatorIsBusy: false)
+
+        let volume = try HFSPlusVolume(source: FileVolumeSource(url: volumeURL))
+        let builder = try RootFilesystemBuilder(volume: volume)
+        XCTAssertEqual(Data(try builder.contents(of: "/private/var/mobile/Media/Podium/hello.txt")), guestBytes)
+        XCTAssertNotEqual(try Data(contentsOf: volumeURL), originalImage)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(storage.snapshot()).freeBytes, 8 << 20)
+    }
+
+    func testAddingGuestFilesRequiresPowerOffAndExistingPreparedStorage() throws {
+        let storage = PersistentGuestStorage(appSupportURL: applicationSupportURL)
+        XCTAssertThrowsError(try storage.addFiles([temporaryDirectory], emulatorIsBusy: true))
+        XCTAssertThrowsError(try storage.addFiles([temporaryDirectory], emulatorIsBusy: false))
+    }
+
+    private func writeSyntheticHFSVolume(at url: URL) throws {
+        let blockSize: UInt32 = 512
+        let totalBlocks: UInt32 = 65_536
+        let volumeBytes = UInt64(blockSize) * UInt64(totalBlocks)
+        let root = HFSPlusCatalogRecord(parentID: 1, name: [], data: folderRecordData(id: 2))
+        let privateFolder = HFSPlusCatalogRecord(parentID: 2, name: Array("private".utf16), data: folderRecordData(id: 3))
+        let varFolder = HFSPlusCatalogRecord(parentID: 3, name: Array("var".utf16), data: folderRecordData(id: 4))
+        let mobileFolder = HFSPlusCatalogRecord(parentID: 4, name: Array("mobile".utf16), data: folderRecordData(id: 5))
+        let etcFolder = HFSPlusCatalogRecord(parentID: 3, name: Array("etc".utf16), data: folderRecordData(id: 6))
+        var fstabData = [UInt8](repeating: 0, count: 248)
+        putBigEndian(UInt16(HFSPlusCatalogRecord.fileType), into: &fstabData, at: 0)
+        putBigEndian(UInt16(0x0002), into: &fstabData, at: 2)
+        putBigEndian(UInt32(7), into: &fstabData, at: 8)
+        putBigEndian(UInt32(0o100644), into: &fstabData, at: 42)
+        HFSPlusForkData.contiguous(logicalSize: 8, startBlock: 20, blockCount: 1).write(into: &fstabData, at: 88)
+        let fstab = HFSPlusCatalogRecord(parentID: 6, name: Array("fstab".utf16), data: fstabData)
+        let items = [root, privateFolder, varFolder, mobileFolder, etcFolder, fstab]
+        let catalog = items.flatMap { [$0, HFSPlusCatalogRecord.thread(for: $0)] }
+            .sorted(by: HFSPlusCatalogRecord.areInIncreasingOrder)
+            .map { BTreeRecord(key: $0.key, data: $0.data) }
+        let btreeHeader = BTreeHeader(nodeSize: 512, maxKeyLength: 516, clumpSize: 512,
+                                      btreeType: 0, keyCompareType: 0, attributes: BTreeBuilder.variableIndexKeysAttribute)
+        let catalogBytes = try BTreeBuilder.build(records: catalog, header: btreeHeader, totalNodes: 16)
+        let extentsBytes = try BTreeBuilder.build(records: [], header: btreeHeader, totalNodes: 1)
+
+        var headerBytes = [UInt8](repeating: 0, count: HFSPlusVolumeHeader.byteCount)
+        putBigEndian(HFSPlusVolumeHeader.signatureHFSPlus, into: &headerBytes, at: 0)
+        putBigEndian(blockSize, into: &headerBytes, at: 40)
+        putBigEndian(totalBlocks, into: &headerBytes, at: 44)
+        putBigEndian(totalBlocks - 32, into: &headerBytes, at: 48)
+        putBigEndian(UInt32(8), into: &headerBytes, at: 64)
+        HFSPlusForkData.contiguous(logicalSize: UInt64(extentsBytes.count), startBlock: 3, blockCount: 1)
+            .write(into: &headerBytes, at: 192)
+        HFSPlusForkData.contiguous(logicalSize: UInt64(catalogBytes.count), startBlock: 4,
+                                   blockCount: UInt32(catalogBytes.count / Int(blockSize)))
+            .write(into: &headerBytes, at: 272)
+
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: volumeBytes)
+        try handle.seek(toOffset: 3 * UInt64(blockSize))
+        try handle.write(contentsOf: Data(extentsBytes))
+        try handle.seek(toOffset: 4 * UInt64(blockSize))
+        try handle.write(contentsOf: Data(catalogBytes))
+        try handle.seek(toOffset: 20 * UInt64(blockSize))
+        try handle.write(contentsOf: Data("fstab!!!".utf8))
+        try handle.seek(toOffset: HFSPlusVolumeHeader.offset)
+        try handle.write(contentsOf: Data(headerBytes))
+        try handle.seek(toOffset: volumeBytes - HFSPlusVolumeHeader.offset)
+        try handle.write(contentsOf: Data(headerBytes))
+        try handle.synchronize()
+    }
+
+    private func folderRecordData(id: UInt32) -> [UInt8] {
+        var data = [UInt8](repeating: 0, count: 88)
+        putBigEndian(UInt16(HFSPlusCatalogRecord.folderType), into: &data, at: 0)
+        putBigEndian(id, into: &data, at: 8)
+        putBigEndian(UInt32(501), into: &data, at: 32)
+        putBigEndian(UInt32(501), into: &data, at: 36)
+        putBigEndian(UInt16(0o040755), into: &data, at: 42)
+        return data
+    }
+
     private func writeHFSImage(at url: URL, fill: UInt8, freeBlocks: UInt32) throws {
         let blockSize: UInt32 = 512
         let totalBlocks: UInt32 = 8
@@ -150,6 +248,11 @@ final class PersistentGuestStorageTests: XCTestCase {
         putBigEndian(totalBlocks, into: &bytes, at: headerOffset + 44)
         putBigEndian(freeBlocks, into: &bytes, at: headerOffset + 48)
         try Data(bytes).write(to: url, options: .atomic)
+    }
+
+    private func putBigEndian(_ value: UInt16, into bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = UInt8((value >> 8) & 0xFF)
+        bytes[offset + 1] = UInt8(value & 0xFF)
     }
 
     private func putBigEndian(_ value: UInt32, into bytes: inout [UInt8], at offset: Int) {
