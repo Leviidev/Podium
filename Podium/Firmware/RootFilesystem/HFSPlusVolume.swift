@@ -103,6 +103,7 @@ struct HFSPlusVolumeHeader {
     var attributes: UInt32 { get { bytes.be32(4) } set { bytes.putBE32(newValue, at: 4) } }
     var blockSize: UInt32 { bytes.be32(40) }
     var totalBlocks: UInt32 { bytes.be32(44) }
+    var freeBlocks: UInt32 { bytes.be32(48) }
     var nextCatalogID: UInt32 { get { bytes.be32(64) } set { bytes.putBE32(newValue, at: 64) } }
     var modifyDate: UInt32 { bytes.be32(16) }
     var allocationFile: HFSPlusForkData { HFSPlusForkData(bytes: bytes, at: 112) }

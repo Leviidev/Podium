@@ -28,6 +28,13 @@ final class EmulationSession {
         let jitAvailable: Bool
     }
 
+    struct StopResult {
+        let state: State
+        /// False means the mapped guest disk could not be durably committed;
+        /// keep the session alive so the caller can retry instead of unmapping it.
+        let storageFlushed: Bool
+    }
+
     /// `_panic` and the unexported `panic_context` (reached from exception
     /// handlers, jumping into `_panic`'s tail) in the 10B500 kernelcache,
     /// with the register holding each one's format string.
@@ -56,6 +63,8 @@ final class EmulationSession {
     /// The physical address space, for diagnostics.
     var memoryBus: MemoryBus { bus }
     private let ram: FlatPhysicalMemory
+    /// The persistent user volume, if this run shares it with the host file.
+    private let persistentRootFilesystem: Bool
     /// Where the RAM disk sits in guest RAM (offsets from its base).
     private var ramDiskRange: Range<Int> = 0..<0
     private var messageBufferOffset: Int?
@@ -71,6 +80,11 @@ final class EmulationSession {
     private var releasesDue: [Button: UInt64] = [:]
     private var stopRequested = false
     private var state: State = .running
+    private var runLoopHasStarted = false
+    private var runLoopHasFinished = false
+    private var stateBeforeStorageFlushFailure: State?
+    private var storageFlushError: String?
+    private let runLoopFinished = DispatchGroup()
     private var retired: UInt64 = 0
     private var virtualTime: UInt64 = 0
     private var thread: Thread?
@@ -82,6 +96,7 @@ final class EmulationSession {
     /// image file, and last; otherwise every boot starts from the image.
     init(kernel: Data, deviceTree: Data, rootFilesystem: URL, persistent: Bool = false) throws {
         ram = FlatPhysicalMemory(length: GuestMemoryLayout.ramSize, baseAddress: GuestMemoryLayout.ramPhysicalBase)
+        persistentRootFilesystem = persistent
         // A small on-chip SRAM at low physical addresses, separate from
         // DRAM: the kernel's pmap has put early page tables there.
         let lowSRAM = FlatPhysicalMemory(length: 0x0010_0000, baseAddress: 0)
@@ -129,15 +144,94 @@ final class EmulationSession {
         thread.name = "Podium emulation"
         thread.qualityOfService = .userInitiated
         thread.stackSize = 16 << 20
+        lock.lock()
+        guard !runLoopHasStarted, !runLoopHasFinished else { lock.unlock(); return }
         self.thread = thread
+        runLoopHasStarted = true
+        runLoopFinished.enter()
+        lock.unlock()
         thread.start()
     }
 
-    /// Stops the CPU at the next chunk boundary.
-    func stop() {
+    /// Stops at the next CPU chunk boundary. Persistent storage is flushed
+    /// by the run loop before this returns. If the flush fails, the session
+    /// remains available so the caller can retry before unmapping the disk.
+    @discardableResult
+    func stop() -> StopResult {
         lock.lock()
+        if runLoopHasFinished {
+            if let previousState = stateBeforeStorageFlushFailure {
+                do {
+                    try ram.flushSharedFileMappings()
+                    storageFlushError = nil
+                    stateBeforeStorageFlushFailure = nil
+                    state = previousState
+                } catch {
+                    storageFlushError = "\(error)"
+                    state = .halted("couldn't flush persistent guest storage: \(error)")
+                }
+            }
+            let result = StopResult(state: state, storageFlushed: storageFlushError == nil)
+            lock.unlock()
+            return result
+        }
+        if runLoopHasStarted, thread == nil {
+            // Another stop is performing the pre-start flush.
+            lock.unlock()
+            runLoopFinished.wait()
+            lock.lock()
+            let result = StopResult(state: state, storageFlushed: storageFlushError == nil)
+            lock.unlock()
+            return result
+        }
+        guard runLoopHasStarted else {
+            // Seal the session against a concurrent start, and let any other
+            // stop caller wait until this synchronous flush is complete.
+            runLoopHasStarted = true
+            runLoopFinished.enter()
+            lock.unlock()
+            var finalState = State.stopped
+            if persistentRootFilesystem {
+                do {
+                    try ram.flushSharedFileMappings()
+                } catch {
+                    finalState = .halted("couldn't flush persistent guest storage: \(error)")
+                }
+            }
+            lock.lock()
+            if case .halted(let message) = finalState, message.hasPrefix("couldn't flush persistent guest storage:") {
+                stateBeforeStorageFlushFailure = .stopped
+                storageFlushError = message
+            }
+            state = finalState
+            runLoopHasFinished = true
+            let result = StopResult(state: finalState, storageFlushed: storageFlushError == nil)
+            lock.unlock()
+            runLoopFinished.leave()
+            return result
+        }
         stopRequested = true
         lock.unlock()
+        inputArrived.signal()
+        runLoopFinished.wait()
+        lock.lock()
+        let result = StopResult(state: state, storageFlushed: storageFlushError == nil)
+        lock.unlock()
+        return result
+    }
+
+    /// A natural guest shutdown with a failed final sync stays recoverable
+    /// until Power Off retries the commit.
+    var hasStorageFlushFailure: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storageFlushError != nil
+    }
+
+    var storageFlushFailureDescription: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storageFlushError
     }
 
     func send(_ event: InputEvent) {
@@ -316,11 +410,25 @@ final class EmulationSession {
             virtualTime = cpu.virtualTime
             lock.unlock()
         }
-        lock.lock()
-        state = finalState
+        let stateBeforeFlush = finalState
         retired = cpu.retiredInstructionCount
         virtualTime = cpu.virtualTime
+        if persistentRootFilesystem {
+            do {
+                try ram.flushSharedFileMappings()
+            } catch {
+                finalState = .halted("couldn't flush persistent guest storage: \(error)")
+                lock.lock()
+                stateBeforeStorageFlushFailure = stateBeforeFlush
+                storageFlushError = "\(error)"
+                lock.unlock()
+            }
+        }
+        lock.lock()
+        state = finalState
+        runLoopHasFinished = true
         lock.unlock()
+        runLoopFinished.leave()
         onFinish?(finalState)
     }
 

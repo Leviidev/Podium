@@ -17,12 +17,15 @@ final class FirmwareLibrary {
     private let fileManager: FileManager
     private let storageDirectoryURL: URL
     private let indexFileURL: URL
+    private let guestStorage: PersistentGuestStorage
 
     init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
-        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        storageDirectoryURL = appSupport.appendingPathComponent("Podium/Firmware", isDirectory: true)
+        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        let baseURL = appSupport ?? fileManager.temporaryDirectory
+        storageDirectoryURL = baseURL.appendingPathComponent("Podium/Firmware", isDirectory: true)
         indexFileURL = storageDirectoryURL.appendingPathComponent("index.json")
+        guestStorage = PersistentGuestStorage(fileManager: fileManager, appSupportURL: appSupport)
         try? fileManager.createDirectory(at: storageDirectoryURL, withIntermediateDirectories: true)
         firmwares = Self.loadIndex(at: indexFileURL)
     }
@@ -30,6 +33,8 @@ final class FirmwareLibrary {
     var activeFirmware: ImportedFirmware? {
         firmwares.first { $0.isActive }
     }
+
+    var persistentGuestStorage: PersistentGuestStorage { guestStorage }
 
     func fileURL(for firmware: ImportedFirmware) -> URL {
         storageDirectoryURL.appendingPathComponent(firmware.storedFileName)
@@ -77,8 +82,11 @@ final class FirmwareLibrary {
         }
     }
 
-    func remove(_ firmware: ImportedFirmware) throws {
-        try? fileManager.removeItem(at: fileURL(for: firmware))
+    func remove(_ firmware: ImportedFirmware, emulatorIsBusy: Bool) throws {
+        let importedURL = fileURL(for: firmware)
+        try guestStorage.removeFirmware(at: importedURL, emulatorIsBusy: emulatorIsBusy) {
+            try fileManager.removeItem(at: importedURL)
+        }
         firmwares.removeAll { $0.id == firmware.id }
         try persistIndex()
     }

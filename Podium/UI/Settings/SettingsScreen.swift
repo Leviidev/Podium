@@ -2,11 +2,42 @@ import SwiftUI
 
 struct SettingsScreen: View {
     @Environment(FirmwareLibrary.self) private var firmwareLibrary
+    @Environment(EmulatorCore.self) private var emulatorCore
+
+    @State private var guestStorage: PersistentGuestStorage.Snapshot?
+    @State private var storageError: String?
+    @State private var showingEraseConfirmation = false
+    @State private var isErasingGuest = false
 
     @AppStorage(AppStorageKeys.appearance) private var appearanceRawValue = AppearanceOption.system.rawValue
     @AppStorage(AppStorageKeys.confirmBeforeDeletingFirmware) private var confirmBeforeDeleting = true
     @AppStorage(AppStorageKeys.showFrameRate) private var showFrameRate = false
     @AppStorage(AppStorageKeys.showDeveloperSettings) private var showDeveloperSettings = false
+
+    private func refreshGuestStorage() {
+        do {
+            guestStorage = try firmwareLibrary.persistentGuestStorage.snapshot()
+            storageError = nil
+        } catch {
+            guestStorage = nil
+            storageError = error.localizedDescription
+        }
+    }
+
+    private func eraseGuestStorage() {
+        guard let firmware = firmwareLibrary.activeFirmware else { return }
+        isErasingGuest = true
+        defer { isErasingGuest = false }
+        do {
+            _ = try firmwareLibrary.persistentGuestStorage.eraseActiveVolume(
+                for: firmwareLibrary.fileURL(for: firmware),
+                emulatorIsBusy: emulatorCore.isBusy
+            )
+            refreshGuestStorage()
+        } catch {
+            storageError = error.localizedDescription
+        }
+    }
 
     private var appearance: Binding<AppearanceOption> {
         Binding(
@@ -52,6 +83,26 @@ struct SettingsScreen: View {
             }
 
             Section {
+                if let guestStorage {
+                    LabeledContent("Used", value: Int64(clamping: guestStorage.usedBytes).formattedByteCount)
+                    LabeledContent("Available", value: Int64(clamping: guestStorage.freeBytes).formattedByteCount)
+                    LabeledContent("Total", value: Int64(clamping: guestStorage.totalBytes).formattedByteCount)
+                } else {
+                    LabeledContent("Status") {
+                        Text("Not prepared yet").foregroundStyle(.secondary)
+                    }
+                }
+                Button("Erase Virtual iPod…", role: .destructive) {
+                    showingEraseConfirmation = true
+                }
+                .disabled(emulatorCore.isBusy || isErasingGuest || firmwareLibrary.activeFirmware?.compatibility.isCompatible != true)
+            } header: {
+                Text("Virtual iPod Storage")
+            } footer: {
+                Text("Apps, tweaks, settings, and their data are kept in a private disk image on this device, not in the imported firmware file.")
+            }
+
+            Section {
                 Toggle("Show Frame Rate", isOn: $showFrameRate)
                 LabeledContent("Performance") {
                     Text("Not yet configurable").foregroundStyle(.secondary)
@@ -86,6 +137,18 @@ struct SettingsScreen: View {
         }
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
+        .task { refreshGuestStorage() }
+        .confirmationDialog("Erase all virtual iPod data?", isPresented: $showingEraseConfirmation, titleVisibility: .visible) {
+            Button("Erase Virtual iPod", role: .destructive) { eraseGuestStorage() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes installed apps, tweaks, preferences, and guest files. The firmware image remains installed.")
+        }
+        .alert("Virtual iPod Storage", isPresented: Binding(get: { storageError != nil }, set: { if !$0 { storageError = nil } })) {
+            Button("OK", role: .cancel) { storageError = nil }
+        } message: {
+            Text(storageError ?? "")
+        }
     }
 }
 
@@ -94,4 +157,5 @@ struct SettingsScreen: View {
         SettingsScreen()
     }
     .environment(FirmwareLibrary())
+    .environment(EmulatorCore())
 }

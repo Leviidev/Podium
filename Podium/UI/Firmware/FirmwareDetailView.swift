@@ -4,12 +4,14 @@ struct FirmwareDetailView: View {
     let firmwareID: UUID
 
     @Environment(FirmwareLibrary.self) private var firmwareLibrary
+    @Environment(EmulatorCore.self) private var emulatorCore
     @Environment(\.dismiss) private var dismiss
     @AppStorage(AppStorageKeys.confirmBeforeDeletingFirmware) private var confirmBeforeDeleting = true
 
     @State private var isVerifying = false
     @State private var verifyResult: Bool?
     @State private var isPresentingRemoveConfirmation = false
+    @State private var removalError: String?
 
     private var firmware: ImportedFirmware? {
         firmwareLibrary.firmwares.first { $0.id == firmwareID }
@@ -76,10 +78,20 @@ struct FirmwareDetailView: View {
                     } label: {
                         Label("Remove Firmware", systemImage: "trash")
                     }
+                    .disabled(emulatorCore.isBusy)
                 }
             }
             .navigationTitle(firmware.displayName)
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if emulatorCore.isBusy {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Text("Power off to remove")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             .confirmationDialog(
                 "Remove this firmware?",
                 isPresented: $isPresentingRemoveConfirmation,
@@ -88,9 +100,15 @@ struct FirmwareDetailView: View {
                 Button("Remove", role: .destructive) {
                     performRemoval(of: firmware)
                 }
+                .disabled(emulatorCore.isBusy)
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("The imported copy will be deleted from Podium. Your original IPSW file is never touched.")
+            }
+            .alert("Couldn't Remove Firmware", isPresented: Binding(get: { removalError != nil }, set: { if !$0 { removalError = nil } })) {
+                Button("OK", role: .cancel) { removalError = nil }
+            } message: {
+                Text(removalError ?? "")
             }
         } else {
             ContentUnavailableView("Firmware Removed", systemImage: "questionmark.folder")
@@ -124,7 +142,11 @@ struct FirmwareDetailView: View {
     }
 
     private func performRemoval(of firmware: ImportedFirmware) {
-        try? firmwareLibrary.remove(firmware)
-        dismiss()
+        do {
+            try firmwareLibrary.remove(firmware, emulatorIsBusy: emulatorCore.isBusy)
+            dismiss()
+        } catch {
+            removalError = error.localizedDescription
+        }
     }
 }

@@ -55,6 +55,13 @@ final class ZipArchiveReader {
         entries.first { $0.name == name }
     }
 
+    /// Opens the named archive member and streams its uncompressed bytes
+    /// directly to the caller, without building an intermediate `Data`.
+    func stream(named name: String, progress: (Double) -> Void = { _ in }, _ body: (UnsafeRawBufferPointer) throws -> Void) throws {
+        guard let entry = entry(named: name) else { throw FirmwareParsingError.missingEntry(name: name) }
+        try stream(entry, progress: progress, body)
+    }
+
     /// Extracts and, if needed, decompresses a single entry's data.
     func data(for entry: ZipEntry) throws -> Data {
         try fileHandle.seek(toOffset: entry.localHeaderOffset)

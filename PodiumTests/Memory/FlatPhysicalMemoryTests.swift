@@ -83,6 +83,24 @@ final class FlatPhysicalMemoryTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url)[0], 0x11, "the file itself never changes")
     }
 
+    /// Persistent user data is backed by a shared mapping. Writes must be
+    /// visible in the image on disk after an explicit emulator shutdown.
+    func testSharedMappingFlushPersistsGuestWrites() throws {
+        let page = Int(getpagesize())
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("podium-mapfile-shared-\(UUID().uuidString)")
+        try Data(repeating: 0x11, count: page).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        do {
+            let memory = FlatPhysicalMemory(length: page * 2, baseAddress: 0x4000_0000)
+            XCTAssertEqual(try memory.mapFile(url, at: 0x4000_0000, shared: true), page)
+            try memory.writeByte(0xA5, at: 0x4000_0000)
+            try memory.flushSharedFileMappings()
+        }
+
+        XCTAssertEqual(try Data(contentsOf: url)[0], 0xA5)
+    }
+
     func testMapFileRejectsMisalignedAddress() {
         let memory = FlatPhysicalMemory(length: Int(getpagesize()) * 2)
         XCTAssertThrowsError(try memory.mapFile(URL(fileURLWithPath: "/dev/null"), at: 1))

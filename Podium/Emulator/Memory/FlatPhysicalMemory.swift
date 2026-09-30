@@ -5,16 +5,21 @@ import Foundation
 /// Backed by one anonymous `mmap` reservation rather than a Swift array:
 /// pages the guest never touches cost the host nothing, the base pointer
 /// is stable for the object's lifetime (the JIT's fast path holds it), and
-/// `mapFile(_:at:)` can lay a file's pages copy-on-write over part of it —
-/// how the root filesystem RAM disk sits inside guest DRAM without being
-/// read into host memory up front (its clean, file-backed pages don't
-/// count against the host app's memory footprint until the guest writes
-/// them).
+/// `mapFile(_:at:shared:)` can map file-backed pages into guest DRAM without
+/// reading the whole file into host memory up front.
 final class FlatPhysicalMemory: MemoryBus {
     var window: (first: UInt32, count: UInt64)? { (baseAddress, UInt64(length)) }
     let baseAddress: UInt32
     let length: Int
     private let pointer: UnsafeMutableRawPointer
+    private struct SharedFileMapping {
+        let url: URL
+        let descriptor: Int32
+        let offset: Int
+        let length: Int
+    }
+    private let mappingsLock = NSLock()
+    private var sharedFileMappings: [SharedFileMapping] = []
 
     init(length: Int, baseAddress: UInt32 = 0) {
         precondition(length > 0, "Memory region must have a nonzero length")
@@ -28,6 +33,7 @@ final class FlatPhysicalMemory: MemoryBus {
 
     deinit {
         munmap(pointer, length)
+        for mapping in sharedFileMappings { close(mapping.descriptor) }
     }
 
     enum MapFileError: Error {
@@ -35,16 +41,15 @@ final class FlatPhysicalMemory: MemoryBus {
         case outOfRange(address: UInt32, length: Int)
         case cannotOpen(path: String, errno: Int32)
         case mapFailed(errno: Int32)
+        case flushFailed(path: String, errno: Int32)
     }
 
-    /// Maps `url`'s contents copy-on-write at guest `address`: guest reads
-    /// see the file, guest writes stay private to this process and never
-    /// reach it. `address` must sit on a host page boundary within this
-    /// region. Returns the number of bytes mapped (the file's size).
+    /// Maps `url` over guest memory at `address`, private by default.
+    /// Private mappings keep guest writes in memory; shared mappings write
+    /// them to the backing file so they can survive process exit. `address`
+    /// must sit on a host page boundary within this region. Returns the
+    /// number of bytes mapped (the file's size).
     @discardableResult
-    /// Maps `url` over guest memory at `address`. Private by default:
-    /// the guest's writes stay in memory. `shared`, they go to the file,
-    /// so it keeps them after the process ends.
     func mapFile(_ url: URL, at address: UInt32, shared: Bool = false) throws -> Int {
         let pageSize = Int(getpagesize())
         guard address >= baseAddress, Int(address - baseAddress) % pageSize == 0 else {
@@ -52,7 +57,8 @@ final class FlatPhysicalMemory: MemoryBus {
         }
         let fd = open(url.path, shared ? O_RDWR : O_RDONLY)
         guard fd >= 0 else { throw MapFileError.cannotOpen(path: url.path, errno: errno) }
-        defer { close(fd) }
+        var retainDescriptor = false
+        defer { if !retainDescriptor { close(fd) } }
         var info = stat()
         guard fstat(fd, &info) == 0 else { throw MapFileError.cannotOpen(path: url.path, errno: errno) }
         let size = Int(info.st_size)
@@ -62,7 +68,36 @@ final class FlatPhysicalMemory: MemoryBus {
         guard let mapped = mmap(target, size, PROT_READ | PROT_WRITE, (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED, fd, 0), mapped == target else {
             throw MapFileError.mapFailed(errno: errno)
         }
+        if shared {
+            mappingsLock.lock()
+            sharedFileMappings.append(SharedFileMapping(url: url, descriptor: fd, offset: offset, length: size))
+            retainDescriptor = true
+            mappingsLock.unlock()
+        }
         return size
+    }
+
+    /// Synchronously commits guest writes in every shared file mapping to
+    /// its backing file. Call after the emulation thread has stopped so a
+    /// normal power-off cannot leave dirty guest-disk pages pending in the
+    /// host's page cache.
+    func flushSharedFileMappings() throws {
+        mappingsLock.lock()
+        let mappings = sharedFileMappings
+        mappingsLock.unlock()
+
+        for mapping in mappings {
+            let address = pointer + mapping.offset
+            guard msync(address, mapping.length, MS_SYNC) == 0 else {
+                let flushError = errno
+                throw MapFileError.flushFailed(path: mapping.url.path, errno: flushError)
+            }
+            let result = fsync(mapping.descriptor)
+            let syncError = errno
+            guard result == 0 else {
+                throw MapFileError.flushFailed(path: mapping.url.path, errno: syncError)
+            }
+        }
     }
 
     func fastPathRegion(for address: UInt32) -> (pointer: UnsafeMutableRawPointer, regionBaseAddress: UInt32, regionLength: Int)? {

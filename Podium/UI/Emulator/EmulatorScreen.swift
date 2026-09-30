@@ -51,10 +51,19 @@ struct EmulatorScreen: View {
                     .padding(.horizontal, 40)
             }
 
-            if !emulatorCore.isPoweredOn, emulatorCore.bootStage == nil, let firmware, firmware.compatibility.isCompatible {
+            if !emulatorCore.isPoweredOn, emulatorCore.bootStage == nil,
+               !emulatorCore.isBusy, let firmware, firmware.compatibility.isCompatible {
                 Button("Power On") { powerOn(firmware) }
                     .buttonStyle(.podiumPrimary)
                     .padding(.horizontal, 40)
+            }
+            if emulatorCore.hasStorageFlushFailure {
+                Button("Retry Storage Flush", systemImage: "arrow.clockwise") {
+                    emulatorCore.retryStorageFlush()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .padding(.horizontal, 40)
             }
 
             Spacer()
@@ -79,12 +88,12 @@ struct EmulatorScreen: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            if emulatorCore.isPoweredOn {
+            if emulatorCore.isPoweredOn || emulatorCore.storageFlushFailure != nil {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(role: .destructive) {
                         emulatorCore.powerOff()
                     } label: {
-                        Label("Power Off", systemImage: "power.circle")
+                        Label(emulatorCore.isPoweredOn ? "Power Off" : "Retry Power Off", systemImage: "power.circle")
                     }
                 }
             }

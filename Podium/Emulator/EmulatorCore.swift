@@ -32,11 +32,17 @@ final class EmulatorCore {
     private(set) var jitAvailable = false
 
     var cpu: CPU? { session?.cpu }
-    var isPoweredOn: Bool { session != nil }
+    var isPoweredOn: Bool { session != nil && !hasStorageFlushFailure }
+    /// Firmware and storage are in use while the guest boots, runs, or a
+    /// disk flush is waiting to be retried.
+    var isBusy: Bool { session != nil || bootStage != nil }
+    var storageFlushFailure: String? { session?.storageFlushFailureDescription }
+    var hasStorageFlushFailure: Bool { session?.hasStorageFlushFailure ?? false }
 
     let audioOutput: AudioOutput
     let networkInterface: NetworkInterface
     let inputController: InputController
+    let persistentGuestStorage: PersistentGuestStorage
 
     static let physicalMemorySize = GuestMemoryLayout.ramSize
     static let framebufferWidth = GuestMemoryLayout.framebufferWidth
@@ -60,11 +66,13 @@ final class EmulatorCore {
     init(
         audioOutput: AudioOutput = NullAudioOutput(),
         networkInterface: NetworkInterface = NullNetworkInterface(),
-        inputController: InputController = PassthroughInputController()
+        inputController: InputController = PassthroughInputController(),
+        persistentGuestStorage: PersistentGuestStorage? = nil
     ) {
         self.audioOutput = audioOutput
         self.networkInterface = networkInterface
         self.inputController = inputController
+        self.persistentGuestStorage = persistentGuestStorage ?? PersistentGuestStorage()
     }
 
     private var expectedBootInstructions: Double {
@@ -113,7 +121,7 @@ final class EmulatorCore {
                 appendLog(String(format: "Root filesystem ready in %.1f s.", Date().timeIntervalSince(started)))
             }
             bootStage = .loadingKernel
-            let userImage = try RootFilesystemPreparer.prepareUserImage(forFirmwareAt: fileURL)
+            let userImage = try persistentGuestStorage.prepareUserVolume(forFirmwareAt: fileURL)
             if userImage.fromOlderRecipe {
                 appendLog("This iOS install was made by an older Podium; erase it in Settings to pick up the newer system image.")
             }
@@ -123,8 +131,11 @@ final class EmulatorCore {
                 let deviceTree = try DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: fileURL)
                 return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem, persistent: true)
             }.value
-            session.onFinish = { [weak self] state in
-                Task { @MainActor in self?.sessionFinished(state) }
+            session.onFinish = { [weak self, weak session] state in
+                Task { @MainActor in
+                    guard let self, let session, self.session === session else { return }
+                    self.sessionFinished(state, from: session)
+                }
             }
             self.session = session
             framebufferSource = session.display
@@ -140,11 +151,18 @@ final class EmulatorCore {
         }
     }
 
-    /// Cuts the power: the machine stops at once and its memory is freed.
+    /// Cuts the power, flushes its persistent guest volume, then frees memory.
+    /// On a disk-sync failure the halted session stays resident so Power Off
+    /// can retry the write before unmapping guest memory.
     func powerOff() {
         guard let session else { return }
         session.onFinish = nil
-        session.stop()
+        let result = session.stop()
+        guard result.storageFlushed else {
+            status = .error("Couldn't safely power off: \(result.state)")
+            appendLog("Power-off storage flush failed; retry before closing: \(result.state)")
+            return
+        }
         pollTask?.cancel()
         pollTask = nil
         self.session = nil
@@ -152,6 +170,13 @@ final class EmulatorCore {
         bootStage = nil
         status = .stopped
         appendLog("Powered off.")
+    }
+
+    /// After iOS has already halted, a Power Off tap retries the final flush;
+    /// the mapped image is released only once msync and fsync both succeed.
+    func retryStorageFlush() {
+        guard let session, session.hasStorageFlushFailure else { return }
+        powerOff()
     }
 
     func sendInput(_ event: InputEvent) {
@@ -214,11 +239,17 @@ final class EmulatorCore {
         return Double(bright) / Double(sampled) > 0.4
     }
 
-    private func sessionFinished(_ state: EmulationSession.State) {
+    private func sessionFinished(_ state: EmulationSession.State, from finishedSession: EmulationSession) {
+        guard session === finishedSession else { return }
         pollTask?.cancel()
         pollTask = nil
-        session = nil
         bootStage = nil
+        if finishedSession.hasStorageFlushFailure {
+            status = .error("Guest stopped, but persistent storage couldn't be flushed. Retry Power Off before leaving.")
+            appendLog("Storage flush failed: \(finishedSession.storageFlushFailureDescription ?? "unknown error")")
+            return
+        }
+        session = nil
         switch state {
         case .panicked(let message):
             status = .error("iOS panicked: \(message)")
