@@ -21,64 +21,43 @@ struct EmulatorScreen: View {
     }
 
     var body: some View {
-        VStack(spacing: 20) {
-            Spacer(minLength: 12)
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                Spacer(minLength: 12)
 
-            GeometryReader { proxy in
-                screen
-                    .contentShape(Rectangle())
-                    .gesture(touchGesture(in: proxy.size))
-            }
-            .aspectRatio(640.0 / 960.0, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 4))
-            .padding(.horizontal, 40)
+                deviceFrame
+                    .frame(maxHeight: min(geometry.size.height * 0.68, 610))
+                    .aspectRatio(0.53, contentMode: .fit)
+                    .frame(maxWidth: .infinity)
 
-            if let firmware {
-                Text("\(firmware.displayName) · iOS \(firmware.metadata.productVersion)")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("No firmware selected")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
+                deviceDescription
+                    .padding(.top, 18)
 
-            if case .error(let message) = emulatorCore.status {
-                Text(message)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 40)
-            }
+                Spacer(minLength: 20)
 
-            if !emulatorCore.isPoweredOn, emulatorCore.bootStage == nil,
-               !emulatorCore.isBusy, let firmware, firmware.compatibility.isCompatible {
-                Button("Power On") { powerOn(firmware) }
-                    .buttonStyle(.podiumPrimary)
-                    .padding(.horizontal, 40)
-            }
-            if emulatorCore.hasStorageFlushFailure {
-                Button("Retry Storage Flush", systemImage: "arrow.clockwise") {
-                    emulatorCore.retryStorageFlush()
+                EmulatorControlBar { event in
+                    if case .powerButton(pressed: true) = event, !emulatorCore.isPoweredOn, emulatorCore.bootStage == nil, let firmware {
+                        powerOn(firmware)
+                    } else {
+                        emulatorCore.sendInput(event)
+                    }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-                .padding(.horizontal, 40)
-            }
-
-            Spacer()
-
-            EmulatorControlBar { event in
-                if case .powerButton(pressed: true) = event, !emulatorCore.isPoweredOn, emulatorCore.bootStage == nil, let firmware {
-                    powerOn(firmware)
-                } else {
-                    emulatorCore.sendInput(event)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+                .background(Color(.secondarySystemBackground), in: Capsule())
+                .overlay {
+                    Capsule()
+                        .strokeBorder(Color.white.opacity(0.07), lineWidth: 1)
                 }
+                .padding(.bottom, max(geometry.safeAreaInsets.bottom == 0 ? 18 : 8, 8))
             }
-            .padding(.bottom, 28)
+            .padding(.horizontal, 28)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(.systemBackground))
+            .ignoresSafeArea(edges: .bottom)
         }
-        .background(Color(.systemGroupedBackground))
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .tabBar)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
@@ -98,6 +77,98 @@ struct EmulatorScreen: View {
                 }
             }
         }
+    }
+
+    private var deviceFrame: some View {
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            let bezel = max(width * 0.065, 15)
+            let cornerRadius = width * 0.16
+
+            VStack(spacing: 0) {
+                Circle()
+                    .fill(Color(.systemGray2))
+                    .frame(width: 7, height: 7)
+                    .padding(.top, 15)
+                    .padding(.bottom, 11)
+
+                GeometryReader { displayProxy in
+                    screen
+                        .aspectRatio(640.0 / 960.0, contentMode: .fit)
+                        .contentShape(Rectangle())
+                        .gesture(touchGesture(in: CGSize(width: displayProxy.size.width, height: displayProxy.size.width * 1.5)))
+                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                }
+                .padding(.horizontal, bezel)
+                .frame(maxHeight: .infinity)
+
+                Button {
+                    emulatorCore.sendInput(.homeButton(pressed: true))
+                    emulatorCore.sendInput(.homeButton(pressed: false))
+                } label: {
+                    ZStack {
+                        Circle()
+                            .fill(Color.black)
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.78), lineWidth: 1.5)
+                            .frame(width: 13, height: 13)
+                    }
+                    .frame(width: 46, height: 46)
+                    .overlay(Circle().strokeBorder(Color.white.opacity(0.15), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Home button")
+                .padding(.top, 13)
+                .padding(.bottom, 15)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(LinearGradient(colors: [Color.white.opacity(0.55), Color.white.opacity(0.12), Color.white.opacity(0.32)], startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 1.5)
+            }
+            .shadow(color: .black.opacity(0.45), radius: 26, y: 16)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private var deviceDescription: some View {
+        VStack(spacing: 7) {
+            Text(firmware.map { "\($0.displayName) · iOS \($0.metadata.productVersion)" } ?? "No firmware selected")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+
+            if case .error(let message) = emulatorCore.status {
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+            }
+
+            if !emulatorCore.isPoweredOn, emulatorCore.bootStage == nil,
+               !emulatorCore.isBusy, let firmware, firmware.compatibility.isCompatible {
+                Button {
+                    powerOn(firmware)
+                } label: {
+                    Label("Power On", systemImage: "power")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .clipShape(Capsule())
+            }
+            if emulatorCore.hasStorageFlushFailure {
+                Button("Retry Storage Flush", systemImage: "arrow.clockwise") {
+                    emulatorCore.retryStorageFlush()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+            }
+        }
+        .frame(maxWidth: 340)
+        .frame(maxWidth: .infinity)
     }
 
     private func powerOn(_ firmware: ImportedFirmware) {

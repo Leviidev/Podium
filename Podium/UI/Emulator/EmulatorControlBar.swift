@@ -1,22 +1,28 @@
 import SwiftUI
 
-/// The device's physical buttons, laid out as a slim bar rather than
-/// permanently overlaid on the display (Section 12 of the project spec).
-/// Each button reports its own press and release, so holding one — the
-/// sleep/wake button, to reach "slide to power off" — reaches the guest
-/// as a real hold.
+/// The virtual device's physical controls. Tap sends a complete button
+/// press; a press-and-hold emits down/up so guest hold actions still work.
 struct EmulatorControlBar: View {
     let onEvent: (InputEvent) -> Void
 
     var body: some View {
-        HStack(spacing: 40) {
+        HStack(spacing: 0) {
             HoldableButton(systemImage: "power", accessibilityLabel: "Sleep/Wake") { onEvent(.powerButton(pressed: $0)) }
+            Spacer(minLength: 8)
             HoldableButton(systemImage: "speaker.minus", accessibilityLabel: "Volume Down") { onEvent(.volumeDown(pressed: $0)) }
-            HoldableButton(systemImage: "circle", accessibilityLabel: "Home") { onEvent(.homeButton(pressed: $0)) }
+            Spacer(minLength: 8)
+            VStack(spacing: 3) {
+                Image(systemName: "circle")
+                    .font(.system(size: 9, weight: .regular))
+                    .foregroundStyle(.secondary)
+                HoldableButton(systemImage: "circle", accessibilityLabel: "Home") { onEvent(.homeButton(pressed: $0)) }
+            }
+            Spacer(minLength: 8)
             HoldableButton(systemImage: "speaker.plus", accessibilityLabel: "Volume Up") { onEvent(.volumeUp(pressed: $0)) }
         }
-        .font(.title2)
+        .font(.title3.weight(.medium))
         .foregroundStyle(.primary)
+        .frame(maxWidth: 320)
     }
 }
 
@@ -31,6 +37,7 @@ private struct HoldableButton: View {
         Image(systemName: systemImage)
             .frame(width: 44, height: 44)
             .opacity(isPressed ? 0.4 : 1)
+            .background(Color.primary.opacity(isPressed ? 0.14 : 0.06), in: Circle())
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)

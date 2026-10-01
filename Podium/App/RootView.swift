@@ -8,21 +8,45 @@ struct RootView: View {
     @State private var emulatorCore = EmulatorCore()
     @State private var referenceFirmwareDownloader = ReferenceFirmwareDownloader()
 
-    @AppStorage(AppStorageKeys.appearance) private var appearanceRawValue = AppearanceOption.system.rawValue
+    @AppStorage(AppStorageKeys.appearance) private var appearanceRawValue = AppearanceOption.dark.rawValue
+    @State private var selectedTab = AppTab.home
+
+    private enum AppTab: Hashable {
+        case home
+        case settings
+    }
 
     private var preferredColorScheme: ColorScheme? {
         AppearanceOption(rawValue: appearanceRawValue)?.colorScheme
     }
 
     var body: some View {
-        MainScreen()
-            .environment(firmwareLibrary)
-            .environment(emulatorCore)
-            .environment(referenceFirmwareDownloader)
-            .preferredColorScheme(preferredColorScheme)
-            .task {
-                await referenceFirmwareDownloader.downloadIfNeeded(into: firmwareLibrary)
+        TabView(selection: $selectedTab) {
+            NavigationStack {
+                MainScreen()
             }
+            .tabItem {
+                Label("Home", systemImage: "house.fill")
+            }
+            .tag(AppTab.home)
+
+            NavigationStack {
+                SettingsScreen()
+            }
+            .tabItem {
+                Label("Settings", systemImage: "gearshape.fill")
+            }
+            .tag(AppTab.settings)
+        }
+        .tint(.blue)
+        .toolbarBackground(.visible, for: .tabBar)
+        .environment(firmwareLibrary)
+        .environment(emulatorCore)
+        .environment(referenceFirmwareDownloader)
+        .preferredColorScheme(preferredColorScheme)
+        .task {
+            await referenceFirmwareDownloader.downloadIfNeeded(into: firmwareLibrary)
+        }
     }
 }
 

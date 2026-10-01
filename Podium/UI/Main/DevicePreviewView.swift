@@ -1,9 +1,7 @@
 import SwiftUI
 
-/// A simple, recognizable iPod touch 4 silhouette drawn with plain
-/// SwiftUI shapes — no image asset, no decorative gradients. The screen
-/// is always drawn off/black: this is a device representation, not a
-/// live framebuffer, and should never be mistaken for one.
+/// A clean, off-state iPod touch silhouette for the Home dashboard. The
+/// screen remains black so the preview is never mistaken for the live guest.
 struct DevicePreviewView: View {
     var body: some View {
         GeometryReader { proxy in
@@ -18,12 +16,12 @@ struct DevicePreviewView: View {
                     .fill(Color(.secondarySystemBackground))
                     .overlay(
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .strokeBorder(Color(.systemGray3), lineWidth: 1)
+                            .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
                     )
 
                 VStack(spacing: 0) {
                     Circle()
-                        .fill(Color(.systemGray3))
+                        .fill(Color(.systemGray2))
                         .frame(width: cameraDiameter, height: cameraDiameter)
                         .padding(.top, bezel * 1.4)
 
@@ -34,14 +32,25 @@ struct DevicePreviewView: View {
                         .frame(maxHeight: .infinity)
 
                     Circle()
-                        .strokeBorder(Color(.systemGray3), lineWidth: 1.5)
+                        .fill(Color.black)
                         .frame(width: homeButtonDiameter, height: homeButtonDiameter)
+                        .background(Color.white.opacity(0.04), in: Circle())
+                        .overlay {
+                            Circle()
+                                .strokeBorder(Color.white.opacity(0.35), lineWidth: 1.5)
+                        }
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .strokeBorder(Color.white.opacity(0.72), lineWidth: 1.1)
+                                .frame(width: homeButtonDiameter * 0.34, height: homeButtonDiameter * 0.34)
+                        }
                         .padding(.top, bezel * 0.6)
                         .padding(.bottom, bezel * 1.2)
                 }
             }
+            .shadow(color: .black.opacity(0.35), radius: 18, y: 10)
         }
-        .aspectRatio(640.0 / 960.0, contentMode: .fit)
+        .aspectRatio(0.55, contentMode: .fit)
         .accessibilityLabel("iPod touch preview")
     }
 }
