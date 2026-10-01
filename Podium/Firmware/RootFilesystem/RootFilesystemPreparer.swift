@@ -144,6 +144,71 @@ enum RootFilesystemPreparer {
         }
     }
 
+    /// Installs offline `.deb` packages into the durable persistent root
+    /// volume while the emulator is powered off. The image is rebuilt into
+    /// a sibling and promoted transactionally, so a failed install leaves
+    /// the previous guest data untouched.
+    static func installDebianPackages(_ urls: [URL], to image: URL, stagingDirectory: URL,
+                                      keepingFreeSpace freeSpace: UInt64 = 8 << 20) throws -> [DebianPackageInstaller.InstalledPackage] {
+        guard !urls.isEmpty else { return [] }
+        let fileManager = FileManager.default
+        defer { try? fileManager.removeItem(at: stagingDirectory) }
+        let sourceSize = (try fileManager.attributesOfItem(atPath: image.path)[.size] as? NSNumber)?.uint64Value ?? 0
+        let sourceVolume = try HFSPlusVolume(source: FileVolumeSource(url: image))
+        let builder = try RootFilesystemBuilder(volume: sourceVolume)
+        let installed = try DebianPackageInstaller.install(urls, into: builder, stagingDirectory: stagingDirectory)
+
+        let temporary = image.appendingPathExtension("updating")
+        let version = try? String(contentsOf: markerURL(for: image), encoding: .utf8)
+        try? fileManager.removeItem(at: temporary)
+        try? fileManager.removeItem(at: markerURL(for: temporary))
+        do {
+            try builder.write(to: temporary, freeSpace: freeSpace, maximumVolumeBytes: sourceSize)
+            let updated = try readHFSPlusVolumeHeader(at: temporary)
+            guard UInt64(updated.freeBlocks) * UInt64(updated.blockSize) >= freeSpace else {
+                throw PreparationError.invalidHFSImage("the installed volume did not retain the requested free-space reserve")
+            }
+            try safelyPromote(temporary, to: image, markerVersion: version, fileManager: fileManager)
+        } catch {
+            try? fileManager.removeItem(at: temporary)
+            try? fileManager.removeItem(at: markerURL(for: temporary))
+            throw error
+        }
+        return installed
+    }
+
+    /// Extracts supported single-app IPA bundles into /Applications on the
+    /// persistent guest root, keeping all staged sources alive until the
+    /// transactional HFS+ rebuild has completed.
+    static func installIPAs(_ urls: [URL], to image: URL, stagingDirectory: URL,
+                            keepingFreeSpace freeSpace: UInt64 = 8 << 20) throws -> [IPAInstaller.InstalledApp] {
+        guard !urls.isEmpty else { return [] }
+        let fileManager = FileManager.default
+        defer { try? fileManager.removeItem(at: stagingDirectory) }
+        let sourceSize = (try fileManager.attributesOfItem(atPath: image.path)[.size] as? NSNumber)?.uint64Value ?? 0
+        let sourceVolume = try HFSPlusVolume(source: FileVolumeSource(url: image))
+        let builder = try RootFilesystemBuilder(volume: sourceVolume)
+        let installed = try IPAInstaller.install(urls, into: builder, stagingDirectory: stagingDirectory)
+
+        let temporary = image.appendingPathExtension("updating")
+        let version = try? String(contentsOf: markerURL(for: image), encoding: .utf8)
+        try? fileManager.removeItem(at: temporary)
+        try? fileManager.removeItem(at: markerURL(for: temporary))
+        do {
+            try builder.write(to: temporary, freeSpace: freeSpace, maximumVolumeBytes: sourceSize)
+            let updated = try readHFSPlusVolumeHeader(at: temporary)
+            guard UInt64(updated.freeBlocks) * UInt64(updated.blockSize) >= freeSpace else {
+                throw PreparationError.invalidHFSImage("the installed volume did not retain the requested free-space reserve")
+            }
+            try safelyPromote(temporary, to: image, markerVersion: version, fileManager: fileManager)
+        } catch {
+            try? fileManager.removeItem(at: temporary)
+            try? fileManager.removeItem(at: markerURL(for: temporary))
+            throw error
+        }
+        return installed
+    }
+
     /// Validates and transactionally copies a legacy IPSW-adjacent user
     /// image into the durable Application Support location. Existing data
     /// at the destination is never overwritten by a migration.

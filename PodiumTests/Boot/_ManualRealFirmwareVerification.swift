@@ -16,7 +16,7 @@ final class ManualRealFirmwareVerification: XCTestCase {
         let machO = try KernelcacheExtractor.extractKernelMachO(from: firmware, storedAt: ipswURL)
         var deviceTree = try? DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: ipswURL)
 
-        let ram = FlatPhysicalMemory(length: EmulatorCore.physicalMemorySize, baseAddress: EmulatorCore.physicalMemoryBaseAddress)
+        let ram = FlatPhysicalMemory(length: EmulatorCore.physicalMemorySize, baseAddress: GuestMemoryLayout.ramPhysicalBase)
         let lowSRAM = FlatPhysicalMemory(length: 0x0010_0000, baseAddress: 0)
         let bus = SegmentedMemoryBus(regions: [ram, lowSRAM])
 
@@ -27,7 +27,7 @@ final class ManualRealFirmwareVerification: XCTestCase {
         if deviceTree != nil {
             dumpZeroLengthFourProperties(deviceTree!)
             DeviceTreePatcher.patchClockPlaceholders(&deviceTree!)
-            let ramRange = EmulatorCore.physicalMemoryBaseAddress..<(EmulatorCore.physicalMemoryBaseAddress &+ UInt32(EmulatorCore.physicalMemorySize))
+            let ramRange = GuestMemoryLayout.ramPhysicalBase..<(GuestMemoryLayout.ramPhysicalBase &+ UInt32(EmulatorCore.physicalMemorySize))
             for region in DeviceTreeMemoryMap.peripheralRegions(in: deviceTree!, excluding: ramRange) {
                 bus.addRegion(FlatPhysicalMemory(length: Int(region.size), baseAddress: region.address))
             }
@@ -46,13 +46,13 @@ final class ManualRealFirmwareVerification: XCTestCase {
         // trace reflects what the live app actually does now, not the
         // pre-video-support boot path.
         let video = BootVideoInfo(
-            baseAddress: EmulatorCore.framebufferPhysicalAddress, display: 1,
+            baseAddress: GuestMemoryLayout.framebufferPhysicalAddress, display: 1,
             rowBytes: UInt32(EmulatorCore.framebufferWidth * 4),
             width: UInt32(EmulatorCore.framebufferWidth), height: UInt32(EmulatorCore.framebufferHeight),
             depth: 32
         )
         let bootArgs = BootArgsBuilder.build(
-            virtBase: EmulatorCore.physicalMemoryBaseAddress, physBase: EmulatorCore.physicalMemoryBaseAddress,
+            virtBase: GuestMemoryLayout.ramPhysicalBase, physBase: GuestMemoryLayout.ramPhysicalBase,
             memSize: UInt32(EmulatorCore.physicalMemorySize), topOfKernelData: topOfKernelData,
             deviceTreeP: deviceTree != nil ? deviceTreeAddress : 0, deviceTreeLength: deviceTreeLength,
             video: video

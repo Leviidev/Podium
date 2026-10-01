@@ -73,7 +73,11 @@ enum KernelBootstrap {
             DeviceTreePatcher.setDotPitch(&deviceTree!)
             DeviceTreePatcher.setDisplayScale(&deviceTree!)
             DeviceTreePatcher.setVRAM(&deviceTree!, physicalAddress: GuestMemoryLayout.framebufferPhysicalAddress, size: GuestMemoryLayout.framebufferSize)
-            for region in DeviceTreeMemoryMap.peripheralRegions(in: deviceTree!, excluding: GuestMemoryLayout.ramPhysicalRange) {
+            for region in DeviceTreeMemoryMap.peripheralRegions(
+                in: deviceTree!,
+                excluding: GuestMemoryLayout.ramPhysicalRange,
+                alsoExcluding: [GuestMemoryLayout.lowSRAMRange]
+            ) {
                 bus.addRegion(peripheralBacking(FlatPhysicalMemory(length: Int(region.size), baseAddress: region.address)))
             }
         }

@@ -21,6 +21,10 @@ final class PersistentGuestStorage {
         case invalidGuestFile(String)
         case duplicateGuestFile(String)
         case insufficientGuestSpace(required: UInt64, available: UInt64)
+        case noFirmwareForPackageInstall
+        case noCompatibleFirmwareForPackageInstall
+        case noFirmwareForIPAInstall
+        case noCompatibleFirmwareForIPAInstall
 
         var errorDescription: String? { description }
 
@@ -35,6 +39,10 @@ final class PersistentGuestStorage {
             case .invalidGuestFile: return "A selected item isn't a regular file name that can be stored on the virtual iPod."
             case .duplicateGuestFile: return "A selected filename is repeated or already exists in Media/Podium."
             case .insufficientGuestSpace: return "There isn't enough free space to add these files while keeping guest storage available."
+            case .noFirmwareForPackageInstall: return "Import compatible iOS 6.1.6 firmware before installing packages."
+            case .noCompatibleFirmwareForPackageInstall: return "Select compatible iOS 6.1.6 firmware before installing packages."
+            case .noFirmwareForIPAInstall: return "Import compatible iOS 6.1.6 firmware before installing apps."
+            case .noCompatibleFirmwareForIPAInstall: return "Select compatible iOS 6.1.6 firmware before installing apps."
             }
         }
     }
@@ -136,6 +144,45 @@ final class PersistentGuestStorage {
             throw StorageError.duplicateGuestFile(file.name)
         }
         try RootFilesystemPreparer.addGuestFiles(files, to: imageURL, keepingFreeSpace: guestReserve)
+    }
+
+    /// Installs Cydia-compatible Debian payloads directly into the
+    /// persistent root volume. Packages with scripts, unsupported archive
+    /// compression, conflicts, or unmet dependencies are rejected.
+    func installDebianPackages(_ urls: [URL], forFirmwareAt firmwareURL: URL?, emulatorIsBusy: Bool) throws -> [DebianPackageInstaller.InstalledPackage] {
+        guard !emulatorIsBusy else { throw StorageError.deviceMustBePoweredOff }
+        guard let firmwareURL else { throw StorageError.noFirmwareForPackageInstall }
+        guard RootFilesystemPreparer.isPrepared(forFirmwareAt: firmwareURL) else {
+            throw StorageError.noCompatibleFirmwareForPackageInstall
+        }
+        guard !urls.isEmpty else { return [] }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        let directory = try directoryURL()
+        let imageURL = RootFilesystemPreparer.userImageURL(in: directory)
+        guard fileManager.fileExists(atPath: imageURL.path) else { throw StorageError.storageNotPrepared }
+        let staging = directory.appendingPathComponent("package-install-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: staging) }
+        return try RootFilesystemPreparer.installDebianPackages(urls, to: imageURL, stagingDirectory: staging)
+    }
+
+    /// Copies basic .ipa app bundles into /Applications while the virtual iPod
+    /// is powered off. The guest OS's installer, signing, and registration are not run.
+    func installIPAs(_ urls: [URL], forFirmwareAt firmwareURL: URL?, emulatorIsBusy: Bool) throws -> [IPAInstaller.InstalledApp] {
+        guard !emulatorIsBusy else { throw StorageError.deviceMustBePoweredOff }
+        guard let firmwareURL else { throw StorageError.noFirmwareForIPAInstall }
+        guard RootFilesystemPreparer.isPrepared(forFirmwareAt: firmwareURL) else {
+            throw StorageError.noCompatibleFirmwareForIPAInstall
+        }
+        guard !urls.isEmpty else { return [] }
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        let directory = try directoryURL()
+        let imageURL = RootFilesystemPreparer.userImageURL(in: directory)
+        guard fileManager.fileExists(atPath: imageURL.path) else { throw StorageError.storageNotPrepared }
+        let staging = directory.appendingPathComponent("ipa-install-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: staging) }
+        return try RootFilesystemPreparer.installIPAs(urls, to: imageURL, stagingDirectory: staging)
     }
 
     static func isSafeGuestFileName(_ name: String) -> Bool {

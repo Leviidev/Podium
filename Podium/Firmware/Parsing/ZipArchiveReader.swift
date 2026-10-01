@@ -5,10 +5,15 @@ import Compression
 struct ZipEntry {
     let name: String
     let compressionMethod: UInt16
+    let generalPurposeFlags: UInt16
     let compressedSize: UInt64
     let uncompressedSize: UInt64
     let localHeaderOffset: UInt64
     let crc32: UInt32
+    /// Unix permission/type bits from the central-directory external attributes.
+    let unixMode: UInt16
+
+    var isDirectory: Bool { name.hasSuffix("/") || unixMode & 0o170000 == 0o040000 }
 }
 
 /// Reads the central directory of a ZIP archive and extracts individual
@@ -95,12 +100,28 @@ final class ZipArchiveReader {
     func stream(_ entry: ZipEntry, progress: (Double) -> Void = { _ in }, _ body: (UnsafeRawBufferPointer) throws -> Void) throws {
         try fileHandle.seek(toOffset: entry.localHeaderOffset)
         guard let header = try fileHandle.read(upToCount: 30), header.count == 30,
-              header.readUInt32LE(at: 0) == Self.localFileHeaderSignature else {
+              header.readUInt32LE(at: 0) == Self.localFileHeaderSignature,
+              header.readUInt16LE(at: 8) == entry.compressionMethod,
+              header.readUInt16LE(at: 6) == entry.generalPurposeFlags,
+              entry.generalPurposeFlags & ~UInt16(0x080E) == 0 else {
             throw FirmwareParsingError.notAZipArchive
         }
         let nameLength = UInt64(header.readUInt16LE(at: 26))
         let extraLength = UInt64(header.readUInt16LE(at: 28))
-        try fileHandle.seek(toOffset: entry.localHeaderOffset + 30 + nameLength + extraLength)
+        guard nameLength <= UInt64(Int.max),
+              entry.localHeaderOffset <= UInt64.max - 30 - nameLength - extraLength else {
+            throw FirmwareParsingError.notAZipArchive
+        }
+        let nameOffset = entry.localHeaderOffset + 30
+        try fileHandle.seek(toOffset: nameOffset)
+        let localName = try readExact(count: Int(nameLength))
+        guard String(data: localName, encoding: .utf8) == entry.name else { throw FirmwareParsingError.notAZipArchive }
+        let payloadOffset = nameOffset + nameLength + extraLength
+        guard entry.compressedSize <= UInt64.max - payloadOffset,
+              payloadOffset + entry.compressedSize <= (try Self.fileLength(of: fileHandle)) else {
+            throw FirmwareParsingError.notAZipArchive
+        }
+        try fileHandle.seek(toOffset: payloadOffset)
         let readSize = 1 << 20
         var remaining = entry.compressedSize
 
@@ -147,7 +168,13 @@ final class ZipArchiveReader {
                         producedAny = true
                         try body(UnsafeRawBufferPointer(start: output, count: produced))
                     }
-                    if status == COMPRESSION_STATUS_END { finished = true; break }
+                    if status == COMPRESSION_STATUS_END {
+                        guard streamPointer.pointee.src_size == 0, remaining == 0 else {
+                            throw FirmwareParsingError.unsupportedZipFeature("Trailing data in deflate stream for \(entry.name).")
+                        }
+                        finished = true
+                        break
+                    }
                 } while streamPointer.pointee.src_size > 0 || streamPointer.pointee.dst_size == 0
             }
             progress(1 - Double(remaining) / Double(max(entry.compressedSize, 1)))
@@ -215,6 +242,8 @@ final class ZipArchiveReader {
             guard directoryData.readUInt32LE(at: cursor) == centralDirectoryHeaderSignature else {
                 break
             }
+            let versionMadeBy = directoryData.readUInt16LE(at: cursor + 4)
+            let generalPurposeFlags = directoryData.readUInt16LE(at: cursor + 8)
             let compressionMethod = directoryData.readUInt16LE(at: cursor + 10)
             let crc32 = directoryData.readUInt32LE(at: cursor + 16)
             let compressedSize = directoryData.readUInt32LE(at: cursor + 20)
@@ -222,7 +251,11 @@ final class ZipArchiveReader {
             let nameLength = Int(directoryData.readUInt16LE(at: cursor + 28))
             let extraLength = Int(directoryData.readUInt16LE(at: cursor + 30))
             let commentLength = Int(directoryData.readUInt16LE(at: cursor + 32))
+            let externalAttributes = directoryData.readUInt32LE(at: cursor + 38)
             let localHeaderOffset = directoryData.readUInt32LE(at: cursor + 42)
+            guard compressedSize != 0xFFFF_FFFF, uncompressedSize != 0xFFFF_FFFF, localHeaderOffset != 0xFFFF_FFFF else {
+                throw FirmwareParsingError.unsupportedZipFeature("This ZIP uses ZIP64 entry sizes or offsets.")
+            }
 
             let nameStart = cursor + 46
             guard nameStart + nameLength <= directoryData.count,
@@ -233,14 +266,17 @@ final class ZipArchiveReader {
             entries.append(ZipEntry(
                 name: name,
                 compressionMethod: compressionMethod,
+                generalPurposeFlags: generalPurposeFlags,
                 compressedSize: UInt64(compressedSize),
                 uncompressedSize: UInt64(uncompressedSize),
                 localHeaderOffset: UInt64(localHeaderOffset),
-                crc32: crc32
+                crc32: crc32,
+                unixMode: versionMadeBy >> 8 == 3 ? UInt16(externalAttributes >> 16) : 0
             ))
 
             cursor = nameStart + nameLength + extraLength + commentLength
         }
+        guard entries.count == Int(totalEntries) else { throw FirmwareParsingError.notAZipArchive }
 
         return entries
     }

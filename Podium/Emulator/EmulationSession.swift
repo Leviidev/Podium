@@ -99,7 +99,7 @@ final class EmulationSession {
         persistentRootFilesystem = persistent
         // A small on-chip SRAM at low physical addresses, separate from
         // DRAM: the kernel's pmap has put early page tables there.
-        let lowSRAM = FlatPhysicalMemory(length: 0x0010_0000, baseAddress: 0)
+        let lowSRAM = FlatPhysicalMemory(length: GuestMemoryLayout.lowSRAMSize, baseAddress: GuestMemoryLayout.lowSRAMBase)
         bus = SegmentedMemoryBus(regions: [ram, lowSRAM])
         // Not the old block JIT (its short kernel-only blocks cost more to
         // look up than they saved); DBTEngine, attached below, is what

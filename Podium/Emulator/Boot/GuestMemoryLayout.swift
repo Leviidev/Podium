@@ -21,6 +21,10 @@ import Foundation
 /// physical addresses matched, which silently turned every access to
 /// those peripherals into reads and writes of kernel RAM.
 enum GuestMemoryLayout {
+    static let lowSRAMBase: UInt32 = 0
+    static let lowSRAMSize = 0x0010_0000
+    static var lowSRAMRange: Range<UInt32> { lowSRAMBase..<(lowSRAMBase &+ UInt32(lowSRAMSize)) }
+
     static let ramPhysicalBase: UInt32 = 0x4000_0000
     static let ramSize = 1024 * 1024 * 1024
     static let kernelVirtualBase: UInt32 = 0x8000_0000

@@ -36,6 +36,7 @@ final class RootFilesystemBuilder {
     }
 
     var fileCount: Int { records.indices.filter { !removed.contains($0) && records[$0].isFile }.count }
+    var volumeFreeBytes: UInt64 { UInt64(volume.header.freeBlocks) * UInt64(volume.blockSize) }
 
     // MARK: Lookup
 
@@ -62,8 +63,81 @@ final class RootFilesystemBuilder {
 
     func contains(_ path: String) -> Bool { index(of: path) != nil }
 
+    func isFolder(at path: String) -> Bool {
+        guard let index = index(of: path) else { return false }
+        return records[index].isFolder
+    }
+
+    func isSymbolicLink(at path: String) -> Bool {
+        guard let index = index(of: path) else { return false }
+        return records[index].isSymbolicLink
+    }
+
+    /// Resolves existing symlink components without allowing a path to walk
+    /// above the guest root. Package archives are untrusted and must not be
+    /// able to redirect writes outside their guest-visible destination.
+    func resolvedPath(_ path: String, resolvingFinalComponent: Bool = true) throws -> String {
+        guard path.hasPrefix("/"), !path.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw HFSPlusError.unsupported("guest path must be absolute and contain no NUL")
+        }
+        var pending = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        var resolved: [String] = []
+        var symlinkHops = 0
+        while !pending.isEmpty {
+            let component = pending.removeFirst()
+            if component.isEmpty || component == "." { continue }
+            if component == ".." {
+                guard !resolved.isEmpty else { throw HFSPlusError.unsupported("guest path escapes the root: \(path)") }
+                resolved.removeLast()
+                continue
+            }
+            let candidate = "/" + (resolved + [component]).joined(separator: "/")
+            if let item = index(of: candidate), records[item].isSymbolicLink,
+               resolvingFinalComponent || !pending.isEmpty {
+                symlinkHops += 1
+                guard symlinkHops <= 40 else { throw HFSPlusError.unsupported("symbolic-link loop at \(candidate)") }
+                let target = String(decoding: try contents(of: candidate), as: UTF8.self)
+                guard !target.isEmpty, !target.unicodeScalars.contains(where: { $0.value == 0 }) else {
+                    throw HFSPlusError.unsupported("invalid symbolic link at \(candidate)")
+                }
+                let remainder = pending
+                if target.hasPrefix("/") {
+                    resolved.removeAll(keepingCapacity: true)
+                }
+                pending = target.split(separator: "/", omittingEmptySubsequences: false).map(String.init) + remainder
+            } else {
+                resolved.append(component)
+            }
+        }
+        return resolved.isEmpty ? "/" : "/" + resolved.joined(separator: "/")
+    }
+
+    func installFile(_ path: String, from sourceURL: URL, length: UInt64, owner: UInt32, group: UInt32, mode: UInt16) throws {
+        if let existing = index(of: path) {
+            guard !records[existing].isFolder else { throw HFSPlusError.unsupported("package file conflicts with directory \(path)") }
+            try remove(index: existing)
+        }
+        try addFile(path, from: sourceURL, length: length, owner: owner, group: group, mode: mode, template: "/private/etc/fstab")
+    }
+
+    func installSymbolicLink(_ path: String, target: String, owner: UInt32, group: UInt32) throws {
+        if let existing = index(of: path) {
+            guard !records[existing].isFolder else { throw HFSPlusError.unsupported("package symlink conflicts with directory \(path)") }
+            try remove(index: existing)
+        }
+        try addSymbolicLink(path, target: target, owner: owner, group: group, template: "/private/etc/fstab")
+    }
+
+    func installFile(_ path: String, contents: [UInt8], owner: UInt32, group: UInt32, mode: UInt16) throws {
+        if let existing = index(of: path) {
+            guard !records[existing].isFolder else { throw HFSPlusError.unsupported("package file conflicts with directory \(path)") }
+            try remove(index: existing)
+        }
+        try addFile(path, contents: contents, owner: owner, group: group, mode: mode, template: "/private/etc/fstab")
+    }
+
     func addFile(_ path: String, from sourceURL: URL, length: UInt64, owner: UInt32, group: UInt32, mode: UInt16,
-                 template templatePath: String) throws {
+                 template templatePath: String = "/private/etc/fstab") throws {
         guard index(of: path) == nil else { throw HFSPlusError.unsupported("file already exists: \(path)") }
         var parts = Self.components(path)
         guard let name = parts.popLast() else { throw HFSPlusError.missingPath(path) }

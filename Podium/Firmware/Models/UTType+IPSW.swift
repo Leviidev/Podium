@@ -7,4 +7,9 @@ extension UTType {
     static var ipsw: UTType {
         UTType(filenameExtension: "ipsw") ?? .zip
     }
+
+    /// IPAs use the ZIP container format but have their own file extension.
+    static var ipa: UTType {
+        UTType(filenameExtension: "ipa") ?? .zip
+    }
 }

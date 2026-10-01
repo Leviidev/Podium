@@ -208,6 +208,7 @@ struct HFSPlusCatalogRecord {
     /// A file hard link ('hlnk'/'hfs+'), whose content lives in the
     /// private metadata folder's iNode file.
     var isHardLink: Bool { isFile && fileType == 0x686C_6E6B && fileCreator == 0x6866_732B }
+    var isSymbolicLink: Bool { isFile && fileType == 0x736C_6E6B && fileCreator == 0x7268_6170 }
 
     var key: [UInt8] { Self.key(parentID: parentID, name: name) }
 
