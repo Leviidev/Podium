@@ -25,10 +25,18 @@ struct EmulatorScreen: View {
             VStack(spacing: 0) {
                 Spacer(minLength: 12)
 
-                deviceFrame
-                    .frame(maxHeight: min(geometry.size.height * 0.68, 610))
-                    .aspectRatio(0.53, contentMode: .fit)
-                    .frame(maxWidth: .infinity)
+                GeometryReader { displayProxy in
+                    let displayHeight = min(displayProxy.size.height, displayProxy.size.width * 1.5)
+                    let displayWidth = displayHeight / 1.5
+
+                    screen
+                        .frame(width: displayWidth, height: displayHeight)
+                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                        .contentShape(Rectangle())
+                        .gesture(touchGesture(in: CGSize(width: displayWidth, height: displayHeight)))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .frame(maxHeight: min(geometry.size.height * 0.68, 610))
 
                 deviceDescription
                     .padding(.top, 18)
@@ -77,59 +85,6 @@ struct EmulatorScreen: View {
                 }
             }
         }
-    }
-
-    private var deviceFrame: some View {
-        GeometryReader { proxy in
-            let width = proxy.size.width
-            let bezel = max(width * 0.065, 15)
-            let cornerRadius = width * 0.16
-
-            VStack(spacing: 0) {
-                Circle()
-                    .fill(Color(.systemGray2))
-                    .frame(width: 7, height: 7)
-                    .padding(.top, 15)
-                    .padding(.bottom, 11)
-
-                GeometryReader { displayProxy in
-                    screen
-                        .aspectRatio(640.0 / 960.0, contentMode: .fit)
-                        .contentShape(Rectangle())
-                        .gesture(touchGesture(in: CGSize(width: displayProxy.size.width, height: displayProxy.size.width * 1.5)))
-                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-                }
-                .padding(.horizontal, bezel)
-                .frame(maxHeight: .infinity)
-
-                Button {
-                    emulatorCore.sendInput(.homeButton(pressed: true))
-                    emulatorCore.sendInput(.homeButton(pressed: false))
-                } label: {
-                    ZStack {
-                        Circle()
-                            .fill(Color.black)
-                        RoundedRectangle(cornerRadius: 4, style: .continuous)
-                            .strokeBorder(Color.white.opacity(0.78), lineWidth: 1.5)
-                            .frame(width: 13, height: 13)
-                    }
-                    .frame(width: 46, height: 46)
-                    .overlay(Circle().strokeBorder(Color.white.opacity(0.15), lineWidth: 1))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Home button")
-                .padding(.top, 13)
-                .padding(.bottom, 15)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.black, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(LinearGradient(colors: [Color.white.opacity(0.55), Color.white.opacity(0.12), Color.white.opacity(0.32)], startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 1.5)
-            }
-            .shadow(color: .black.opacity(0.45), radius: 26, y: 16)
-        }
-        .accessibilityElement(children: .contain)
     }
 
     @ViewBuilder

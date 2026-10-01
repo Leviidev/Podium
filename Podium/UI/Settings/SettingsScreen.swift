@@ -197,7 +197,7 @@ struct SettingsScreen: View {
 
                         cardDivider
 
-                        actionRow("Install IPA Apps", detail: "Add .ipa apps to /Applications", systemImage: "app.badge.plus",
+                        actionRow("Install IPA Apps", detail: "Add .ipa apps to /Applications", systemImage: "square.and.arrow.down",
                                   isDisabled: !canModifyGuestStorage || isInstallingIPAs) {
                             isImportingIPAs = true
                         }
@@ -243,26 +243,6 @@ struct SettingsScreen: View {
                                 .contentShape(Rectangle())
                         }
                         .disabled(emulatorCore.isBusy || isErasingGuest || firmwareLibrary.activeFirmware?.compatibility.isCompatible != true)
-                    }
-                }
-
-                settingsCard("Emulator", systemImage: "gamecontroller") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Label("Touchscreen, Home, volume, and power controls are available when the iPod is open.", systemImage: "hand.tap")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if let firmware = firmwareLibrary.activeFirmware {
-                            cardDivider
-                            HStack {
-                                Text("Device")
-                                Spacer()
-                                Text("\(firmware.displayName) · iOS \(firmware.metadata.productVersion)")
-                                    .foregroundStyle(.secondary)
-                                    .multilineTextAlignment(.trailing)
-                            }
-                            .font(.caption)
-                        }
                     }
                 }
 
