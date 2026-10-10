@@ -1,0 +1,25 @@
+name: Build Podium 8 GiB
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build unsigned IPA
+        run: bash build-8gib-ipa.sh
+      - name: Execute simulator tests
+        shell: bash
+        run: |
+          simulator=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for runtime,devices in d["devices"].items() if "iOS" in runtime for x in devices if x["isAvailable"] and "iPhone" in x["name"]))')
+          xcodebuild -project Podium.xcodeproj -scheme Podium -configuration Debug -destination "platform=iOS Simulator,id=$simulator" -derivedDataPath build-tests CODE_SIGNING_ALLOWED=NO DEVELOPMENT_TEAM='' test
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: Podium-0.1.0-8GiB-unsigned
+          path: Podium-0.1.0-8GiB-unsigned.ipa

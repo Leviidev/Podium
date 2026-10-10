@@ -56,28 +56,78 @@ final class PersistentGuestStorage {
         self.appSupportURL = appSupportURL ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
     }
 
-    /// Build/device scoped location, currently only `iPod4,1` / `10B500` is
-    /// compatible. Keep this stable across imported IPSW UUIDs and filenames.
-    private func directoryURL() throws -> URL {
+    /// Build/device scoped location for the firmware `firmwareURL` is
+    /// prepared from (matched against the validated reference builds). Keep
+    /// this stable across imported IPSW UUIDs and filenames. Without a URL,
+    /// the first validated build's directory is used for legacy callers
+    /// that haven't got the active firmware handy.
+    private func directoryURL(forFirmwareAt firmwareURL: URL? = nil) throws -> URL {
         guard let appSupportURL else { throw StorageError.appSupportUnavailable }
-        return appSupportURL
+        var directory = appSupportURL
             .appendingPathComponent("Podium", isDirectory: true)
             .appendingPathComponent("VirtualDevices", isDirectory: true)
-            .appendingPathComponent(ReferenceFirmware.device.identifier, isDirectory: true)
-            .appendingPathComponent(ReferenceFirmware.buildVersion, isDirectory: true)
+        if let firmwareURL,
+           let manifestData = try? Data(contentsOf: firmwareURL),
+           let manifest = try? PropertyListDecoder().decode(BuildManifestPlist.self, from: manifestData) {
+            let reference = ReferenceFirmware.all.first {
+                $0.buildVersion == manifest.productBuildVersion
+            }
+            if let reference {
+                directory = directory
+                    .appendingPathComponent(reference.device.identifier, isDirectory: true)
+                    .appendingPathComponent(reference.buildVersion, isDirectory: true)
+            }
+        }
+        return directory
     }
 
     func prepareUserVolume(forFirmwareAt firmwareURL: URL) throws -> (url: URL, fromOlderRecipe: Bool) {
         ioLock.lock()
         defer { ioLock.unlock() }
-        let directory = try directoryURL()
+        let directory = try directoryURL(forFirmwareAt: firmwareURL)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         let prepared = try RootFilesystemPreparer.prepareUserImage(forFirmwareAt: firmwareURL, in: directory)
+        var fromOlderRecipe = prepared.fromOlderRecipe
+
+        // A user volume made before a build gained (or lost) the 8 GiB md0
+        // path has the wrong size for its build: iOS 7 sessions replay it
+        // as a RAM disk and can't map it, and iOS 6 has no reason to keep a
+        // RAM-disk-sized volume. The volume's recipe marker should already
+        // catch this (it records the disk class too); the size check below
+        // covers volumes promoted before that marker existed. Rebuilding
+        // discards installed apps, tweaks, preferences, and guest files —
+        // the same cost an owner accepted by erasing in Settings.
+        let volumeMatchesSizing: Bool
+        do {
+            volumeMatchesSizing = try Self.volumeMatchesBuildSizing(prepared.url, firmwareURL: firmwareURL)
+        } catch {
+            volumeMatchesSizing = false
+        }
+        if fromOlderRecipe || !volumeMatchesSizing {
+            fromOlderRecipe = true
+            _ = try RootFilesystemPreparer.prepareUserImage(forFirmwareAt: firmwareURL, erasing: true, in: directory)
+        }
         let imageHeader = try RootFilesystemPreparer.readHFSPlusVolumeHeader(at: prepared.url)
         guard imageHeader.signature == HFSPlusVolumeHeader.signatureHFSPlus || imageHeader.signature == HFSPlusVolumeHeader.signatureHFSX else {
             throw StorageError.notAnHFSVolume
         }
-        return prepared
+        return (url: prepared.url, fromOlderRecipe: fromOlderRecipe)
+    }
+
+    /// Whether the user image's volume size fits its build's boot path:
+    /// md0-backed builds hold an 8 GiB volume, RAM-disk builds must fit in
+    /// guest DRAM. An image of the wrong class can't be booted by whatever
+    /// session would run this build.
+    private static func volumeMatchesBuildSizing(_ imageURL: URL, firmwareURL: URL) throws -> Bool {
+        let zip = try ZipArchiveReader(fileURL: firmwareURL)
+        guard let entry = zip.entry(named: IPSWParser.buildManifestEntryName) else { return false }
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        guard let plist = try PropertyListSerialization.propertyList(from: try zip.data(for: entry), options: [], format: &format) as? [String: Any],
+              let build = plist["ProductBuildVersion"] as? String else { return false }
+        let header = try RootFilesystemPreparer.readHFSPlusVolumeHeader(at: imageURL)
+        let volumeBytes = UInt64(header.blockSize) * UInt64(header.totalBlocks)
+        let isBlockBackedSized = volumeBytes > GuestMemoryLayout.ramDiskMaximumBytes
+        return isBlockBackedSized == GuestDiskBridge.supports(build: build)
     }
 
     func eraseActiveVolume(for firmwareURL: URL?, emulatorIsBusy: Bool) throws {
@@ -92,7 +142,7 @@ final class PersistentGuestStorage {
         defer { ioLock.unlock() }
         let legacy = RootFilesystemPreparer.userImageURL(forFirmwareAt: firmwareURL)
         if fileManager.fileExists(atPath: legacy.path) {
-            let destination = try RootFilesystemPreparer.userImageURL(in: directoryURL())
+            let destination = try RootFilesystemPreparer.userImageURL(in: directoryURL(forFirmwareAt: firmwareURL))
             try RootFilesystemPreparer.migrateUserImage(from: legacy, to: destination)
             try removeImportedFile()
             try? fileManager.removeItem(at: legacy)
@@ -110,7 +160,7 @@ final class PersistentGuestStorage {
         ioLock.lock()
         defer { ioLock.unlock() }
 
-        let imageURL = RootFilesystemPreparer.userImageURL(in: try directoryURL())
+        let imageURL = RootFilesystemPreparer.userImageURL(in: try directoryURL(forFirmwareAt: nil))
         guard fileManager.fileExists(atPath: imageURL.path) else { throw StorageError.storageNotPrepared }
         var selectedNames = Set<String>()
         var files: [RootFilesystemPreparer.GuestFile] = []
@@ -158,7 +208,7 @@ final class PersistentGuestStorage {
         guard !urls.isEmpty else { return [] }
         ioLock.lock()
         defer { ioLock.unlock() }
-        let directory = try directoryURL()
+        let directory = try directoryURL(forFirmwareAt: firmwareURL)
         let imageURL = RootFilesystemPreparer.userImageURL(in: directory)
         guard fileManager.fileExists(atPath: imageURL.path) else { throw StorageError.storageNotPrepared }
         let staging = directory.appendingPathComponent("package-install-\(UUID().uuidString)", isDirectory: true)
@@ -177,7 +227,7 @@ final class PersistentGuestStorage {
         guard !urls.isEmpty else { return [] }
         ioLock.lock()
         defer { ioLock.unlock() }
-        let directory = try directoryURL()
+        let directory = try directoryURL(forFirmwareAt: firmwareURL)
         let imageURL = RootFilesystemPreparer.userImageURL(in: directory)
         guard fileManager.fileExists(atPath: imageURL.path) else { throw StorageError.storageNotPrepared }
         let staging = directory.appendingPathComponent("ipa-install-\(UUID().uuidString)", isDirectory: true)
@@ -190,10 +240,10 @@ final class PersistentGuestStorage {
         !name.contains("/") && !name.unicodeScalars.contains(where: { $0.value == 0 }) && name.utf16.count <= 255
     }
 
-    func snapshot() throws -> Snapshot? {
+    func snapshot(forFirmwareAt firmwareURL: URL? = nil) throws -> Snapshot? {
         ioLock.lock()
         defer { ioLock.unlock() }
-        let imageURL = RootFilesystemPreparer.userImageURL(in: try directoryURL())
+        let imageURL = RootFilesystemPreparer.userImageURL(in: try directoryURL(forFirmwareAt: firmwareURL))
         guard fileManager.fileExists(atPath: imageURL.path) else { return nil }
         let header: HFSPlusVolumeHeader
         do {
@@ -210,7 +260,7 @@ final class PersistentGuestStorage {
         guard !emulatorIsPoweredOn else { throw StorageError.deviceMustBePoweredOff }
         ioLock.lock()
         defer { ioLock.unlock() }
-        let directory = try directoryURL()
+        let directory = try directoryURL(forFirmwareAt: firmwareURL)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         return try RootFilesystemPreparer.prepareUserImage(forFirmwareAt: firmwareURL, erasing: true, in: directory)
     }

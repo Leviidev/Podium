@@ -1,0 +1,49 @@
+
+push {r4,r5,r6,r7,lr}
+sub sp,sp,#20
+mov r4,r0
+bl 0x8009cdf8
+mov r5,r0
+mov r1,r0
+mov r0,r4
+bl 0x8009ce0c
+mov r0,r4
+add r1,sp,#8
+bl 0x8009d1e8
+cmp r0,#0
+bne failed_map
+mov r0,r4
+bl 0x8009d1a0
+str r0,[sp,#4]
+mov r0,r4
+bl 0x8009cdcc
+str r0,[sp]
+mov r0,r4
+bl 0x8009d178
+mov r2,r0
+mov r3,r1
+ldr r0,[sp,#8]
+mov r1,r5
+bl 0x80097918
+str r0,[sp,#12]
+str r1,[sp,#16]
+mov r0,r4
+bl 0x8009d230
+ldr r1,[sp,#16]
+subs r1,r5,r1
+mov r0,r4
+bl 0x8009ce0c
+ldr r1,[sp,#12]
+b report
+failed_map:
+movs r1,#14
+report:
+cmp r1,#0
+beq done
+mov r0,r4
+bl 0x8009cd90
+done:
+mov r0,r4
+bl 0x8009d5d4
+add sp,sp,#20
+pop {r4,r5,r6,r7,pc}

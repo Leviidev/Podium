@@ -24,7 +24,7 @@ final class PersistentGuestStorageTests: XCTestCase {
         let storage = PersistentGuestStorage(appSupportURL: applicationSupportURL)
         let prepared = try storage.prepareUserVolume(forFirmwareAt: firmwareURL)
         let expectedURL = RootFilesystemPreparer.userImageURL(in: applicationSupportURL
-            .appendingPathComponent("Podium/VirtualDevices/\(ReferenceFirmware.device.identifier)/\(ReferenceFirmware.buildVersion)",
+            .appendingPathComponent("Podium/VirtualDevices/\(ReferenceFirmware.all.first!.device.identifier)/\(ReferenceFirmware.all.first!.buildVersion)",
                                    isDirectory: true))
 
         XCTAssertEqual(prepared.url, expectedURL)
@@ -111,7 +111,7 @@ final class PersistentGuestStorageTests: XCTestCase {
         try writeHFSImage(at: preparedURL, fill: 0x31, freeBlocks: 3)
         let storage = PersistentGuestStorage(appSupportURL: applicationSupportURL)
         let directory = applicationSupportURL
-            .appendingPathComponent("Podium/VirtualDevices/\(ReferenceFirmware.device.identifier)/\(ReferenceFirmware.buildVersion)",
+            .appendingPathComponent("Podium/VirtualDevices/\(ReferenceFirmware.all.first!.device.identifier)/\(ReferenceFirmware.all.first!.buildVersion)",
                                    isDirectory: true)
         let committedURL = try storage.prepareUserVolume(forFirmwareAt: firmwareURL).url
         let committed = try Data(contentsOf: committedURL)
@@ -421,6 +421,37 @@ final class PersistentGuestStorageTests: XCTestCase {
         let storage = PersistentGuestStorage(appSupportURL: applicationSupportURL)
         XCTAssertThrowsError(try storage.addFiles([temporaryDirectory], emulatorIsBusy: true))
         XCTAssertThrowsError(try storage.addFiles([temporaryDirectory], emulatorIsBusy: false))
+    }
+
+    func testEightGiBCapacitySurvivesIPADEBAndFileRebuilds() throws {
+        let seed = temporaryDirectory.appendingPathComponent("seed.hfs")
+        let image = temporaryDirectory.appendingPathComponent("eight.hfs")
+        try writeSyntheticHFSVolume(at: seed)
+        let builder = try RootFilesystemBuilder(volume: HFSPlusVolume(source: FileVolumeSource(url: seed)))
+        try builder.write(to: image, freeSpace: 64 << 20, maximumVolumeBytes: FileBackedStorage.capacity)
+        func verifyCapacity() throws {
+            let header = try RootFilesystemPreparer.readHFSPlusVolumeHeader(at: image)
+            XCTAssertEqual(UInt64(header.totalBlocks) * UInt64(header.blockSize), FileBackedStorage.capacity)
+            XCTAssertGreaterThan(UInt64(header.freeBlocks) * UInt64(header.blockSize), UInt64(7) << 30)
+        }
+        try verifyCapacity()
+        let ipa = temporaryDirectory.appendingPathComponent("test.ipa")
+        try makeIPAArchive().write(to: ipa)
+        _ = try RootFilesystemPreparer.installIPAs([ipa], to: image, stagingDirectory: temporaryDirectory.appendingPathComponent("ipa-stage"))
+        try verifyCapacity()
+        let deb = try makeDebPackage(name: "com.example.eight", version: "1", files: [
+            .file(path: "usr/lib/eight.txt", contents: Data("eight".utf8), mode: 0o644)
+        ])
+        _ = try RootFilesystemPreparer.installDebianPackages([deb], to: image, stagingDirectory: temporaryDirectory.appendingPathComponent("deb-stage"))
+        try verifyCapacity()
+        let file = temporaryDirectory.appendingPathComponent("hello.txt")
+        try Data("hello".utf8).write(to: file)
+        try RootFilesystemPreparer.addGuestFiles([.init(name: "hello.txt", sourceURL: file, size: 5)], to: image, keepingFreeSpace: 8 << 20)
+        try verifyCapacity()
+        let updated = try RootFilesystemBuilder(volume: HFSPlusVolume(source: FileVolumeSource(url: image)))
+        XCTAssertTrue(updated.isFolder(at: "/Applications/PodiumTest.app"))
+        XCTAssertEqual(String(decoding: try updated.contents(of: "/usr/lib/eight.txt"), as: UTF8.self), "eight")
+        XCTAssertEqual(String(decoding: try updated.contents(of: "/private/var/mobile/Media/Podium/hello.txt"), as: UTF8.self), "hello")
     }
 
     private func makeIPAArchive(appName: String = "PodiumTest", bundleIdentifier: String = "com.example.podiumtest",

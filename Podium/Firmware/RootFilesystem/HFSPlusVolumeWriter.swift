@@ -281,6 +281,9 @@ final class HFSPlusVolumeWriter {
             totalBlocks = capacityBlocks
             let bitmapBytes = (capacityBlocks + 7) / 8
             allocationBlocks = (bitmapBytes + bs - 1) / bs
+            guard occupiedBlocks <= capacityBlocks, allocationBlocks <= capacityBlocks - occupiedBlocks else {
+                throw HFSPlusError.unsupported("volume metadata exceeds its maximum capacity")
+            }
             let actualFreeBlocks = capacityBlocks - occupiedBlocks - allocationBlocks
             guard actualFreeBlocks >= blocks(freeSpace) else {
                 throw HFSPlusError.unsupported("the rebuilt volume cannot retain the requested free space")

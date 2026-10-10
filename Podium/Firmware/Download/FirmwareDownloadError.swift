@@ -24,7 +24,7 @@ enum FirmwareDownloadError: FriendlyError {
         case .network(let underlying):
             return underlying.localizedDescription
         case .notFound:
-            return "api.ipsw.me returned no firmware for iPod4,1 / 10B500."
+            return "api.ipsw.me returned no firmware for the requested reference build."
         case .decodingFailed(let underlying):
             return underlying.localizedDescription
         case .checksumMismatch:

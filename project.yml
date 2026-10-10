@@ -55,6 +55,10 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: PodiumTests
+        excludes:
+          # This diagnostic requires a local IPSW and runs a real guest;
+          # it is not part of the firmware-independent unit test suite.
+          - Boot/_ManualRealFirmwareVerification.swift
     dependencies:
       - target: Podium
     settings:

@@ -11,13 +11,18 @@ import Foundation
 /// unimplemented without silently diverging from real hardware, so this
 /// exists to do it for real, per ARM DDI 0406C section B3.6.
 ///
-/// Deliberately out of scope, honestly: the simplified/access-flag AP
-/// model (SCTLR.AFE) — `ARMv7CPU` checks for and refuses that combination
-/// rather than silently misapplying the legacy 3-bit AP model to it — TEX
-/// remap. Permissions are checked for the access's privilege: User-mode
-/// accesses get the user half of Table B3-8 (copy-on-write and read-only
-/// user mappings depend on it). `ARMv7CPU` keeps a TLB of successful walks
-/// in front of this (see `translatedAddress`).
+/// The simplified/access-flag AP model (SCTLR.AFE) *is* implemented —
+/// iOS 7's kernel enables it at boot — selected by the `afe` flag through
+/// `translate`. Its AP encodings and the hardware-managed Access Flag
+/// follow XNU's own 32-bit pmap definitions (`osfmk/arm/proc_reg.h`):
+/// AP = AP1(bit5):AP2(bit9) with 0 = privileged RW/user none, 1 = RW/RW,
+/// 2 = privileged RO/user none, 3 = RO/RO; AP0 (bit 4) is the Access
+/// Flag, and an entry with AF clear faults any access. TEX remap remains
+/// honestly out of scope. Permissions are checked for the access's
+/// privilege: user-mode accesses get the user half of the tables
+/// (copy-on-write and read-only user mappings depend on it).
+/// `ARMv7CPU` keeps a TLB of successful walks in front of this (see
+/// `translatedAddress`).
 enum ARMv7MMU {
     enum Access {
         case read
@@ -34,7 +39,7 @@ enum ARMv7MMU {
         privileged: Bool = true
     ) throws -> UInt32 {
         try translate(virtualAddress: virtualAddress, access: access, ttbcr: cp15.ttbcr, ttbr0: cp15.ttbr0, ttbr1: cp15.ttbr1,
-                      dacr: cp15.dacr, memory: memory, privileged: privileged)
+                      dacr: cp15.dacr, memory: memory, privileged: privileged, afe: cp15.sctlr & 0x2000_0000 != 0)
     }
 
     /// The walk itself, taking just the registers it reads (passing the
@@ -47,7 +52,8 @@ enum ARMv7MMU {
         ttbr1: UInt32,
         dacr: UInt32,
         memory: MemoryBus,
-        privileged: Bool
+        privileged: Bool,
+        afe: Bool
     ) throws -> UInt32 {
         let n = Int(ttbcr.bitField(2, 0))
 
@@ -93,9 +99,21 @@ enum ARMv7MMU {
 
             let isLargePage = secondLevelDescriptor.bitField(1, 0) == 0b01
             if requiresPermissionCheck {
-                let ap = pageAccessPermission(secondLevelDescriptor)
-                let executeNever = isLargePage ? secondLevelDescriptor.bit(15) : secondLevelDescriptor.bit(0)
-                try checkPermission(ap, access: access, executeNever: executeNever, isPage: true, privileged: privileged, virtualAddress: virtualAddress)
+                let ap = afe ? afeAccessPermission(secondLevelDescriptor) : pageAccessPermission(secondLevelDescriptor)
+                // With AFE, small-page bit 0 becomes the Access Flag and
+                // XN lives in bit 1 (DDI 0406C B3.6.6); large pages and
+                // sections keep their ordinary XN.
+                let executeNever: Bool
+                if afe, !isLargePage {
+                    executeNever = secondLevelDescriptor.bit(1)
+                } else {
+                    executeNever = isLargePage ? secondLevelDescriptor.bit(15) : secondLevelDescriptor.bit(0)
+                }
+                if afe {
+                    try checkAFEPermission(ap, access: access, executeNever: executeNever, isPage: true, privileged: privileged, virtualAddress: virtualAddress)
+                } else {
+                    try checkPermission(ap, access: access, executeNever: executeNever, isPage: true, privileged: privileged, virtualAddress: virtualAddress)
+                }
             }
 
             return isLargePage
@@ -107,9 +125,12 @@ enum ARMv7MMU {
             let requiresPermissionCheck = try checkDomain(domain, isPage: false, dacr: dacr, virtualAddress: virtualAddress, isWrite: isWrite)
 
             if requiresPermissionCheck {
-                let ap = sectionAccessPermission(firstLevelDescriptor)
-                let executeNever = firstLevelDescriptor.bit(4)
-                try checkPermission(ap, access: access, executeNever: executeNever, isPage: false, privileged: privileged, virtualAddress: virtualAddress)
+                let ap = afe ? afeAccessPermission(firstLevelDescriptor) : sectionAccessPermission(firstLevelDescriptor)
+                if afe {
+                    try checkAFEPermission(ap, access: access, executeNever: firstLevelDescriptor.bit(4), isPage: false, privileged: privileged, virtualAddress: virtualAddress)
+                } else {
+                    try checkPermission(ap, access: access, executeNever: firstLevelDescriptor.bit(4), isPage: false, privileged: privileged, virtualAddress: virtualAddress)
+                }
             }
 
             if firstLevelDescriptor.bit(18) {
@@ -135,6 +156,17 @@ enum ARMv7MMU {
         UInt8((descriptor.bitField(9, 9) << 2) | descriptor.bitField(5, 4))
     }
 
+    /// AFE AP value, per XNU's pmap (proc_reg.h): AP1(bit5):AP2(bit9),
+    /// where 0 = privileged RW/user none; 1 = RW/RW; 2 = privileged RO/
+    /// user none; 3 = RO/RO. An entry with the Access Flag clear (AP0,
+    /// bit 4) faults any access — including the kernel's.
+    private static func afeAccessPermission(_ descriptor: UInt32) -> UInt8 {
+        if !descriptor.bit(4) {
+            return 0 // Access Flag clear: no access by anyone.
+        }
+        return UInt8((descriptor.bitField(9, 9) << 1) | descriptor.bitField(5, 5))
+    }
+
     /// DACR (c3, c0, 0): two bits per domain. `0b00` faults unconditionally,
     /// `0b01` ("client") defers to the AP/XN permission check, `0b11`
     /// ("manager") bypasses permission checking entirely, and the reserved
@@ -151,6 +183,23 @@ enum ARMv7MMU {
             return true // Client: caller still performs the AP/XN permission check.
         default:
             throw MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: .domainFault(isPage: isPage), isWrite: isWrite)
+        }
+    }
+
+    /// AFE permission check. AP encodings are XNU's 32-bit pmap values
+    /// (proc_reg.h), stored as AP1|AP2 in the descriptor: 0 = privileged
+    /// RW/user none; 1 = RW/RW; 2 = privileged RO/user none; 3 = RO/RO.
+    /// AP0 is the hardware Access Flag; with it clear the entry faults
+    /// everything (the kernel manages software-managed AF itself).
+    private static func checkAFEPermission(_ ap: UInt8, access: Access, executeNever: Bool, isPage: Bool, privileged: Bool, virtualAddress: UInt32) throws {
+        let fault = MemoryAccessError.translationFault(virtualAddress: virtualAddress, reason: .permissionFault(isPage: isPage), isWrite: access == .write)
+        if ap == 0 { throw fault }
+        if access == .execute && executeNever {
+            throw fault
+        }
+        let writeable = ap == 0 || ap == 1
+        if access == .write && !writeable {
+            throw fault
         }
     }
 

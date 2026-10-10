@@ -1,0 +1,102 @@
+
+bic r3,r0,#0xff000000
+cmp r3,#0
+beq raw_md0
+movs r0,#6
+bx lr
+raw_md0:
+push {r4,r5,r6,r7,r8,r10,r11,lr}
+sub sp,sp,#24
+mov r6,r0
+mov r4,r1
+str r6,[sp,#4]
+mov r0,r4
+bl 0x801e2a3c
+mov r8,r0
+eor r0,r0,#1
+str r0,[sp]
+movw r0,#4096
+bl 0x8001ccec
+mov r10,r0
+cmp r0,#0
+beq no_memory
+again:
+mov r0,r4
+bl 0x801e2724
+cmp r0,#0
+ble success
+movw r5,#4096
+cmp r0,r5
+it lo
+movlo r5,r0
+mov r0,r4
+bl 0x801e2a1c
+str r0,[sp,#8]
+str r1,[sp,#12]
+cmp r8,#0
+beq reading
+mov r0,r4
+bl 0x801e2ec8
+str r0,[sp,#16]
+cmp r0,#0
+beq no_memory
+mov r0,r10
+movs r1,#0
+mov r2,r5
+ldr r3,[sp,#16]
+bl 0x801e25d4
+mov r11,r0
+ldr r0,[sp,#16]
+bl 0x801e2c18
+cmp r11,#0
+bne return_saved_error
+mov r0,r10
+mov r1,r5
+ldr r2,[sp,#8]
+ldr r3,[sp,#12]
+bl 0x8009791c
+mov r11,r0
+cmp r1,#0
+beq return_saved_error
+mov r0,r4
+bl 0x801e2730
+cmp r11,#0
+bne return_saved_error
+b again
+reading:
+mov r0,r10
+mov r1,r5
+ldr r2,[sp,#8]
+ldr r3,[sp,#12]
+bl 0x8009791c
+cmp r0,#0
+bne finish
+cmp r1,#0
+beq success
+mov r2,r1
+mov r0,r10
+movs r1,#0
+mov r3,r4
+bl 0x801e25d4
+cmp r0,#0
+bne finish
+b again
+no_memory:
+movs r0,#12
+b finish
+return_saved_error:
+mov r0,r11
+b finish
+success:
+movs r0,#0
+finish:
+mov r11,r0
+cmp r10,#0
+beq no_free
+mov r0,r10
+movw r1,#4096
+bl 0x8001ccfc
+no_free:
+mov r0,r11
+add sp,sp,#24
+pop {r4,r5,r6,r7,r8,r10,r11,pc}

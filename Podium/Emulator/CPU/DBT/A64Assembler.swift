@@ -568,7 +568,9 @@ struct A64Assembler {
     }
     /// `tbl`/`tbx vd, {vn...vn+length-1}.16b, vm`.
     mutating func tbl(q: Bool, extends: Bool, _ rd: Int, _ rn: Int, length: Int, _ rm: Int) {
-        emit(0x0E00_0000 | (q ? 1 << 30 : 0) | UInt32(rm) << 16 | UInt32(length - 1) << 13 | (extends ? 1 << 12 : 0) | UInt32(rn) << 5 | UInt32(rd))
+        let variant: UInt32 = (q ? UInt32(1) << 30 : 0) | (extends ? UInt32(1) << 12 : 0)
+        let operands = (UInt32(rm) << 16) | (UInt32(length - 1) << 13) | (UInt32(rn) << 5) | UInt32(rd)
+        emit(0x0E00_0000 | variant | operands)
     }
     /// `imm5` encodes the element size and index: `index << 1 | 1` for
     /// bytes, `index << 2 | 2` halfwords, `index << 3 | 4` words, `index << 4 | 8` doublewords.

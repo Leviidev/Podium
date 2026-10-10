@@ -141,9 +141,13 @@ final class DBTEngine {
     /// Addresses (breakpoints, native functions) a block mustn't run
     /// through: execution has to come back to `ARMv7CPU.run` before them.
     private(set) var stopAddresses: Set<UInt32> = []
+    /// How the region was obtained ("RWX MAP_JIT", "debugger dual-mapped"…),
+    /// surfaced so a session can tell its user why boot speed differs.
+    let jitModeDescription: String
 
     init?(cpu: ARMv7CPU) {
         guard let region = JITMemory.shared, let ram = cpu.ramRange else { return nil }
+        jitModeDescription = region.modeDescription
         self.cpu = cpu
         self.region = region
         ramBase = ram.base

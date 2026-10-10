@@ -1,16 +1,18 @@
 import Foundation
 
-/// Looks up Podium's one reference firmware (iPod4,1 / iOS 6.1.6 / 10B500)
-/// via the public ipsw.me API. This is the same source named in Podium's
-/// own project brief as the reference for this firmware.
+/// Looks up a validated reference firmware (e.g. iPod4,1 / iOS 6.1.6 /
+/// 10B500) via the public ipsw.me API — the same source named in Podium's
+/// own project brief.
 struct IPSWMeAPIClient {
-    private static let referenceFirmwareEndpoint = URL(string: "https://api.ipsw.me/v4/ipsw/iPod4,1/10B500")!
+    func endpoint(for firmware: ReferenceFirmware) -> URL {
+        URL(string: "https://api.ipsw.me/v4/ipsw/\(firmware.downloadIdentifier)")!
+    }
 
-    func fetchReferenceFirmwareInfo() async throws -> IPSWMeFirmwareInfo {
+    func fetchReferenceFirmwareInfo(_ firmware: ReferenceFirmware) async throws -> IPSWMeFirmwareInfo {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(from: Self.referenceFirmwareEndpoint)
+            (data, response) = try await URLSession.shared.data(from: endpoint(for: firmware))
         } catch {
             throw FirmwareDownloadError.network(underlying: error)
         }

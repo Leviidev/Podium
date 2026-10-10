@@ -65,7 +65,7 @@ struct BootProgressView: View {
     private func detail(of stage: EmulatorCore.BootStage) -> String? {
         switch stage {
         case .preparingFilesystem(let phase, let fraction):
-            let step = phase == .extracting ? "Extracting the root filesystem" : "Building the RAM disk"
+            let step = phase == .extracting ? "Extracting the root filesystem" : "Building the 8 GiB disk"
             return "\(step) · \(Int(fraction * 100))%"
         case .booting:
             guard instructionsPerSecond > 0 else { return nil }

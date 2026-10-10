@@ -1,0 +1,38 @@
+name: Diagnose actual iPod kernel boot
+on:
+  workflow_dispatch:
+    inputs:
+      trace:
+        description: Trace kernel buffer mapping calls
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen
+      - name: Start simulator while the firmware and app are prepared
+        run: |
+          simulator=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for runtime,devices in d["devices"].items() if "iOS" in runtime for x in devices if x["isAvailable"] and "iPhone" in x["name"]))')
+          xcrun simctl boot "$simulator" > /tmp/podium-simulator-boot.log 2>&1 &
+          echo "BOOT_SIMULATOR=$simulator" >> "$GITHUB_ENV"
+      - name: Download reference firmware for this ephemeral test only
+        run: |
+          mkdir -p .reference-firmware
+          if [ '${{ inputs.trace }}' = true ]; then touch .reference-firmware/trace-buffer-mapping; fi
+          curl --fail --location --retry 2 'https://secure-appldnld.apple.com/iOS6.1/031-3211.20140221.Placef/iPod4,1_6.1.6_10B500_Restore.ipsw' -o '.reference-firmware/iPod4,1_6.1.6_10B500_Restore.ipsw'
+          printf '%s  %s\n' '1f6096c3298c87172f431e4924a4cf3c53298e5920f4b6c817929aa32d90c5ff' '.reference-firmware/iPod4,1_6.1.6_10B500_Restore.ipsw' | shasum -a 256 -c -
+      - name: Execute actual guest kernel on Apple Silicon
+        run: |
+          xcodegen generate
+          xcodebuild -project Podium.xcodeproj -scheme Podium -configuration Release -destination "platform=iOS Simulator,id=$BOOT_SIMULATOR" -derivedDataPath build-boot -only-testing:PodiumTests/RealDiskBootTests -only-testing:PodiumTests/GuestDiskShimExecutionTests -only-testing:PodiumTests/FileBackedStorageTests -resultBundlePath boot-result.xcresult CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES ONLY_ACTIVE_ARCH=YES DEVELOPMENT_TEAM='' test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-diagnostics
+          path: boot-result.xcresult
+          retention-days: 3

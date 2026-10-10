@@ -121,7 +121,15 @@ final class EmulatorCore {
                 appendLog(String(format: "Root filesystem ready in %.1f s.", Date().timeIntervalSince(started)))
             }
             bootStage = .loadingKernel
-            let userImage = try persistentGuestStorage.prepareUserVolume(forFirmwareAt: fileURL)
+            // An APFS clone can fail on a device, falling back to a sparse
+            // copy of the eight-GiB logical image. Never do that I/O on the
+            // main actor: UIKit's watchdog can terminate the app at Kernel.
+            appendLog("Preparing persistent guest storage…")
+            let storage = persistentGuestStorage
+            let userImage = try await Task.detached(priority: .userInitiated) {
+                try storage.prepareUserVolume(forFirmwareAt: fileURL)
+            }.value
+            appendLog("Persistent guest storage ready.")
             if userImage.fromOlderRecipe {
                 appendLog("This iOS install was made by an older Podium; erase it in Settings to pick up the newer system image.")
             }
@@ -129,7 +137,8 @@ final class EmulatorCore {
             let session = try await Task.detached(priority: .userInitiated) {
                 let kernel = try KernelcacheExtractor.extractKernelMachO(from: firmware, storedAt: fileURL)
                 let deviceTree = try DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: fileURL)
-                return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem, persistent: true)
+                return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem,
+                                            firmwareBuildVersion: firmware.metadata.buildVersion, persistent: true)
             }.value
             session.onFinish = { [weak self, weak session] state in
                 Task { @MainActor in
@@ -224,7 +233,7 @@ final class EmulatorCore {
     /// The boot screens (Apple logo, SpringBoard's logo flare) are almost
     /// all black or a dark glow; the lock screen is a bright, full-screen
     /// wallpaper.
-    static func lockScreenIsUp(_ display: DisplayScanout) -> Bool {
+    nonisolated static func lockScreenIsUp(_ display: DisplayScanout) -> Bool {
         guard !display.activeLayers.isEmpty else { return false }
         let width = display.pixelWidth, height = display.pixelHeight
         var pixels = [UInt32](repeating: 0, count: width * height)
@@ -241,8 +250,12 @@ final class EmulatorCore {
 
     private func sessionFinished(_ state: EmulationSession.State, from finishedSession: EmulationSession) {
         guard session === finishedSession else { return }
+        let hadFinishedBoot: Bool
+        if case .running = bootStage { hadFinishedBoot = true } else { hadFinishedBoot = false }
         pollTask?.cancel()
         pollTask = nil
+        let finalMessages = finishedSession.newKernelMessages()
+        if !finalMessages.isEmpty { appendLog(finalMessages) }
         bootStage = nil
         if finishedSession.hasStorageFlushFailure {
             status = .error("Guest stopped, but persistent storage couldn't be flushed. Retry Power Off before leaving.")
@@ -262,6 +275,14 @@ final class EmulatorCore {
             framebufferSource = nil
             appendLog("iOS shut down.")
         case .restarting:
+            // An early reboot must leave its log visible instead of hiding
+            // the cause behind an endless sequence of Kernel screens.
+            if !hadFinishedBoot {
+                status = .error("iOS restarted before finishing boot. Open Developer Settings to view the kernel log.")
+                appendLog("iOS requested a restart before finishing boot; automatic retry stopped.")
+                framebufferSource = nil
+                return
+            }
             status = .stopped
             framebufferSource = nil
             appendLog("iOS is restarting.")

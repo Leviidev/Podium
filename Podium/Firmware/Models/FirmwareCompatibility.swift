@@ -23,18 +23,18 @@ enum FirmwareCompatibility: Codable, Hashable {
 
 /// Decides compatibility for parsed firmware metadata.
 ///
-/// Podium's initial supported target is intentionally exact: a single
-/// device, a single iOS version, a single build. This is not a general
-/// "does Podium probably work" heuristic — it's a strict match against
-/// what's actually been validated.
+/// Podium is deliberately exact: a firmware is compatible when it matches
+/// — device, iOS version, and build — one of the validated reference
+/// builds exactly. This is not a "does it probably work" heuristic; with
+/// an unvalidated build the rest of the pipeline has no symbol tables,
+/// no keys, and no tested recipe.
 enum FirmwareCompatibilityChecker {
     static func evaluate(_ metadata: FirmwareMetadata) -> FirmwareCompatibility {
-        guard metadata.supportedDeviceIdentifiers.contains(ReferenceFirmware.device.identifier) else {
+        guard ReferenceFirmware.matching(metadata) != nil else {
+            if metadata.supportedDeviceIdentifiers.contains(where: { DeviceCatalog.device(for: $0) != nil }) {
+                return .unsupportedVersion
+            }
             return .unsupportedDevice
-        }
-        guard metadata.productVersion == ReferenceFirmware.productVersion,
-              metadata.buildVersion == ReferenceFirmware.buildVersion else {
-            return .unsupportedVersion
         }
         return .compatible
     }
