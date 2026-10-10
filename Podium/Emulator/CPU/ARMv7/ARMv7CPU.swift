@@ -903,6 +903,9 @@ final class ARMv7CPU: CPU {
     private static let sctlrCRm = 0
     private static let sctlrOpc2 = 0
     private static let sctlrMMUEnableBit: UInt32 = 1 << 0
+    /// SCTLR.AFE: the simplified/access-flag AP model, now implemented
+    /// (see `ARMv7MMU`'s doc comment). Kept as a named constant for the
+    /// tests; the MMU reads it from `CP15State.sctlr` bit 29 itself.
     private static let sctlrAccessFlagEnableBit: UInt32 = 1 << 29
 
     /// Whether address translation is currently active, read straight
@@ -948,7 +951,7 @@ final class ARMv7CPU: CPU {
         }
         let physical = try ARMv7MMU.translate(
             virtualAddress: virtualAddress, access: access, ttbcr: cp15.ttbcr, ttbr0: cp15.ttbr0, ttbr1: cp15.ttbr1,
-            dacr: cp15.dacr, memory: memory, privileged: !user
+            dacr: cp15.dacr, memory: memory, privileged: !user, afe: cp15.sctlr & Self.sctlrAccessFlagEnableBit != 0
         )
         tlbTags[slot] = tag
         tlbPages[slot] = physical & 0xFFFF_F000
@@ -1528,23 +1531,8 @@ final class ARMv7CPU: CPU {
             registers[instr.rt] = value
         } else {
             let value = operandValue(for: instr.rt)
-
-            if instr.coprocessor == Self.sctlrCoprocessor, instr.opc1 == Self.sctlrOpc1,
-               instr.crn == Self.sctlrCRn, instr.crm == Self.sctlrCRm, instr.opc2 == Self.sctlrOpc2,
-               value & Self.sctlrAccessFlagEnableBit != 0 {
-                // AFE repurposes the AP encoding `ARMv7MMU` implements
-                // (the legacy 3-bit {APX,AP} permission model) into a
-                // different one built around a hardware-managed Access
-                // Flag — silently reusing the same bits under that model
-                // would misinterpret real permission data. No guest code
-                // Podium has run so far sets this, so it's refused
-                // outright rather than guessed at.
-                lastError = .unimplementedHardwareFeature(
-                    description: "guest enabled SCTLR.AFE (access-flag AP model) — only the legacy 3-bit AP model is implemented",
-                    address: instructionAddress
-                )
-                return
-            }
+            // SCTLR.AFE (the access-flag AP model) is implemented now —
+            // iOS 7's kernel enables it — see `ARMv7MMU`'s doc comment.
 
             cp15.write(coprocessor: instr.coprocessor, opc1: instr.opc1, crn: instr.crn, crm: instr.crm, opc2: instr.opc2, value: value)
             if instr.coprocessor == 15, instr.opc1 == 0, instr.crn == 8 {

@@ -20,9 +20,15 @@ enum GuestDiskBridge {
         var developerDetail: String { "Kernel SHA-256 does not match the verified 10B500 storage ABI." }
     }
 
-    static func patch(_ original: Data) throws -> Data {
+    /// The verified kernels whose storage ABI this bridge patches. Other
+    /// builds boot the root filesystem as a RAM disk instead.
+    static let verifiedKernels: [String: String] = ["10B500": kernelSHA256]
+
+    static func supports(build buildVersion: String) -> Bool { verifiedKernels[buildVersion] != nil }
+
+    static func patch(_ original: Data, buildVersion: String) throws -> Data {
         let digest = SHA256.hash(data: original).hexEncodedString
-        guard digest == kernelSHA256 else { throw UnsupportedKernel() }
+        guard digest == verifiedKernels[buildVersion] else { throw UnsupportedKernel() }
         var kernel = original
         // In this verified Mach-O __TEXT vmaddr/fileoff are 0x80001000/0.
         func put(_ hex: String, at address: UInt32) {

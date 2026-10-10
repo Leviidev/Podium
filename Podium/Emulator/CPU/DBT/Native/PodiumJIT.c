@@ -87,10 +87,12 @@ void *podium_jit_allocate(size_t size, void **writable, PodiumJITMode *mode) {
     fprintf(stderr, "[podium-jit] RWX MAP_JIT refused (errno %d)\n", errno);
 
 #if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
-    if (!podium_jit_debugger_attached()) {
-        fprintf(stderr, "[podium-jit] no debugger attached; no JIT\n");
-        return NULL;
-    }
+    // Don't require CS_DEBUGGED here: attaching a debugger after exec
+    // (StikDebug's own "attach + prepare region" flow, on a running app)
+    // also services JIT26 breakpoints. The SIGTRAP guard below makes an
+    // unserviced attempt a clean failure instead of a crash, so trying
+    // it even with no debugger present is harmless — one failed MAP_ANON
+    // RX mapping and its cleanup.
     void *executable = mmap(NULL, size, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (executable == MAP_FAILED) {
         fprintf(stderr, "[podium-jit] RX region refused (errno %d)\n", errno);

@@ -38,6 +38,15 @@ enum GuestMemoryLayout {
         address &- kernelVirtualBase &+ ramPhysicalBase
     }
 
+    /// The largest root filesystem image a RAM-disk boot can hold: an 8 MiB
+    /// journal, the device tree and boot structures live at the bottom of
+    /// DRAM, and the framebuffer at the top — everything in between may be
+    /// the disk (see `KernelBootstrap`'s static region and the kernel's
+    /// linear map of all of DRAM).
+    static var ramDiskMaximumBytes: UInt64 {
+        UInt64(ramSize) - UInt64(framebufferSize) - (16 << 20)
+    }
+
     /// Physical DRAM address -> the kernel's linear-map virtual address.
     static func kernelVirtual(fromPhysical address: UInt32) -> UInt32 {
         address &- ramPhysicalBase &+ kernelVirtualBase

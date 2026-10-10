@@ -35,9 +35,9 @@ final class IPSWParserTests: XCTestCase {
 
     private func makeIPSW(
         named fileName: String = "test.ipsw",
-        productVersion: String = ReferenceFirmware.productVersion,
-        buildVersion: String = ReferenceFirmware.buildVersion,
-        deviceIdentifiers: [String] = [ReferenceFirmware.device.identifier],
+        productVersion: String = ReferenceFirmware.all.first!.productVersion,
+        buildVersion: String = ReferenceFirmware.all.first!.buildVersion,
+        deviceIdentifiers: [String] = [ReferenceFirmware.all.first!.device.identifier],
         kernelCachePath: String? = nil,
         includeManifest: Bool = true
     ) throws -> URL {
@@ -62,9 +62,15 @@ final class IPSWParserTests: XCTestCase {
         let url = try makeIPSW()
         let parsed = try IPSWParser.parse(fileURL: url)
 
-        XCTAssertEqual(parsed.metadata.productVersion, ReferenceFirmware.productVersion)
-        XCTAssertEqual(parsed.metadata.buildVersion, ReferenceFirmware.buildVersion)
-        XCTAssertEqual(parsed.metadata.supportedDeviceIdentifiers, [ReferenceFirmware.device.identifier])
+        for reference in ReferenceFirmware.all {
+            let url = try makeIPSW(productVersion: reference.productVersion,
+                                   buildVersion: reference.buildVersion,
+                                   deviceIdentifiers: [reference.device.identifier])
+            let parsed = try IPSWParser.parse(fileURL: url)
+            XCTAssertEqual(parsed.metadata.productVersion, reference.productVersion)
+            XCTAssertEqual(parsed.metadata.buildVersion, reference.buildVersion)
+            XCTAssertEqual(parsed.compatibility, .compatible, "\(reference.buildVersion) must parse compatible")
+        }
         XCTAssertEqual(parsed.compatibility, .compatible)
     }
 

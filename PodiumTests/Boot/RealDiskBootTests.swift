@@ -29,7 +29,8 @@ final class RealDiskBootTests: XCTestCase {
             setenv("PODIUM_DISK_TRACE", "1", 1)
         }
         defer { unsetenv("PODIUM_DISK_TRACE") }
-        let session = try EmulationSession(kernel: kernel, deviceTree: tree, rootFilesystem: image, persistent: true)
+        let session = try EmulationSession(kernel: kernel, deviceTree: tree, rootFilesystem: image,
+                                           firmwareBuildVersion: parsed.metadata.buildVersion, persistent: true)
         session.start()
         defer { session.stop() }
         var messages = ""

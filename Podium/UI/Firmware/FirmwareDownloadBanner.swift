@@ -5,6 +5,7 @@ import SwiftUI
 /// so callers can drop this in unconditionally above their normal content.
 struct FirmwareDownloadBanner: View {
     let phase: FirmwareDownloadPhase
+    let firmware: ReferenceFirmware
     let onCancel: () -> Void
     let onRetry: () -> Void
 
@@ -17,14 +18,14 @@ struct FirmwareDownloadBanner: View {
             statusCard {
                 ProgressView()
                     .controlSize(.small)
-                Text("Looking up iOS \(ReferenceFirmware.productVersion)…")
+                Text("Looking up iOS \(firmware.productVersion)…")
                     .font(.subheadline)
             }
 
         case .downloading(let written, let total):
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Downloading iOS \(ReferenceFirmware.productVersion)")
+                    Text("Downloading iOS \(firmware.productVersion)")
                         .font(.subheadline.weight(.medium))
                     Spacer()
                     Button("Cancel", action: onCancel)

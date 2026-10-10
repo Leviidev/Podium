@@ -23,7 +23,8 @@ struct SettingsScreen: View {
 
     private func refreshGuestStorage() {
         do {
-            guestStorage = try firmwareLibrary.persistentGuestStorage.snapshot()
+            guestStorage = try firmwareLibrary.persistentGuestStorage.snapshot(
+                forFirmwareAt: firmwareLibrary.activeFirmware.map { firmwareLibrary.fileURL(for: $0) })
             storageError = nil
         } catch {
             guestStorage = nil

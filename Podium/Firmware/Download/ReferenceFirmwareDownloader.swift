@@ -13,6 +13,11 @@ import Observation
 @Observable
 final class ReferenceFirmwareDownloader {
     private(set) var phase: FirmwareDownloadPhase = .idle
+    /// The validated firmware the current (or next) download will fetch.
+    /// The automatic launch-time download targets the iOS 7.1.2 (iPhone 4)
+    /// reference build; the firmware screen also lists the older iPod
+    /// touch 4 build as an explicit choice.
+    var downloadingFirmware: ReferenceFirmware = .iPhone4712
 
     private let apiClient: IPSWMeAPIClient
     private var activeDownloadTask: FirmwareDownloadTask?
@@ -43,7 +48,7 @@ final class ReferenceFirmwareDownloader {
     private func run(into library: FirmwareLibrary) async {
         phase = .checkingAvailability
         do {
-            let info = try await apiClient.fetchReferenceFirmwareInfo()
+            let info = try await apiClient.fetchReferenceFirmwareInfo(downloadingFirmware)
 
             let tempURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("podium-download-\(UUID().uuidString).ipsw")

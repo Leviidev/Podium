@@ -54,11 +54,11 @@ enum DeviceTreeExtractor {
         guard container.isEncrypted else {
             return Data(container.payload.prefix(Int(container.declaredDataLength)))
         }
-        guard firmware.compatibility.isCompatible else {
+        guard let keys = ReferenceFirmwareKeys.forBuild(firmware.metadata.buildVersion),
+              firmware.compatibility.isCompatible else {
             throw DeviceTreeExtractionError.unknownDecryptionKey
         }
-        let keys = ReferenceFirmwareKeys.deviceTree
-        let decrypted = try FirmwareDecryption.aes256CBCDecrypt(container.payload, key: keys.key, iv: keys.iv)
+        let decrypted = try FirmwareDecryption.aes256CBCDecrypt(container.payload, key: keys.deviceTree.key, iv: keys.deviceTree.iv)
         // Unlike the kernelcache, the device tree isn't compressed, so
         // there's no decompressor to naturally stop at the real end —
         // trim the AES block-padding remainder ourselves using the

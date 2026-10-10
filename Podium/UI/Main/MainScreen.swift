@@ -25,6 +25,7 @@ struct MainScreen: View {
 
                 FirmwareDownloadBanner(
                     phase: downloader.phase,
+                    firmware: downloader.downloadingFirmware,
                     onCancel: { downloader.cancel() },
                     onRetry: { Task { await downloader.retry(into: firmwareLibrary) } }
                 )
@@ -48,9 +49,11 @@ struct MainScreen: View {
                 .font(.caption.weight(.bold))
                 .tracking(2.4)
                 .foregroundStyle(.blue)
-            Text(DeviceCatalog.iPodTouch4.marketingName)
+            Text(activeFirmware?.metadata.primaryDevice?.marketingName
+                 ?? downloader.downloadingFirmware.device.marketingName)
                 .font(.title2.weight(.semibold))
-            Text(activeFirmware.map { "iOS \($0.metadata.productVersion)" } ?? "Your virtual iPod")
+            Text(activeFirmware.map { "iOS \($0.metadata.productVersion)" }
+                 ?? "iOS \(downloader.downloadingFirmware.productVersion) ready to download")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }

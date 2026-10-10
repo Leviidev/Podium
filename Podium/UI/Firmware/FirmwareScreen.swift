@@ -12,6 +12,7 @@ struct FirmwareScreen: View {
             if downloader.phase != .idle && downloader.phase != .completed {
                 FirmwareDownloadBanner(
                     phase: downloader.phase,
+                    firmware: downloader.downloadingFirmware,
                     onCancel: { downloader.cancel() },
                     onRetry: { Task { await downloader.retry(into: firmwareLibrary) } }
                 )
@@ -67,16 +68,21 @@ struct FirmwareScreen: View {
             ContentUnavailableView {
                 Label("No Firmware Imported", systemImage: "square.and.arrow.down")
             } description: {
-                Text("Import an IPSW to get started. Podium currently supports \(DeviceCatalog.iPodTouch4.marketingName) on iOS \(ReferenceFirmware.productVersion).")
+                Text("Import an IPSW to get started. Podium currently supports " +
+                     ReferenceFirmware.all.map { "\($0.device.marketingName) on iOS \($0.productVersion)" }
+                        .joined(separator: ") and ("))
             }
 
             if !downloader.phase.isActive {
-                Button {
-                    Task { await downloader.retry(into: firmwareLibrary) }
-                } label: {
-                    Label("Download iOS \(ReferenceFirmware.productVersion) for \(DeviceCatalog.iPodTouch4.shortName)", systemImage: "arrow.down.circle")
+                ForEach(ReferenceFirmware.all, id: \.buildVersion) { firmware in
+                    Button {
+                        downloader.downloadingFirmware = firmware
+                        Task { await downloader.retry(into: firmwareLibrary) }
+                    } label: {
+                        Label("Download iOS \(firmware.productVersion) for \(firmware.device.shortName)", systemImage: "arrow.down.circle")
+                    }
+                    .font(.subheadline.weight(.medium))
                 }
-                .font(.subheadline.weight(.medium))
             }
         }
         .listRowSeparator(.hidden)

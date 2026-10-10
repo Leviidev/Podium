@@ -32,15 +32,13 @@ enum RootFilesystemPreparer {
 
         var description: String {
             switch self {
-            case .wrongFirmware(let build): return "root filesystem preparation only supports iOS 6.1.6 (10B500); this is \(build)"
+            case .wrongFirmware(let build): return "root filesystem preparation has no recipe or keys for iOS build \(build)"
             case .missingRootFilesystem: return "the IPSW has no root filesystem image"
             case .incompleteDecryption: return "the root filesystem image ended early"
             case .invalidHFSImage(let detail): return "invalid HFS+ disk image: \(detail)"
             }
         }
     }
-
-    static let referenceBuild = "10B500"
 
     static func imageURL(forFirmwareAt ipswURL: URL) -> URL {
         ipswURL.deletingPathExtension().appendingPathExtension("rootfs.hfs")
@@ -83,9 +81,20 @@ enum RootFilesystemPreparer {
             guard fileManager.fileExists(atPath: source.path) else {
                 throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: source.path])
             }
+            // A prepared system image too large for this build's boot path
+            // (an oversize RAM-disk image, or an old recipe's margin) can't
+            // seed a usable user volume; rebuilding is the caller's job.
+            if source == prepared {
+                let sourceBytes = (try? fileManager.attributesOfItem(atPath: source.path)[.size] as? NSNumber)?.uint64Value ?? 0
+                if !Self.isPrepared(source, fileManager: fileManager,
+                                    expected: try expectedMarker(for: ipswURL, fileManager: fileManager)) {
+                    throw CocoaError(.fileReadCorruptFile, userInfo: [NSLocalizedDescriptionKey:
+                        "The prepared root filesystem is \(sourceBytes) bytes, which either doesn't match this build's disk class or is too large to boot from; rebuilding it is required."])
+                }
+            }
             try copyHFSImage(from: source, to: temporary, fileManager: fileManager)
             let sourceVersion = source == prepared
-                ? String(RootFilesystemRecipe.version)
+                ? (try expectedMarker(for: ipswURL, fileManager: fileManager))
                 : try? String(contentsOf: markerURL(for: source), encoding: .utf8)
             try safelyPromote(temporary, to: user, markerVersion: sourceVersion, fileManager: fileManager)
 
@@ -95,7 +104,7 @@ enum RootFilesystemPreparer {
             }
         }
         let version = (try? String(contentsOf: markerURL(for: user), encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (user, version != String(RootFilesystemRecipe.version))
+        return (user, version != (try expectedMarker(for: ipswURL, fileManager: fileManager)))
     }
 
     private static func markerURL(for imageURL: URL) -> URL {
@@ -363,14 +372,36 @@ enum RootFilesystemPreparer {
         }
     }
 
-    private static func isPrepared(_ image: URL, fileManager: FileManager) -> Bool {
+    /// The version marker now also records the image's disk class, so an
+    /// image made before a build's sizing changed (8 GiB md0 vs RAM-disk)
+    /// no longer passes as current.
+    private static func expectedMarker(for ipswURL: URL, fileManager: FileManager) throws -> String {
+        "\(RootFilesystemRecipe.version)-\(try diskClass(for: ipswURL))"
+    }
+
+    private static func isPrepared(_ image: URL, fileManager: FileManager, expected: String) -> Bool {
         guard fileManager.fileExists(atPath: image.path),
               let marker = try? String(contentsOf: markerURL(for: image), encoding: .utf8) else { return false }
-        return marker.trimmingCharacters(in: .whitespacesAndNewlines) == String(RootFilesystemRecipe.version)
+        guard marker.trimmingCharacters(in: .whitespacesAndNewlines) == expected else { return false }
+        // Older margins could produce an oversize RAM-disk image; it must
+        // not only claim the right class but actually fit guest DRAM.
+        if expected.hasSuffix("-ramdisk") {
+            let bytes = (try? fileManager.attributesOfItem(atPath: image.path)[.size] as? NSNumber)?.uint64Value ?? 0
+            return bytes != 0 && bytes <= GuestMemoryLayout.ramDiskMaximumBytes
+        }
+        return true
+    }
+
+    /// Whether this build's kernel takes the 8 GiB md0 path ("md0") or
+    /// boots the root filesystem as a RAM disk ("ramdisk"), as a marker
+    /// suffix. Read from the IPSW's own manifest entry.
+    private static func diskClass(for ipswURL: URL) throws -> String {
+        GuestDiskBridge.supports(build: try buildManifest(of: ipswURL).productBuildVersion) ? "md0" : "ramdisk"
     }
 
     static func isPrepared(forFirmwareAt ipswURL: URL) -> Bool {
-        isPrepared(imageURL(forFirmwareAt: ipswURL), fileManager: .default)
+        isPrepared(imageURL(forFirmwareAt: ipswURL), fileManager: .default,
+                   expected: (try? expectedMarker(for: ipswURL, fileManager: .default)) ?? "unreachable")
     }
 
     /// Returns the prepared system image, building it first if needed.
@@ -380,8 +411,9 @@ enum RootFilesystemPreparer {
                         progress: (Progress) -> Void = { _ in }) throws -> URL {
         let fileManager = FileManager.default
         let image = imageURL(forFirmwareAt: ipswURL)
+        let expected = try expectedMarker(for: ipswURL, fileManager: fileManager)
         try recoverInterruptedReplacement(at: image, fileManager: fileManager)
-        if isPrepared(image, fileManager: fileManager) { return image }
+        if isPrepared(image, fileManager: fileManager, expected: expected) { return image }
 
         // Finish an image written successfully before a previous launch was
         // able to promote its atomic temporary into the normal prepared path.
@@ -389,7 +421,7 @@ enum RootFilesystemPreparer {
         let readyMarker = markerURL(for: readyImage)
         if fileManager.fileExists(atPath: readyImage.path),
            let readyVersion = try? String(contentsOf: readyMarker, encoding: .utf8),
-           readyVersion.trimmingCharacters(in: .whitespacesAndNewlines) == String(RootFilesystemRecipe.version) {
+           readyVersion.trimmingCharacters(in: .whitespacesAndNewlines) == expected {
             try safelyPromote(readyImage, to: image, markerVersion: readyVersion, fileManager: fileManager)
             return image
         }
@@ -402,13 +434,27 @@ enum RootFilesystemPreparer {
             try? fileManager.removeItem(at: partial)
         }
 
+        let manifest = try Self.buildManifest(of: ipswURL)
+        guard ReferenceFirmwareKeys.forBuild(manifest.productBuildVersion) != nil else {
+            throw PreparationError.wrongFirmware(manifest.productBuildVersion)
+        }
         if keepDecrypted, fileManager.fileExists(atPath: decrypted.path) {
-            return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap,
-                             syncDaemon: syncDaemon, firstBootState: firstBootState, bootReadFiles: bootReadFiles, progress: progress)
+            return try build(from: decrypted, to: image, partial: partial, buildVersion: manifest.productBuildVersion,
+                             keybagBootstrap: keybagBootstrap, syncDaemon: syncDaemon, firstBootState: firstBootState,
+                             bootReadFiles: bootReadFiles, progress: progress)
         }
         try decryptRootFilesystem(fromFirmwareAt: ipswURL, to: decrypted) { progress(Progress(phase: .extracting, fraction: $0)) }
-        return try build(from: decrypted, to: image, partial: partial, keybagBootstrap: keybagBootstrap,
-                         syncDaemon: syncDaemon, firstBootState: firstBootState, bootReadFiles: bootReadFiles, progress: progress)
+        return try build(from: decrypted, to: image, partial: partial, buildVersion: manifest.productBuildVersion,
+                         keybagBootstrap: keybagBootstrap, syncDaemon: syncDaemon, firstBootState: firstBootState,
+                         bootReadFiles: bootReadFiles, progress: progress)
+    }
+
+    /// The IPSW's own build declaration, read once for both the key lookup
+    /// above and the per-build recipe edits below.
+    private static func buildManifest(of ipswURL: URL) throws -> BuildManifestPlist {
+        let zip = try ZipArchiveReader(fileURL: ipswURL)
+        guard let manifestEntry = zip.entry(named: IPSWParser.buildManifestEntryName) else { throw PreparationError.missingRootFilesystem }
+        return try PropertyListDecoder().decode(BuildManifestPlist.self, from: try zip.data(for: manifestEntry))
     }
 
     /// Streams the root filesystem DMG out of the IPSW, decrypting it into
@@ -418,7 +464,9 @@ enum RootFilesystemPreparer {
         let zip = try ZipArchiveReader(fileURL: ipswURL)
         guard let manifestEntry = zip.entry(named: IPSWParser.buildManifestEntryName) else { throw PreparationError.missingRootFilesystem }
         let manifest = try PropertyListDecoder().decode(BuildManifestPlist.self, from: try zip.data(for: manifestEntry))
-        guard manifest.productBuildVersion == referenceBuild else { throw PreparationError.wrongFirmware(manifest.productBuildVersion) }
+        guard let keys = ReferenceFirmwareKeys.forBuild(manifest.productBuildVersion) else {
+            throw PreparationError.wrongFirmware(manifest.productBuildVersion)
+        }
         guard let path = manifest.rootFilesystemPath, let entry = zip.entry(named: path) else { throw PreparationError.missingRootFilesystem }
 
         let temporary = decrypted.appendingPathExtension("partial")
@@ -429,7 +477,7 @@ enum RootFilesystemPreparer {
         defer { try? output.close() }
         var buffer = Data()
         buffer.reserveCapacity(8 << 20)
-        let decryptor = try EncryptedDiskImageDecryptor(key: [UInt8](ReferenceFirmwareKeys.rootFilesystem)) { plain in
+        let decryptor = try EncryptedDiskImageDecryptor(key: [UInt8](keys.rootFilesystem)) { plain in
             buffer.append(contentsOf: plain)
             if buffer.count >= 8 << 20 {
                 try output.write(contentsOf: buffer)
@@ -444,15 +492,19 @@ enum RootFilesystemPreparer {
         try fileManager.moveItem(at: temporary, to: decrypted)
     }
 
-    private static func build(from decrypted: URL, to image: URL, partial: URL, keybagBootstrap: [UInt8], syncDaemon: [UInt8]?,
+    private static func build(from decrypted: URL, to image: URL, partial: URL, buildVersion: String, keybagBootstrap: [UInt8], syncDaemon: [UInt8]?,
                               firstBootState: Data?, bootReadFiles: [String], progress: (Progress) -> Void) throws -> URL {
         let fileManager = FileManager.default
         progress(Progress(phase: .building, fraction: 0))
         let volume = try HFSPlusVolume(source: try UDIFDiskImage(url: decrypted))
         let builder = try RootFilesystemBuilder(volume: volume)
-        try RootFilesystemRecipe.apply(to: builder, keybagBootstrap: keybagBootstrap, syncDaemon: syncDaemon, firstBootState: firstBootState,
-                                       bootReadFiles: bootReadFiles)
-        try builder.write(to: partial, freeSpace: RootFilesystemRecipe.freeSpace, maximumVolumeBytes: FileBackedStorage.capacity) { written in
+        try RootFilesystemRecipe.apply(to: builder, buildVersion: buildVersion, keybagBootstrap: keybagBootstrap, syncDaemon: syncDaemon,
+                                       firstBootState: firstBootState, bootReadFiles: bootReadFiles)
+        // iOS 7 sessions still boot the root filesystem as a RAM disk (the
+        // 8 GiB md0 bridge is hash-gated to the verified 10B500 kernel), so
+        // this build's image must fit in guest DRAM; the rest is trimming.
+        let maximumVolumeBytes: UInt64 = GuestDiskBridge.supports(build: buildVersion) ? FileBackedStorage.capacity : GuestMemoryLayout.ramDiskMaximumBytes
+        try builder.write(to: partial, freeSpace: RootFilesystemRecipe.freeSpace, maximumVolumeBytes: maximumVolumeBytes) { written in
             progress(Progress(phase: .building, fraction: Double(written.bytesWritten) / Double(max(written.totalBytes, 1))))
         }
 
@@ -460,7 +512,7 @@ enum RootFilesystemPreparer {
         try? fileManager.removeItem(at: ready)
         try? fileManager.removeItem(at: markerURL(for: ready))
         try fileManager.moveItem(at: partial, to: ready)
-        let version = String(RootFilesystemRecipe.version)
+        let version = String(RootFilesystemRecipe.version) + "-" + (GuestDiskBridge.supports(build: buildVersion) ? "md0" : "ramdisk")
         try version.write(to: markerURL(for: ready), atomically: true, encoding: .utf8)
         try safelyPromote(ready, to: image, markerVersion: version, fileManager: fileManager)
         return image

@@ -68,6 +68,9 @@ final class EmulationSession {
     private var fileDisk: FileBackedStorage?
     /// Where the RAM disk sits in guest RAM (offsets from its base).
     private var ramDiskRange: Range<Int> = 0..<0
+    /// A [podium] note prefixed to the first `newKernelMessages` result:
+    /// which execution mode the session got (translated vs interpreter).
+    private var executeModeNote: String = ""
     private var messageBufferOffset: Int?
     private var messagesRead = 0
 
@@ -95,7 +98,10 @@ final class EmulationSession {
 
     /// `persistent`: the guest's writes to its root filesystem go to the
     /// image file, and last; otherwise every boot starts from the image.
-    init(kernel: Data, deviceTree: Data, rootFilesystem: URL, persistent: Bool = false) throws {
+    /// `firmwareBuildVersion` gates the md0 bridge per kernel: the bridge
+    /// patches one verified kernel's storage ABI, and another build must
+    /// fail with that exact reason rather than a generic boot error.
+    init(kernel: Data, deviceTree: Data, rootFilesystem: URL, firmwareBuildVersion: String = "10B500", persistent: Bool = false) throws {
         ram = FlatPhysicalMemory(length: GuestMemoryLayout.ramSize, baseAddress: GuestMemoryLayout.ramPhysicalBase)
         persistentRootFilesystem = persistent
         // A small on-chip SRAM at low physical addresses, separate from
@@ -121,11 +127,13 @@ final class EmulationSession {
 
         let diskAttributes = try FileManager.default.attributesOfItem(atPath: rootFilesystem.path)
         let size = (diskAttributes[.size] as? NSNumber)?.intValue ?? 0
-        // Existing small disks keep their original RAM-disk boot path. New
-        // eight-GiB volumes use md0 backed by host block I/O. A single page
-        // in the device tree registers md0 without reserving the disk in RAM.
+        // The md0 bridge is hash-gated per build: only the verified 10B500
+        // kernel has the storage ABI it patches, so only then does an
+        // eight-GiB volume boot through md0 backed by host block I/O. iOS 7
+        // sessions use the original RAM-disk path either way; images that
+        // are already bigger than DRAM only get here from another build.
         let blockBacked = size >= GuestMemoryLayout.ramSize
-        let bootKernel = try (blockBacked ? GuestDiskBridge.patch(kernel) : kernel)
+        let bootKernel = try (blockBacked ? GuestDiskBridge.patch(kernel, buildVersion: firmwareBuildVersion) : kernel)
         let prepared = try KernelBootstrap.prepare(kernel: bootKernel, deviceTree: deviceTree, on: bus,
                                                    ramDiskSize: blockBacked ? 4096 : size)
         if blockBacked {
@@ -144,6 +152,10 @@ final class EmulationSession {
         // iOS, once a debugger such as StikDebug has prepared memory for
         // it); the interpreter otherwise.
         cpu.dbt = DBTEngine(cpu: cpu)
+        // Prefix notes for the kernel-log reader (newKernelMessages), shown
+        // before any guest output so a slow interpreter boot is never
+        // mistaken for "just how fast it is".
+        executeModeNote = "\n[podium] \(cpu.dbt != nil ? "translated execution: \(cpu.dbt!.jitModeDescription)" : "interpreter only — no executable memory; attach a debugger (StikDebug 'Enable JIT') to Podium before launching for translated execution")\n"
         KernelAcceleration.install(on: cpu)
         // A reset by any other route (the kernel ends a halt with the
         // watchdog, and spins until it lands) ends the run too; the run
@@ -473,13 +485,15 @@ final class EmulationSession {
             }
         }
         guard let offset = messageBufferOffset, let buffer = ring(at: offset) else { return "" }
+        let note = executeModeNote
+        executeModeNote = ""
         let last = messagesRead
         messagesRead = buffer.next
         guard buffer.next != last else { return "" }
         let bytes = buffer.next > last
             ? Array(raw[buffer.start + last..<buffer.start + buffer.next])
             : Array(raw[buffer.start + last..<buffer.start + buffer.size]) + Array(raw[buffer.start..<buffer.start + buffer.next])
-        return String(decoding: bytes.filter { $0 != 0 }, as: UTF8.self)
+        return note + String(decoding: bytes.filter { $0 != 0 }, as: UTF8.self)
     }
 
     private func readCString(atKernelVirtual address: UInt32) -> String {

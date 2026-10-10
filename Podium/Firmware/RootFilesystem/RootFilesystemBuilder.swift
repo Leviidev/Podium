@@ -188,9 +188,21 @@ final class RootFilesystemBuilder {
         try remove(index: index)
     }
 
+    /// Removes the children of a folder that exists, tolerating a folder
+    /// absent from this build's filesystem.
+    func removeChildrenIfNeeded(of path: String, keeping: Set<String> = []) throws {
+        guard let folder = index(of: path), records[folder].isFolder else { return }
+        for child in try children(of: path) where !keeping.contains(child.name) {
+            try remove(index: child.index)
+        }
+    }
+
     /// Removes the children of a folder whose names match `pattern` (an
-    /// `fnmatch` glob), except those in `keeping`.
+    /// `fnmatch` glob), except those in `keeping`. A folder that doesn't
+    /// exist in this build's filesystem is tolerated — the trim list names
+    /// assets that moved or disappeared between iOS versions.
     func removeChildren(of path: String, matching pattern: String = "*", keeping: Set<String> = []) throws {
+        guard index(of: path) != nil, records[index(of: path)!].isFolder else { return }
         for child in try children(of: path) where !keeping.contains(child.name) && fnmatch(pattern, child.name, 0) == 0 {
             try remove(index: child.index)
         }
@@ -409,17 +421,21 @@ final class RootFilesystemBuilder {
     }
 }
 
-/// The changes Podium makes to iOS 6.1.6's root filesystem so it can boot
-/// from a RAM disk in the emulator — the same set `prepare_rootfs.sh`
-/// applies on a Mac.
+/// The changes Podium makes to a root filesystem so it can boot from a
+/// RAM disk in the emulator — the same set `prepare_rootfs.sh` applies
+/// on a Mac.
+///
+/// Most steps tolerate iOS-version differences (an asset that moved or
+/// disappeared between builds is simply not trimmed); the steps that
+/// must be exact are gated per validated build in `BuildSpecific`.
 enum RootFilesystemRecipe {
     /// Bumped whenever the edits change, so prepared images are rebuilt.
-    static let version = 14
+    static let version = 15
     /// Room left for the guest to write into (logs, caches, preferences).
     static let freeSpace: UInt64 = 64 << 20
 
-    static func apply(to builder: RootFilesystemBuilder, keybagBootstrap: [UInt8], syncDaemon: [UInt8]? = nil, firstBootState: Data? = nil,
-                      bootReadFiles: [String] = []) throws {
+    static func apply(to builder: RootFilesystemBuilder, buildVersion: String, keybagBootstrap: [UInt8], syncDaemon: [UInt8]? = nil,
+                      firstBootState: Data? = nil, bootReadFiles: [String] = []) throws {
         // The volume is rebuilt with a fresh 8 MB journal (the kernel sets
         // it up on first mount): the app keeps the guest's writes, and a
         // sudden power-off then costs a journal replay instead of a full
@@ -475,6 +491,7 @@ enum RootFilesystemRecipe {
             plist["ProgramArguments"] = ["/usr/libexec/keybag_bootstrap", "/usr/libexec/keybagd", "-t", "15"]
         }
 
+
         // The app boots a copy of this image that keeps the guest's writes,
         // and its Power Off stops the machine at once; the volume has no
         // journal. podium_syncd flushes the guest's cache to it every few
@@ -499,7 +516,7 @@ enum RootFilesystemRecipe {
         let preferences = "/private/var/mobile/Library/Preferences/"
         let template = preferences + ".GlobalPreferences.plist"
         try builder.addFile(preferences + "com.apple.backboardd.plist",
-                            contents: try binaryPlist(["BKDataMigratorLastSystemVersion": "10B500"]), template: template)
+                            contents: try binaryPlist(["BKDataMigratorLastSystemVersion": buildVersion]), template: template)
         let setupDone = try binaryPlist(["SetupDone": true, "SetupFinishedAllSteps": true, "SetupVersion": 3])
         try builder.addFile(preferences + "com.apple.purplebuddy.plist", contents: setupDone, template: template)
         try builder.addFolder(preferences + "ByHost", owner: 501, group: 501, mode: 0o755)
@@ -507,20 +524,9 @@ enum RootFilesystemRecipe {
         try builder.addFile(preferences + "com.apple.keyboard.plist",
                             contents: try binaryPlist(["BuddySetupDone": true]), template: template)
 
-        try applyHactivation(to: builder)
+        try applyBuildSpecificEdits(to: builder, buildVersion: buildVersion)
 
         if let firstBootState { try applyFirstBootState(firstBootState, to: builder) }
-
-        // Grouped table views — Settings and most other lists — fill their
-        // background with UITableViewTexture.png, 16 by 2 pixels. With no
-        // GPU, CoreAnimation draws a pattern one image-sized tile at a
-        // time, each a quad through its whole software renderer: some
-        // 17,000 for one screen, nearly all the work of a frame while
-        // Settings scrolls. The same stripes tiled out to a screenful look
-        // the same (the pattern is drawn pixel for pixel, and a screen is
-        // a whole number of periods) and draw as one tile.
-        try UIKitArtwork.tile(image: "UITableViewTexture.png", in: "/System/Library/Frameworks/UIKit.framework/Shared@2x.artwork",
-                              toWidth: 640, height: 960, builder: builder)
 
         // The files the guest reads while it boots, stored uncompressed.
         // Nearly every file here is HFS-compressed (decmpfs), and the
@@ -570,32 +576,86 @@ enum RootFilesystemRecipe {
         }
     }
 
-    /// Activation. A restored iOS 6 device is unactivated until Apple's
+    /// The edits that must match a concrete build byte-for-byte. A build
+    /// without an entry here fails preparation loudly (a half-patched
+    /// volume would boot to a launchd respawn loop, a lockdownd bricking
+    /// itself, or a crash instead), by design.
+    enum BuildSpecific {
+        struct Hactivation {
+            let offset: Int
+            let original: [UInt8]
+            let patched: [UInt8]
+        }
+
+        struct Recipe {
+            /// Patch on lockdownd for hactivation, or nil to skip.
+            let hactivation: Hactivation?
+            /// Grouped-table-view texture til name + artwork path; older
+            /// UIKit files it in a named artwork entry.
+            let tableTextureTiling: (artworkPath: String, image: String)?
+        }
+
+        /// iOS 6.1.6 (10B500) — the original validated recipe:
+        /// hactivation via the `mov r2, r0` after MGGetBoolAnswer("
+        /// ShouldHactivate") in lockdownd, and UIKit's
+        /// `Shared@2x.artwork` carrying `UITableViewTexture.png` (see
+        /// `apply`'s comment on why this tile matters with no GPU).
+        static let tenB500 = Recipe(
+            hactivation: Hactivation(
+                offset: 0x1_BD40,
+                original: [0x00, 0xF0, 0xE8, 0xF8, 0x02, 0x46, 0x49, 0xF6],
+                patched: [0x00, 0xF0, 0xE8, 0xF8, 0x01, 0x22, 0x49, 0xF6]
+            ),
+            tableTextureTiling: ("/System/Library/Frameworks/UIKit.framework/Shared@2x.artwork", "UITableViewTexture.png")
+        )
+
+        /// iOS 7.1.2 (11D257) — first-work-in-progress recipe: iOS 7 moved
+        /// table texturing (no `Shared@2x.artwork`) and lockdownd's
+        /// hactivation site differs. Setup is skipped until re-derived —
+        /// documented in iOS7-Port-Notes.md.
+        static let elevenD257 = Recipe(
+            hactivation: nil,
+            tableTextureTiling: nil
+        )
+
+        static let all: [String: Recipe] = ["10B500": tenB500, "11D257": elevenD257]
+
+        static func recipe(for buildVersion: String) -> Recipe? { all[buildVersion] }
+    }
+
+    /// Applies the per-build exact edits. Skips cleanly when the build
+    /// disables a step (hactivation: nil) rather than pretending it did.
+    static func applyBuildSpecificEdits(to builder: RootFilesystemBuilder, buildVersion: String) throws {
+        guard let recipe = BuildSpecific.recipe(for: buildVersion) else {
+            throw HFSPlusError.unsupported("no validated per-build recipe for build \(buildVersion)")
+        }
+        if let site = recipe.hactivation {
+            try applyHactivation(to: builder, site: site)
+        }
+        if let tiling = recipe.tableTextureTiling {
+            try UIKitArtwork.tile(image: tiling.image, in: tiling.artworkPath, toWidth: 640, height: 960, builder: builder)
+        }
+    }
+
+    /// Activation. A restored device is unactivated until Apple's
     /// activation server signs a record for its hardware identity, and
     /// until then lockdownd reports it bricked and SpringBoard runs Setup
-    /// to activate it — a virtual iPod has no identity Apple would sign.
-    /// lockdownd has its own way past this for devices that shouldn't be
-    /// activated ("hactivation"): when MobileGestalt's ShouldHactivate
-    /// answer is true it reports the device Activated without a record
-    /// (dealwith_activation: "Short circuiting activation state to
-    /// Activated."). That answer comes from a per-model table in which
-    /// every retail model, the iPod touch 4 included, says no. So this
-    /// changes the one instruction in lockdownd's device-type setup that
-    /// takes the answer (`mov r2, r0` after MGGetBoolAnswer("ShouldHactivate"),
-    /// stored as the flag) to `movs r2, #1`, and recomputes the changed
-    /// page's hash in lockdownd's (ad-hoc) signature so the kernel keeps
-    /// it valid — lockdownd needs its entitlements for the keychain.
-    static let lockdowndShouldHactivate = (offset: 0x1_BD40, original: [0x00, 0xF0, 0xE8, 0xF8, 0x02, 0x46, 0x49, 0xF6] as [UInt8],
-                                           patched: [0x00, 0xF0, 0xE8, 0xF8, 0x01, 0x22, 0x49, 0xF6] as [UInt8])
-
-    static func applyHactivation(to builder: RootFilesystemBuilder) throws {
+    /// to activate it — a virtual device has no identity Apple would
+    /// sign. lockdownd has its own way past this for devices that
+    /// shouldn't be activated ("hactivation"): when MobileGestalt's
+    /// ShouldHactivate answer is true it reports the device Activated
+    /// without a record. This patches the one instruction that takes
+    /// that answer, then recomputes lockdownd's (ad-hoc) signature so the
+    /// kernel keeps it valid — lockdownd needs its entitlements for the
+    /// keychain.
+    static func applyHactivation(to builder: RootFilesystemBuilder, site: BuildSpecific.Hactivation) throws {
         let path = "/usr/libexec/lockdownd"
         var lockdownd = try builder.contents(of: path)
-        let site = lockdowndShouldHactivate
-        guard lockdownd.count > site.offset + 8, Array(lockdownd[site.offset..<site.offset + 8]) == site.original else {
-            throw HFSPlusError.corrupt("lockdownd isn't the 10B500 build this expects")
+        guard lockdownd.count > site.offset + site.original.count,
+              Array(lockdownd[site.offset..<site.offset + site.original.count]) == site.original else {
+            throw HFSPlusError.corrupt("lockdownd doesn't match the patched hactivation site this build expects")
         }
-        lockdownd.replaceSubrange(site.offset..<site.offset + 8, with: site.patched)
+        lockdownd.replaceSubrange(site.offset..<site.offset + site.original.count, with: site.patched)
         try CodeDirectory.updatePageHashes(&lockdownd)
         try builder.replaceContents(of: path, with: lockdownd)
     }

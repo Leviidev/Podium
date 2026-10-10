@@ -137,7 +137,8 @@ final class EmulatorCore {
             let session = try await Task.detached(priority: .userInitiated) {
                 let kernel = try KernelcacheExtractor.extractKernelMachO(from: firmware, storedAt: fileURL)
                 let deviceTree = try DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: fileURL)
-                return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem, persistent: true)
+                return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem,
+                                            firmwareBuildVersion: firmware.metadata.buildVersion, persistent: true)
             }.value
             session.onFinish = { [weak self, weak session] state in
                 Task { @MainActor in

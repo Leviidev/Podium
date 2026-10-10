@@ -24,7 +24,7 @@ final class PersistentGuestStorageTests: XCTestCase {
         let storage = PersistentGuestStorage(appSupportURL: applicationSupportURL)
         let prepared = try storage.prepareUserVolume(forFirmwareAt: firmwareURL)
         let expectedURL = RootFilesystemPreparer.userImageURL(in: applicationSupportURL
-            .appendingPathComponent("Podium/VirtualDevices/\(ReferenceFirmware.device.identifier)/\(ReferenceFirmware.buildVersion)",
+            .appendingPathComponent("Podium/VirtualDevices/\(ReferenceFirmware.all.first!.device.identifier)/\(ReferenceFirmware.all.first!.buildVersion)",
                                    isDirectory: true))
 
         XCTAssertEqual(prepared.url, expectedURL)
@@ -111,7 +111,7 @@ final class PersistentGuestStorageTests: XCTestCase {
         try writeHFSImage(at: preparedURL, fill: 0x31, freeBlocks: 3)
         let storage = PersistentGuestStorage(appSupportURL: applicationSupportURL)
         let directory = applicationSupportURL
-            .appendingPathComponent("Podium/VirtualDevices/\(ReferenceFirmware.device.identifier)/\(ReferenceFirmware.buildVersion)",
+            .appendingPathComponent("Podium/VirtualDevices/\(ReferenceFirmware.all.first!.device.identifier)/\(ReferenceFirmware.all.first!.buildVersion)",
                                    isDirectory: true)
         let committedURL = try storage.prepareUserVolume(forFirmwareAt: firmwareURL).url
         let committed = try Data(contentsOf: committedURL)

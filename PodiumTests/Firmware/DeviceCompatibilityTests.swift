@@ -3,9 +3,9 @@ import XCTest
 
 final class DeviceCompatibilityTests: XCTestCase {
     private func metadata(
-        productVersion: String = ReferenceFirmware.productVersion,
-        buildVersion: String = ReferenceFirmware.buildVersion,
-        deviceIdentifiers: [String] = [ReferenceFirmware.device.identifier]
+        productVersion: String = ReferenceFirmware.all.first!.productVersion,
+        buildVersion: String = ReferenceFirmware.all.first!.buildVersion,
+        deviceIdentifiers: [String] = [ReferenceFirmware.all.first!.device.identifier]
     ) -> FirmwareMetadata {
         FirmwareMetadata(
             supportedDeviceIdentifiers: deviceIdentifiers,

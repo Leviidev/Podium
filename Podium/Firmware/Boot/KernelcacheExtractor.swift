@@ -54,11 +54,11 @@ enum KernelcacheExtractor {
 
         var payload = container.payload
         if container.isEncrypted {
-            guard firmware.compatibility.isCompatible else {
+            guard let keys = ReferenceFirmwareKeys.forBuild(firmware.metadata.buildVersion),
+                  firmware.compatibility.isCompatible else {
                 throw KernelcacheExtractionError.unknownDecryptionKey
             }
-            let keys = ReferenceFirmwareKeys.kernelcache
-            payload = try FirmwareDecryption.aes256CBCDecrypt(payload, key: keys.key, iv: keys.iv)
+            payload = try FirmwareDecryption.aes256CBCDecrypt(payload, key: keys.kernelcache.key, iv: keys.kernelcache.iv)
         }
 
         do {
